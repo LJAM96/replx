@@ -2825,7 +2825,8 @@ never does. A product version change resets certainty for review.
 | `REPLX_EDGE_INGRESS_MODE` | Yes | `cloudflare_tunnel` or `direct` |
 | `TUNNEL_TOKEN` | Tunnel profile | Cloudflare Tunnel token (or use `TUNNEL_TOKEN_FILE`) |
 | `TUNNEL_TOKEN_FILE` | Tunnel profile (secret file) | Path to file containing the Tunnel token; Docker secrets compatible |
-| `REPLX_EDGE_ADMIN_PORT` | No | Host loopback admin port |
+| `REPLX_EDGE_ADMIN_PORT` | No | Host admin port |
+| `REPLX_EDGE_ADMIN_BIND` | No | Host bind for the admin panel (`127.0.0.1`, or a Tailscale IP; never `0.0.0.0`) |
 | `REPLX_EDGE_LOG_LEVEL` | No | Production log level |
 | `REPLX_EDGE_CACHE_MAX_GB` | No | General cache budget |
 | `REPLX_EDGE_ARTWORK_MAX_GB` | No | Artwork budget |
@@ -3366,7 +3367,10 @@ services:
       - replx_edge_artwork:/data/artwork
       - replx_edge_diagnostics:/data/diagnostics
     ports:
-      - "127.0.0.1:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
+      # Loopback by default. Set REPLX_EDGE_ADMIN_BIND to a Tailscale IP to
+      # reach the panel over the tailnet. Never 0.0.0.0: the admin API has
+      # no public business.
+      - "${REPLX_EDGE_ADMIN_BIND:-127.0.0.1}:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
     networks:
       - frontend
       - backend
@@ -3477,6 +3481,9 @@ TUNNEL_TOKEN=replace-me
 # TUNNEL_TOKEN_FILE=/run/secrets/cloudflare_tunnel_token (Docker secrets alternative)
 
 REPLX_EDGE_ADMIN_PORT=8080
+# Bind the admin panel to a Tailscale IP to reach it over the tailnet.
+# Default 127.0.0.1 (SSH tunnel only). Never 0.0.0.0.
+# REPLX_EDGE_ADMIN_BIND=100.116.199.128
 REPLX_EDGE_LOG_LEVEL=info
 REPLX_EDGE_CACHE_MAX_GB=20
 REPLX_EDGE_ARTWORK_MAX_GB=50

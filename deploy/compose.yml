@@ -71,7 +71,10 @@ services:
       - replx_edge_artwork:/data/artwork
       - replx_edge_diagnostics:/data/diagnostics
     ports:
-      - "127.0.0.1:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
+      # Loopback by default. Set REPLX_EDGE_ADMIN_BIND to a Tailscale IP to
+      # reach the panel over the tailnet. Never 0.0.0.0: the admin API has
+      # no public business.
+      - "${REPLX_EDGE_ADMIN_BIND:-127.0.0.1}:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
     networks:
       - frontend
       - backend

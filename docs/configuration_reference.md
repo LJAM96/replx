@@ -15,7 +15,8 @@
 | `REPLX_EDGE_INGRESS_MODE` | Yes | `cloudflare_tunnel` or `direct` |
 | `TUNNEL_TOKEN` | Tunnel profile | Cloudflare Tunnel token (or use `TUNNEL_TOKEN_FILE`) |
 | `TUNNEL_TOKEN_FILE` | Tunnel profile (secret file) | Path to file containing the Tunnel token; Docker secrets compatible |
-| `REPLX_EDGE_ADMIN_PORT` | No | Host loopback admin port |
+| `REPLX_EDGE_ADMIN_PORT` | No | Host admin port |
+| `REPLX_EDGE_ADMIN_BIND` | No | Host bind for the admin panel (`127.0.0.1`, or a Tailscale IP; never `0.0.0.0`) |
 | `REPLX_EDGE_LOG_LEVEL` | No | Production log level |
 | `REPLX_EDGE_CACHE_MAX_GB` | No | General cache budget |
 | `REPLX_EDGE_ARTWORK_MAX_GB` | No | Artwork budget |
