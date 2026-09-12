@@ -29,6 +29,48 @@ func TestSelectMediaOriginSkipsSelf(t *testing.T) {
 	}
 }
 
+func TestSelectMediaOriginSkipsPrivateIP(t *testing.T) {
+	// A docker-internal address published by PMS must never win, even
+	// when plex.tv does not flag it local.
+	conns := []plextv.Connection{
+		{URI: "https://172.17.0.7:32400", Protocol: "https"},
+		{URI: "https://origin.example:32400", Protocol: "https"},
+	}
+	resolve := func(host string) (bool, bool) {
+		if host == "origin.example" {
+			return true, false
+		}
+		return false, false
+	}
+	got, err := selectMediaOrigin(conns, "plex.example.com", resolve)
+	if err != nil || got != "https://origin.example:32400" {
+		t.Fatalf("got %q %v", got, err)
+	}
+	// Literal private IP alone fails closed.
+	if _, err := selectMediaOrigin(conns[:1], "plex.example.com", resolve); err == nil {
+		t.Fatal("private-only candidates must fail closed")
+	}
+	// Unresolvable names are kept as a last resort, never preferred.
+	mixed := []plextv.Connection{
+		{URI: "https://mystery.invalid:32400", Protocol: "https"},
+		{URI: "https://origin.example:32400", Protocol: "https"},
+	}
+	unknown := func(host string) (bool, bool) {
+		if host == "origin.example" {
+			return true, false
+		}
+		return false, true
+	}
+	got, err = selectMediaOrigin(mixed, "plex.example.com", unknown)
+	if err != nil || got != "https://origin.example:32400" {
+		t.Fatalf("proven public must win, got %q %v", got, err)
+	}
+	got, err = selectMediaOrigin(mixed[:1], "plex.example.com", unknown)
+	if err != nil || got != "https://mystery.invalid:32400" {
+		t.Fatalf("unknown kept as fallback, got %q %v", got, err)
+	}
+}
+
 func TestSelectMediaOriginFailsClosed(t *testing.T) {
 	only := []plextv.Connection{{URI: "http://192.168.1.2:32400", Protocol: "http", Local: true}}
 	if _, err := SelectMediaOrigin(only, "plex.example.com"); err == nil {

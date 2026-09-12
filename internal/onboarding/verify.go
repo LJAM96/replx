@@ -3,8 +3,10 @@ package onboarding
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/LJAM96/replx/internal/crypto"
 	"github.com/LJAM96/replx/internal/plextv"
@@ -12,12 +14,20 @@ import (
 )
 
 // SelectMediaOrigin picks the client reachable HTTPS origin connection:
-// https, non-relay, non-local, and never the replx-edge public hostname
-// itself. There is deliberately no LAN fallback: a 307 to a private
-// address is useless to a remote client and would present as a mysterious
-// playback failure. Without a non-local https candidate it fails closed
+// https, non-relay, non-local, never the replx-edge public hostname, and
+// never an address that only works inside the PMS host's own network.
+// PMS in Docker frequently publishes its container address (e.g.
+// 172-17-0-7....plex.direct); redirecting remote clients there can never
+// work, so such candidates are skipped. An unresolvable hostname is kept
+// as a last resort (DNS trouble must not block onboarding), but a proven
+// public address always wins. With no usable candidate it fails closed
 // and points at the media gateway profile.
 func SelectMediaOrigin(conns []plextv.Connection, publicHost string) (string, error) {
+	return selectMediaOrigin(conns, publicHost, resolveGlobal)
+}
+
+func selectMediaOrigin(conns []plextv.Connection, publicHost string, resolve func(host string) (public, unknown bool)) (string, error) {
+	var fallback string
 	for _, c := range conns {
 		if !strings.EqualFold(c.Protocol, "https") || c.Relay || c.Local || c.URI == "" {
 			continue
@@ -29,9 +39,38 @@ func SelectMediaOrigin(conns []plextv.Connection, publicHost string) (string, er
 		if publicHost != "" && strings.EqualFold(u.Hostname(), publicHost) {
 			continue
 		}
-		return strings.TrimSuffix(c.URI, "/"), nil
+		uri := strings.TrimSuffix(c.URI, "/")
+		if public, unknown := resolve(u.Hostname()); public {
+			return uri, nil
+		} else if unknown && fallback == "" {
+			fallback = uri
+		}
+	}
+	if fallback != "" {
+		return fallback, nil
 	}
 	return "", fmt.Errorf("onboarding: no non-local https origin connection: fix origin TLS (public hostname or plex.direct) or enable the DNS-only media gateway profile")
+}
+
+// resolveGlobal reports whether host is proven publicly routable.
+// Literal private IPs are rejected without DNS; names are resolved with a
+// short timeout, and resolution failure is unknown (kept as fallback).
+func resolveGlobal(host string) (public, unknown bool) {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsGlobalUnicast(), false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(addrs) == 0 {
+		return false, true
+	}
+	for _, a := range addrs {
+		if a.IP.IsGlobalUnicast() {
+			return true, false
+		}
+	}
+	return false, false
 }
 
 // TripleMatch is the identity invariant: origin root, plex.tv resource and
