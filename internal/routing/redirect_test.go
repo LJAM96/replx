@@ -13,8 +13,8 @@ func TestBuildDirectOriginURL(t *testing.T) {
 	if !strings.HasPrefix(loc, "https://origin.example:32400/library/parts/7/file.mkv?") {
 		t.Fatalf("unexpected location: %s", loc)
 	}
-	if strings.Contains(loc, "user-token") {
-		t.Fatalf("test itself uses a fake token; production must redact: %s", RedactedLocation(loc))
+	if !strings.Contains(loc, "X-Plex-Token=") {
+		t.Fatalf("expected token query in location: %s", RedactedLocation(loc))
 	}
 	if got := RedactedLocation(loc); strings.Contains(got, "user-token") || !strings.Contains(got, "REDACTED") {
 		t.Fatalf("redaction failed: %s", got)
