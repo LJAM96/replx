@@ -1,0 +1,122 @@
+package proxy
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/LJAM96/replx-edge/internal/logging"
+)
+
+func TestPassthroughPreservesSemantics(t *testing.T) {
+	var logs bytes.Buffer
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "bytes=0-99" {
+			t.Errorf("Range not preserved: %q", r.Header.Get("Range"))
+		}
+		if r.Header.Get("X-Plex-Client-Identifier") != "abc123" {
+			t.Errorf("client id not preserved")
+		}
+		if r.Header.Get("X-Plex-Token") != "user-secret" {
+			t.Errorf("user token must be forwarded to origin")
+		}
+		if r.Header.Get("Connection") != "" {
+			t.Errorf("hop-by-hop Connection leaked to origin")
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel", Logger: logging.New(&logs)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/library/sections?X-Plex-Token=user-secret", nil)
+	req.Header.Set("Range", "bytes=0-99")
+	req.Header.Set("X-Plex-Client-Identifier", "abc123")
+	req.Header.Set("X-Plex-Token", "user-secret")
+	req.Header.Set("Connection", "close")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	res := rec.Result()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK || string(body) != "hello" {
+		t.Fatalf("passthrough failed: %d %q", res.StatusCode, body)
+	}
+	if res.Header.Get(RequestIDHeader) == "" {
+		t.Fatal("missing request id response header")
+	}
+	if res.Header.Get("Connection") != "" {
+		t.Fatal("hop-by-hop Connection leaked to client")
+	}
+	if strings.Contains(logs.String(), "user-secret") {
+		t.Fatalf("token leaked to logs: %s", logs.String())
+	}
+}
+
+func TestMediaFailClosedInTunnelMode(t *testing.T) {
+	var logs bytes.Buffer
+	contacted := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contacted++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel", Logger: logging.New(&logs)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/library/parts/11/file.mkv", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("want 403, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), MediaRouteUnavailable) {
+		t.Fatalf("missing reason: %s", rec.Body.String())
+	}
+	if contacted != 0 {
+		t.Fatal("origin must not be contacted for fail-closed media")
+	}
+	if rec.Header().Get(RequestIDHeader) == "" {
+		t.Fatal("missing request id on fail-closed response")
+	}
+}
+
+func TestMediaAllowedInDirectMode(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("bytes"))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/parts/11/file.mkv", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("direct mode should proxy media, got %d", rec.Code)
+	}
+}
+
+func TestOriginDownIsBadGateway(t *testing.T) {
+	h, err := New(Options{OriginBase: "http://127.0.0.1:1", IngressMode: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "ORIGIN_UNAVAILABLE") {
+		t.Fatalf("want 502 ORIGIN_UNAVAILABLE, got %d %s", rec.Code, rec.Body.String())
+	}
+}

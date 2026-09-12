@@ -13,6 +13,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,8 @@ import (
 
 	"github.com/LJAM96/replx-edge/internal/config"
 	"github.com/LJAM96/replx-edge/internal/health"
+	"github.com/LJAM96/replx-edge/internal/logging"
+	"github.com/LJAM96/replx-edge/internal/proxy"
 )
 
 var version = "dev"
@@ -58,16 +61,49 @@ func runServe() error {
 	if err != nil {
 		return err
 	}
-	mux := health.AdminMux(health.Checks{})
-	srv := &http.Server{
-		Addr:              ":8080",
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
+	logger := logging.New(os.Stderr)
+
+	if cfg.OriginInternalURL == "" {
+		return fmt.Errorf("REPLX_EDGE_ORIGIN_INTERNAL_URL is required for serve")
 	}
-	fmt.Fprintf(os.Stdout, "replx-edge %s starting (ingress=%s public=%s)\n", version, cfg.IngressMode, cfg.PublicURL)
-	// Alpha scaffolding: admin listener only. Control listener (32400),
-	// PMS proxy, owner onboarding and media routing land with the P0 spike.
-	return srv.ListenAndServe()
+	proxyHandler, err := proxy.New(proxy.Options{
+		OriginBase:  cfg.OriginInternalURL,
+		IngressMode: cfg.IngressMode,
+		Logger:      logger,
+	})
+	if err != nil {
+		return err
+	}
+
+	adminMux := health.AdminMux(health.Checks{})
+	adminSrv := &http.Server{
+		Addr:              fmt.Sprintf(":%d", cfg.AdminPort),
+		Handler:           adminMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	controlSrv := &http.Server{
+		Addr:              ":32400",
+		Handler:           proxyHandler,
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	fmt.Fprintf(os.Stdout, "replx-edge %s starting (ingress=%s public=%s origin=%s)\n",
+		version, cfg.IngressMode, cfg.PublicURL, logging.RedactURLString(cfg.OriginInternalURL))
+
+	errCh := make(chan error, 2)
+	go func() {
+		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("admin listener: %w", err)
+		}
+	}()
+	go func() {
+		if err := controlSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("control listener: %w", err)
+		}
+	}()
+	return <-errCh
 }
 
 func runMediaGateway() error {
