@@ -308,10 +308,11 @@ func (m *Mux) handlePanel(w http.ResponseWriter, r *http.Request) {
 <h2>2. Select PMS (exactly one)</h2>
 <ul>`, html.EscapeString(fmt.Sprint(status["stage"])), html.EscapeString(r.URL.Query().Get("msg")), csrf)
 	for _, s := range servers {
-		_, _ = fmt.Fprintf(w, `<li>%s (%s) connections=%d httpsDirect=%v
+		_, _ = fmt.Fprintf(w, `<li>%s (%s) connections=%d httpsDirect=%v<br>hosts: %s
 <form method="post" style="display:inline"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="clientIdentifier" value="%s">
 <button name="select" value="1" type="submit">Select</button></form></li>`,
-			html.EscapeString(s.Name), html.EscapeString(s.ClientIdentifier), s.Connections, s.HTTPSDirect, csrf, html.EscapeString(s.ClientIdentifier))
+			html.EscapeString(s.Name), html.EscapeString(s.ClientIdentifier), s.Connections, s.HTTPSDirect,
+			html.EscapeString(strings.Join(s.ConnectionHosts, ", ")), csrf, html.EscapeString(s.ClientIdentifier))
 	}
 	_, _ = fmt.Fprintf(w, `</ul>
 <h2>3. Verify identity triple-check</h2>

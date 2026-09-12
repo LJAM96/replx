@@ -201,11 +201,14 @@ func (s *Service) pendingOwnerToken(ctx context.Context) (string, bool) {
 }
 
 // ServerSummary is a browser-safe resource listing (no tokens).
+// Connection URIs carry no credentials, so their hosts are shown to help
+// diagnose unpublished Custom Server Access URLs.
 type ServerSummary struct {
-	ClientIdentifier string `json:"clientIdentifier"`
-	Name             string `json:"name"`
-	Connections      int    `json:"connections"`
-	HTTPSDirect      bool   `json:"httpsDirect"`
+	ClientIdentifier string   `json:"clientIdentifier"`
+	Name             string   `json:"name"`
+	Connections      int      `json:"connections"`
+	HTTPSDirect      bool     `json:"httpsDirect"`
+	ConnectionHosts  []string `json:"connectionHosts"`
 }
 
 // ListServers returns the selectable PMS resources for the owner token.
@@ -230,9 +233,25 @@ func (s *Service) ListServers(ctx context.Context) ([]ServerSummary, error) {
 			Name:             r.Name,
 			Connections:      len(r.Connections),
 			HTTPSDirect:      hasHTTPSDirect(r.Connections),
+			ConnectionHosts:  connectionHosts(r.Connections),
 		})
 	}
 	return out, nil
+}
+
+// connectionHosts lists distinct URI hostnames for diagnostics.
+func connectionHosts(conns []plextv.Connection) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, c := range conns {
+		u, err := url.Parse(c.URI)
+		if err != nil || u.Host == "" || seen[u.Host] {
+			continue
+		}
+		seen[u.Host] = true
+		out = append(out, u.Host)
+	}
+	return out
 }
 
 // ownerTokenForAdmin resolves the pending token, else the stored credential.

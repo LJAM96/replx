@@ -63,6 +63,26 @@ func CustomURLPresent(resources []plextv.Resource, selectedID, publicHost string
 	return false
 }
 
+// seenHosts lists the connection hosts plex.tv publishes for a resource,
+// so a failed Custom URL check shows ground truth instead of guessing.
+func seenHosts(resources []plextv.Resource, selectedID string) []string {
+	for _, r := range resources {
+		if r.ClientIdentifier != selectedID {
+			continue
+		}
+		var out []string
+		for _, c := range r.Connections {
+			u, err := url.Parse(c.URI)
+			if err != nil || u.Host == "" {
+				continue
+			}
+			out = append(out, u.Host)
+		}
+		return out
+	}
+	return nil
+}
+
 // VerifyReport is the browser-safe verification result (no tokens).
 type VerifyReport struct {
 	Stage             string   `json:"stage"`
@@ -145,7 +165,8 @@ func (s *Service) Verify(ctx context.Context) (VerifyReport, error) {
 	if !report.CustomURLPresent {
 		report.Stage = StageSelected
 		report.Checks = append(report.Checks, "Custom Server Access URL NOT published: add "+s.PublicURL+" on the PMS and re-verify")
-		return report, fmt.Errorf("onboarding: Custom Server Access URL %s not published for this PMS", s.PublicURL)
+		return report, fmt.Errorf("onboarding: Custom Server Access URL %s not published for this PMS (plex.tv lists: %s)",
+			s.PublicURL, strings.Join(seenHosts(resources, resourceID), ", "))
 	}
 	if _, err := s.DB.Exec(ctx, "UPDATE plex_owner_credentials SET status='verified' WHERE server_id=$1", serverID); err != nil {
 		return VerifyReport{}, err
