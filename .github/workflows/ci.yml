@@ -62,8 +62,8 @@ jobs:
         ports: ["5432:5432"]
     steps:
       - uses: actions/checkout@v4
-      - run: PGPASSWORD=test psql -h localhost -U replx_edge -d replx_edge -f migrations/0001_init.sql
-      - run: PGPASSWORD=test psql -h localhost -U replx_edge -d replx_edge -c "SELECT count(*) FROM schema_migrations;" || PGPASSWORD=test psql -h localhost -U replx_edge -d replx_edge -c "\\dt"
+      - run: for f in migrations/*.sql; do echo "== $f"; PGPASSWORD=test psql -h localhost -U replx_edge -d replx_edge -v ON_ERROR_STOP=1 -f "$f"; done
+      - run: PGPASSWORD=test psql -h localhost -U replx_edge -d replx_edge -c "TABLE schema_migrations;"
 
   docker:
     runs-on: ubuntu-latest

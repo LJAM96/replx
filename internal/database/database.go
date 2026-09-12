@@ -51,6 +51,15 @@ func (p *Pool) Close() {
 	}
 }
 
+// Raw exposes the underlying pool for store queries in other packages.
+// Callers must respect the single-active-origin and audit invariants.
+func (p *Pool) Raw() *pgxpool.Pool {
+	if p == nil {
+		return nil
+	}
+	return p.inner
+}
+
 // Ping reports Postgres reachability with a short timeout.
 func (p *Pool) Ping(ctx context.Context) bool {
 	if p == nil || p.inner == nil {

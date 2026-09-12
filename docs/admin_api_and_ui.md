@@ -70,6 +70,13 @@ Responses include:
 | GET | `/api/v1/logs` | Structured logs |
 | GET | `/api/v1/settings` | Safe runtime settings |
 | PATCH | `/api/v1/settings` | Change safe runtime settings |
+| GET | `/api/v1/onboarding/status` | Onboarding stage and identity |
+| POST | `/api/v1/onboarding/pin` | Issue Plex PIN (returns claim URL + code, never tokens) |
+| GET | `/api/v1/onboarding/pin` | Poll PIN claim |
+| GET | `/api/v1/onboarding/resources` | Selectable PMS resources (tokens stripped) |
+| POST | `/api/v1/onboarding/select` | Bind one PMS (`{clientIdentifier}`) |
+| POST | `/api/v1/onboarding/verify` | Identity triple-check + Custom URL report |
+| GET | `/admin/onboarding` | Server-rendered onboarding and verification panel |
 
 ## Rate limiting and job control
 

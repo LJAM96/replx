@@ -2291,6 +2291,20 @@ CREATE TABLE app_settings (
 );
 ```
 
+## app_identity
+
+Installation identity for Plex owner onboarding. Exactly one row. The Ed25519 private key is stored encrypted with key material derived from `REPLX_EDGE_SECRET_KEY`; the stable client identifier binds Plex PIN and API calls to this installation.
+
+```sql
+CREATE TABLE app_identity (
+    id text PRIMARY KEY DEFAULT 'singleton' CHECK (id = 'singleton'),
+    client_identifier text NOT NULL,
+    jwk_public jsonb NOT NULL,
+    jwk_private_ciphertext bytea NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
 ## Retention worker
 
 At least daily:
@@ -2382,6 +2396,13 @@ Responses include:
 | GET | `/api/v1/logs` | Structured logs |
 | GET | `/api/v1/settings` | Safe runtime settings |
 | PATCH | `/api/v1/settings` | Change safe runtime settings |
+| GET | `/api/v1/onboarding/status` | Onboarding stage and identity |
+| POST | `/api/v1/onboarding/pin` | Issue Plex PIN (returns claim URL + code, never tokens) |
+| GET | `/api/v1/onboarding/pin` | Poll PIN claim |
+| GET | `/api/v1/onboarding/resources` | Selectable PMS resources (tokens stripped) |
+| POST | `/api/v1/onboarding/select` | Bind one PMS (`{clientIdentifier}`) |
+| POST | `/api/v1/onboarding/verify` | Identity triple-check + Custom URL report |
+| GET | `/admin/onboarding` | Server-rendered onboarding and verification panel |
 
 ## Rate limiting and job control
 
@@ -2717,6 +2738,7 @@ CI fixture tests cannot replace real client regression. Before a major replx-edg
 | `POSTGRES_USER` | No | Postgres user (`replx_edge`) |
 | `REPLX_EDGE_POSTGRES_URL` | No | Full Postgres URL override (tests, non-Compose) |
 | `REPLX_EDGE_VALKEY_ADDR` | No | Valkey `host:port` (`valkey:6379`); down degrades cache, never readiness |
+| `REPLX_EDGE_PLEXTV_URL` | No | plex.tv API root override (tests only; default `https://plex.tv`) |
 
 ## Removed ambiguous variable
 

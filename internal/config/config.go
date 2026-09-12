@@ -40,6 +40,8 @@ type Config struct {
 	// Valkey address as host:port. Cache is best-effort: Valkey down
 	// degrades to PMS fall-through, never to failed readiness.
 	ValkeyAddr string
+	// PlexTVBase is the plex.tv API root (override for tests only).
+	PlexTVBase string
 }
 
 func getenv(key, def string) string {
@@ -68,6 +70,7 @@ func Load() (Config, error) {
 		PostgresPass:      getenv("POSTGRES_PASSWORD", ""),
 		PostgresURL:       getenv("REPLX_EDGE_POSTGRES_URL", ""),
 		ValkeyAddr:        getenv("REPLX_EDGE_VALKEY_ADDR", getenv("VALKEY_ADDR", "valkey:6379")),
+		PlexTVBase:        getenv("REPLX_EDGE_PLEXTV_URL", "https://plex.tv"),
 	}
 	adminPort, err := strconv.Atoi(getenv("REPLX_EDGE_ADMIN_PORT", "8080"))
 	if err != nil || adminPort <= 0 || adminPort > 65535 {

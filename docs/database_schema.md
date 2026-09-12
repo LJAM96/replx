@@ -506,6 +506,20 @@ CREATE TABLE app_settings (
 );
 ```
 
+## app_identity
+
+Installation identity for Plex owner onboarding. Exactly one row. The Ed25519 private key is stored encrypted with key material derived from `REPLX_EDGE_SECRET_KEY`; the stable client identifier binds Plex PIN and API calls to this installation.
+
+```sql
+CREATE TABLE app_identity (
+    id text PRIMARY KEY DEFAULT 'singleton' CHECK (id = 'singleton'),
+    client_identifier text NOT NULL,
+    jwk_public jsonb NOT NULL,
+    jwk_private_ciphertext bytea NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
 ## Retention worker
 
 At least daily:

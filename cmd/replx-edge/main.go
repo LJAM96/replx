@@ -22,10 +22,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/LJAM96/replx-edge/internal/admin"
 	"github.com/LJAM96/replx-edge/internal/config"
 	"github.com/LJAM96/replx-edge/internal/database"
 	"github.com/LJAM96/replx-edge/internal/health"
 	"github.com/LJAM96/replx-edge/internal/logging"
+	"github.com/LJAM96/replx-edge/internal/onboarding"
+	"github.com/LJAM96/replx-edge/internal/plextv"
 	"github.com/LJAM96/replx-edge/internal/pms"
 	"github.com/LJAM96/replx-edge/internal/proxy"
 	"github.com/LJAM96/replx-edge/internal/valkey"
@@ -129,12 +132,27 @@ func runServe() error {
 	}()
 	valkeyOK := func() bool { return valkey.Ping(cfg.ValkeyAddr, 2*time.Second) }
 
-	adminMux := health.AdminMux(health.Checks{
+	onboard := &onboarding.Service{
+		DB:          db.Raw(),
+		NewTV:       func(clientID string) onboarding.TVClient { return tvClientFor(cfg, clientID) },
+		ControlBase: "http://127.0.0.1:32400",
+		Secret:      cfg.SecretKey,
+		PublicURL:   cfg.PublicURL,
+		InternalURL: cfg.OriginInternalURL,
+	}
+	setupToken, err := admin.NewSetupToken()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "replx-edge onboarding panel: http://127.0.0.1:%d/admin/onboarding (setup token valid for this process)\n", cfg.AdminPort)
+	fmt.Fprintf(os.Stderr, "onboarding setup token: %s\n", setupToken)
+
+	adminMux := admin.NewMux(health.Checks{
 		MigrationsComplete: db.MigrationsComplete,
 		PostgresOK:         func() bool { return db.Ping(ctx) },
 		ValkeyOK:           valkeyOK,
 		PMSStatus:          func() string { return pmsStatus.Load().(string) },
-	})
+	}, onboard, setupToken, true)
 	adminSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.AdminPort),
 		Handler:           adminMux,
@@ -181,6 +199,17 @@ func runMediaGateway() error {
 	}
 	fmt.Fprintf(os.Stdout, "replx-edge %s media-gateway starting\n", version)
 	return srv.ListenAndServe()
+}
+
+// tvClientFor binds a plex.tv client to the installation client ID.
+func tvClientFor(cfg config.Config, clientID string) *plextv.Client {
+	return &plextv.Client{
+		BaseURL:          cfg.PlexTVBase,
+		ClientIdentifier: clientID,
+		Product:          "Replx Edge",
+		Version:          version,
+		Platform:         "Linux",
+	}
 }
 
 func adminHealthURL() string {

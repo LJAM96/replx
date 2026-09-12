@@ -31,6 +31,7 @@
 | `POSTGRES_USER` | No | Postgres user (`replx_edge`) |
 | `REPLX_EDGE_POSTGRES_URL` | No | Full Postgres URL override (tests, non-Compose) |
 | `REPLX_EDGE_VALKEY_ADDR` | No | Valkey `host:port` (`valkey:6379`); down degrades cache, never readiness |
+| `REPLX_EDGE_PLEXTV_URL` | No | plex.tv API root override (tests only; default `https://plex.tv`) |
 
 ## Removed ambiguous variable
 
