@@ -121,6 +121,54 @@ func TestOriginDownIsBadGateway(t *testing.T) {
 	}
 }
 
+func TestUnknownTranscodeDeniedInTunnelMode(t *testing.T) {
+	paths := []string{
+		"/video/:/transcode/future/new-media-route",
+		"/music/:/transcode/future/chunk",
+		"/video/:/transcode/sessions/123/unknown",
+	}
+	for _, p := range paths {
+		contacted := false
+		origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			contacted = true
+			_, _ = w.Write([]byte("must never stream"))
+		}))
+		h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel"})
+		if err != nil {
+			origin.Close()
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		origin.Close()
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), MediaRouteUnavailable) {
+			t.Errorf("%s: want fail-closed 403, got %d %s", p, rec.Code, rec.Body.String())
+		}
+		if contacted {
+			t.Errorf("%s: origin must not be contacted", p)
+		}
+	}
+}
+
+func TestUnknownTranscodePassesInDirectMode(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("direct-safe"))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/video/:/transcode/future/new-media-route", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("direct mode has no tunnel invariant: got %d", rec.Code)
+	}
+}
+
 type stubSpike struct {
 	location string
 	ok       bool

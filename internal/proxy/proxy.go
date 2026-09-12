@@ -101,18 +101,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(RequestIDHeader, id)
 
 	routeClass := "control"
-	if gateway.IsBulkMediaRoute(r.URL.Path) {
+	action := gateway.Classify(r.URL.Path)
+	if action == gateway.ActionMediaRedirect {
 		routeClass = "media"
 	}
 
-	if routeClass == "media" && h.mode == "cloudflare_tunnel" {
+	if action == gateway.ActionMediaRedirect && h.mode == "cloudflare_tunnel" {
 		if h.spike != nil {
 			if loc, ok := h.spike.Resolve(r, id); ok {
 				h.writeMediaRedirect(w, r, id, start, loc)
 				return
 			}
 		}
-		h.writeMediaUnavailable(w, r, id, start)
+		h.writeMediaUnavailable(w, r, id, start, "unavailable")
+		return
+	}
+	if action == gateway.ActionDenyUnknownMedia && h.mode == "cloudflare_tunnel" {
+		// Unknown semantics under a media namespace: deny in tunnel mode
+		// (no Cloudflare bytes), pass through in direct mode where no
+		// tunnel invariant is at risk.
+		h.writeMediaUnavailable(w, r, id, start, "denied-unknown-transcode")
 		return
 	}
 	if h.serveStreaming(w, r, id, start) {
@@ -130,7 +138,7 @@ func (h *Handler) writeMediaRedirect(w http.ResponseWriter, r *http.Request, id 
 	})
 }
 
-func (h *Handler) writeMediaUnavailable(w http.ResponseWriter, r *http.Request, id string, start time.Time) {
+func (h *Handler) writeMediaUnavailable(w http.ResponseWriter, r *http.Request, id string, start time.Time, decision string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusForbidden)
@@ -141,7 +149,7 @@ func (h *Handler) writeMediaUnavailable(w http.ResponseWriter, r *http.Request, 
 			"requestId": id,
 		},
 	})
-	h.emit(r, id, "media", http.StatusForbidden, start, map[string]any{"decision": "unavailable"})
+	h.emit(r, id, "media", http.StatusForbidden, start, map[string]any{"decision": decision})
 }
 
 func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id, routeClass string, start time.Time) {

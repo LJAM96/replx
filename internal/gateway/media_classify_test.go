@@ -22,10 +22,26 @@ func TestClassify(t *testing.T) {
 		"/music/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F2",
 		"/video/:/transcode/session/abc123/stop",
 		"/video/:/transcode/statistics",
+		"/some/future/non-media-route",
 	}
 	for _, p := range control {
 		if IsBulkMediaRoute(p) {
 			t.Errorf("expected control route for %s", p)
+		}
+	}
+	// Unknown transcode-namespace paths DENY: uncertainty is not control.
+	denied := []string{
+		"/video/:/transcode/future/new-media-route",
+		"/music/:/transcode/future/chunk",
+		"/video/:/transcode/sessions/123/unknown",
+		"/video/:/transcode/session/abc123/something-new",
+	}
+	for _, p := range denied {
+		if Classify(p) != ActionDenyUnknownMedia {
+			t.Errorf("expected deny for %s, got %v", p, Classify(p))
+		}
+		if IsBulkMediaRoute(p) {
+			t.Errorf("denied path must not read as bulk media: %s", p)
 		}
 	}
 }

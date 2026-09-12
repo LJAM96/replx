@@ -1371,6 +1371,7 @@ All `X-Plex-*` values may also appear as query parameters.
 | `/library/parts/*` | Never | User | Allowed part substitution only | Critical | Direct origin or media gateway |
 | transcode start manifest | Never | User | Source query enforcement | Critical | Redirect initial manifest or media gateway |
 | transcode segments | Never | User | No | Session validation | Origin or media gateway |
+| unknown transcode-namespace path | Never | User | Deny, never proxied as control | Fail closed | `MEDIA_ROUTE_UNAVAILABLE` in tunnel mode; direct passthrough only where no tunnel invariant applies |
 | artwork transcoder | Long | User | No | No | Control plane permitted |
 | unknown non media | Never initially | User | No | No | Pass through |
 | unknown large body media | Never | User | No | Fail closed in tunnel mode | Do not Cloudflare proxy |
