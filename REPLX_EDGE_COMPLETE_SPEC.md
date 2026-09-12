@@ -2711,6 +2711,12 @@ CI fixture tests cannot replace real client regression. Before a major replx-edg
 | `REPLX_EDGE_AUDIT_RETENTION_DAYS` | No | Audit retention |
 | `REPLX_EDGE_MEDIA_FALLBACK_ENABLED` | No | Enable optional media gateway |
 | `REPLX_EDGE_MEDIA_PUBLIC_URL` | Conditional | DNS only media gateway hostname |
+| `POSTGRES_HOST` | No | Postgres host (`postgres` in Compose) |
+| `POSTGRES_PORT` | No | Postgres port (`5432`) |
+| `POSTGRES_DB` | No | Postgres database (`replx_edge`) |
+| `POSTGRES_USER` | No | Postgres user (`replx_edge`) |
+| `REPLX_EDGE_POSTGRES_URL` | No | Full Postgres URL override (tests, non-Compose) |
+| `REPLX_EDGE_VALKEY_ADDR` | No | Valkey `host:port` (`valkey:6379`); down degrades cache, never readiness |
 
 ## Removed ambiguous variable
 
@@ -3201,6 +3207,12 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: replx_edge
+      POSTGRES_USER: replx_edge
+      REPLX_EDGE_VALKEY_ADDR: valkey:6379
     volumes:
       - replx_edge_cache:/data/cache
       - replx_edge_artwork:/data/artwork
@@ -3246,6 +3258,12 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: replx_edge
+      POSTGRES_USER: replx_edge
+      REPLX_EDGE_VALKEY_ADDR: valkey:6379
     command: ["media-gateway"]
     ports:
       - "${REPLX_EDGE_MEDIA_PORT:-443}:32402"

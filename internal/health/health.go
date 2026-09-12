@@ -3,10 +3,11 @@
 // Admin listener:
 //
 //	GET /health/live   always 200 when the process is running
-//	GET /health/ready  200 when migrations are complete and Postgres+Valkey
-//	                   are reachable; 503 otherwise. PMS status is reported
-//	                   separately as healthy/degraded/unavailable and never
-//	                   gates admin readiness.
+//	GET /health/ready  200 when migrations are complete and Postgres is
+//	                   reachable; 503 otherwise. Valkey and PMS status are
+//	                   reported in the body but never gate readiness: cache
+//	                   degrades to PMS fall-through and PMS downtime must
+//	                   not take down the admin plane.
 //
 // Media gateway listener:
 //
@@ -41,15 +42,19 @@ func AdminMux(c Checks) *http.ServeMux {
 		if c.PostgresOK != nil && !c.PostgresOK() {
 			ready = false
 		}
-		if c.ValkeyOK != nil && !c.ValkeyOK() {
-			ready = false
-		}
 		pms := "unknown"
 		if c.PMSStatus != nil {
 			pms = c.PMSStatus()
 		}
+		valkey := "unknown"
+		if c.ValkeyOK != nil {
+			valkey = "ok"
+			if !c.ValkeyOK() {
+				valkey = "degraded"
+			}
+		}
 		status := http.StatusOK
-		body := map[string]string{"status": "ready", "pms": pms}
+		body := map[string]string{"status": "ready", "pms": pms, "valkey": valkey}
 		if !ready {
 			status = http.StatusServiceUnavailable
 			body["status"] = "not-ready"

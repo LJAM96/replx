@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -27,6 +28,18 @@ type Config struct {
 	MediaFallbackEnabled bool
 	MediaPublicURL       string
 	MediaPort            int
+	// Postgres connection. POSTGRES_HOST defaults to the Compose service
+	// name; REPLX_EDGE_POSTGRES_URL overrides all components when set
+	// (used by tests and non-Compose deployments).
+	PostgresHost string
+	PostgresPort int
+	PostgresDB   string
+	PostgresUser string
+	PostgresPass string
+	PostgresURL  string
+	// Valkey address as host:port. Cache is best-effort: Valkey down
+	// degrades to PMS fall-through, never to failed readiness.
+	ValkeyAddr string
 }
 
 func getenv(key, def string) string {
@@ -49,6 +62,12 @@ func Load() (Config, error) {
 		SecretKey:         getenv("REPLX_EDGE_SECRET_KEY", ""),
 		TunnelToken:       getenv("TUNNEL_TOKEN", ""),
 		MediaPublicURL:    getenv("REPLX_EDGE_MEDIA_PUBLIC_URL", ""),
+		PostgresHost:      getenv("POSTGRES_HOST", "postgres"),
+		PostgresDB:        getenv("POSTGRES_DB", "replx_edge"),
+		PostgresUser:      getenv("POSTGRES_USER", "replx_edge"),
+		PostgresPass:      getenv("POSTGRES_PASSWORD", ""),
+		PostgresURL:       getenv("REPLX_EDGE_POSTGRES_URL", ""),
+		ValkeyAddr:        getenv("REPLX_EDGE_VALKEY_ADDR", getenv("VALKEY_ADDR", "valkey:6379")),
 	}
 	adminPort, err := strconv.Atoi(getenv("REPLX_EDGE_ADMIN_PORT", "8080"))
 	if err != nil || adminPort <= 0 || adminPort > 65535 {
@@ -60,6 +79,11 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid REPLX_EDGE_MEDIA_PORT")
 	}
 	cfg.MediaPort = mediaPort
+	pgPort, err := strconv.Atoi(getenv("POSTGRES_PORT", "5432"))
+	if err != nil || pgPort <= 0 || pgPort > 65535 {
+		return Config{}, fmt.Errorf("invalid POSTGRES_PORT")
+	}
+	cfg.PostgresPort = pgPort
 	cfg.MediaFallbackEnabled = strings.EqualFold(getenv("REPLX_EDGE_MEDIA_FALLBACK_ENABLED", "false"), "true")
 
 	if file := os.Getenv("TUNNEL_TOKEN_FILE"); file != "" && cfg.TunnelToken == "" {
@@ -94,4 +118,22 @@ func (c Config) Validate() error {
 		return fmt.Errorf("REPLX_EDGE_MEDIA_PUBLIC_URL is required when media fallback is enabled")
 	}
 	return nil
+}
+
+// DatabaseURL returns the Postgres connection URL, honouring an explicit
+// REPLX_EDGE_POSTGRES_URL override. The password is URL-escaped.
+func (c Config) DatabaseURL() string {
+	if c.PostgresURL != "" {
+		return c.PostgresURL
+	}
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(c.PostgresUser, c.PostgresPass),
+		Host:   fmt.Sprintf("%s:%d", c.PostgresHost, c.PostgresPort),
+		Path:   "/" + c.PostgresDB,
+	}
+	q := u.Query()
+	q.Set("sslmode", "disable")
+	u.RawQuery = q.Encode()
+	return u.String()
 }

@@ -13,17 +13,22 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/LJAM96/replx-edge/internal/config"
+	"github.com/LJAM96/replx-edge/internal/database"
 	"github.com/LJAM96/replx-edge/internal/health"
 	"github.com/LJAM96/replx-edge/internal/logging"
+	"github.com/LJAM96/replx-edge/internal/pms"
 	"github.com/LJAM96/replx-edge/internal/proxy"
+	"github.com/LJAM96/replx-edge/internal/valkey"
 )
 
 var version = "dev"
@@ -75,7 +80,61 @@ func runServe() error {
 		return err
 	}
 
-	adminMux := health.AdminMux(health.Checks{})
+	// Postgres pool + advisory-locked migrations. Failure degrades
+	// readiness but never takes down the admin plane: operators need
+	// the admin UI to inspect and recover.
+	ctx := context.Background()
+	db, err := database.Open(ctx, cfg.DatabaseURL())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	migrate := func() {
+		mctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		if err := db.Migrate(mctx); err != nil {
+			logger.Log(logging.Entry{Level: "error", Component: "database",
+				Fields: map[string]any{"event": "migrate_failed", "error": err.Error()}})
+			return
+		}
+		logger.Log(logging.Entry{Level: "info", Component: "database",
+			Fields: map[string]any{"event": "migrate_complete"}})
+	}
+	go func() {
+		migrate()
+		if db.MigrationsComplete() {
+			return
+		}
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			migrate()
+			if db.MigrationsComplete() {
+				return
+			}
+		}
+	}()
+
+	// PMS status refreshes in the background so readiness probes stay fast.
+	var pmsStatus atomic.Value
+	pmsStatus.Store(pms.StatusUnknown)
+	go func() {
+		refresh := func() { pmsStatus.Store(pms.Check(cfg.OriginInternalURL)) }
+		refresh()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			refresh()
+		}
+	}()
+	valkeyOK := func() bool { return valkey.Ping(cfg.ValkeyAddr, 2*time.Second) }
+
+	adminMux := health.AdminMux(health.Checks{
+		MigrationsComplete: db.MigrationsComplete,
+		PostgresOK:         func() bool { return db.Ping(ctx) },
+		ValkeyOK:           valkeyOK,
+		PMSStatus:          func() string { return pmsStatus.Load().(string) },
+	})
 	adminSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.AdminPort),
 		Handler:           adminMux,

@@ -43,6 +43,12 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: replx_edge
+      POSTGRES_USER: replx_edge
+      REPLX_EDGE_VALKEY_ADDR: valkey:6379
     volumes:
       - replx_edge_cache:/data/cache
       - replx_edge_artwork:/data/artwork
@@ -88,6 +94,12 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: replx_edge
+      POSTGRES_USER: replx_edge
+      REPLX_EDGE_VALKEY_ADDR: valkey:6379
     command: ["media-gateway"]
     ports:
       - "${REPLX_EDGE_MEDIA_PORT:-443}:32402"

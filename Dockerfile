@@ -1,13 +1,14 @@
 # Replx Edge production image (multi-arch amd64/arm64).
 # Builder compiles Go + admin frontend; final image is distroless nonroot.
-ARG GO_VERSION=1.24
+ARG GO_VERSION=1.25
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS go-builder
 WORKDIR /src
-COPY go.mod ./
-RUN go mod download 2>/dev/null || true
+COPY go.mod go.sum ./
+RUN go mod download
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
+COPY migrations/ ./migrations/
 ARG VERSION=dev
 ARG TARGETOS
 ARG TARGETARCH
