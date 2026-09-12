@@ -36,7 +36,7 @@ func Classify(path string) MediaRouteAction {
 	switch {
 	case strings.HasPrefix(p, "/library/parts/"):
 		return ActionMediaRedirect
-	case isDecision(p):
+	case isDecisionOrControl(p):
 		return ActionControl
 	case isManifest(p):
 		return ActionMediaRedirect
@@ -59,17 +59,21 @@ func inTranscodeNamespace(p string) bool {
 		strings.Contains(p, "/transcode/")
 }
 
-// isDecision matches playback negotiation endpoints (small, inspectable).
-func isDecision(p string) bool {
+// isDecisionOrControl matches negotiation/control endpoints (small, inspectable).
+func isDecisionOrControl(p string) bool {
 	return strings.Contains(p, "/transcode/universal/decision") ||
+		strings.Contains(p, "/transcode/universal/fallback") ||
 		strings.Contains(p, "/transcode/session/decision")
 }
 
 // isManifest matches initial HLS/DASH manifest or playlist requests whose
 // relative segments then resolve against the redirected origin host.
+// universal/subtitles returns transcoded subtitle file bytes, so it routes
+// as media rather than proxied control.
 func isManifest(p string) bool {
 	return strings.Contains(p, "/transcode/universal/start") ||
 		strings.Contains(p, "/transcode/universal/direct") ||
+		strings.Contains(p, "/transcode/universal/subtitles") ||
 		strings.Contains(p, "master.m3u8") ||
 		strings.Contains(p, "manifest.mpd") ||
 		strings.HasSuffix(p, ".m3u8") ||
@@ -90,6 +94,7 @@ func isSegment(p string) bool {
 // namespace deny rather than inherit transparency.
 func isSessionControl(p string) bool {
 	return strings.Contains(p, "/transcode/stop") ||
+		strings.Contains(p, "/transcode/universal/stop") ||
 		strings.Contains(p, "/transcode/statistics")
 }
 

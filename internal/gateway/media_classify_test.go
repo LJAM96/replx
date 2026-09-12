@@ -45,3 +45,33 @@ func TestClassify(t *testing.T) {
 		}
 	}
 }
+
+// TestDocumentedUniversalEndpoints pins the complete currently documented
+// PMS universal transcode surface for both media types, so future
+// classifier edits cannot silently block (or proxy) a known endpoint.
+func TestDocumentedUniversalEndpoints(t *testing.T) {
+	cases := []struct {
+		path string
+		want MediaRouteAction
+	}{
+		// Negotiation / control (small, inspectable, proxied).
+		{"/video/:/transcode/universal/decision", ActionControl},
+		{"/music/:/transcode/universal/decision", ActionControl},
+		{"/video/:/transcode/universal/fallback", ActionControl},
+		{"/music/:/transcode/universal/fallback", ActionControl},
+		{"/video/:/transcode/universal/stop", ActionControl},
+		{"/music/:/transcode/universal/stop", ActionControl},
+		// Byte-carrying routes (leave the Tunnel control path).
+		{"/video/:/transcode/universal/start.m3u8", ActionMediaRedirect},
+		{"/video/:/transcode/universal/start.mpd", ActionMediaRedirect},
+		{"/music/:/transcode/universal/start.m3u8", ActionMediaRedirect},
+		{"/video/:/transcode/universal/direct/abc/file.mp4", ActionMediaRedirect},
+		{"/video/:/transcode/universal/subtitles", ActionMediaRedirect},
+		{"/music/:/transcode/universal/subtitles", ActionMediaRedirect},
+	}
+	for _, tc := range cases {
+		if got := Classify(tc.path); got != tc.want {
+			t.Errorf("%s: want %v, got %v", tc.path, tc.want, got)
+		}
+	}
+}

@@ -9,7 +9,7 @@ zb install go
 go version
 
 echo "==> Docker CLI + VM"
-zb install docker colima qemu docker-compose
+zb install docker colima qemu docker-compose docker-buildx
 
 # Workaround 1: zerobrew qemu lacks the hypervisor entitlement.
 if ! codesign -d --entitlements - /opt/zerobrew/bin/qemu-system-aarch64 2>/dev/null | grep -q com.apple.security.hypervisor; then
@@ -35,9 +35,10 @@ if [ ! -e /opt/zerobrew/opt/pcre2 ]; then
   ln -s "$latest" /opt/zerobrew/opt/pcre2
 fi
 
-# Compose v2 plugin for the zerobrew docker CLI.
+# Compose v2 + buildx plugins for the zerobrew docker CLI.
 mkdir -p ~/.docker/cli-plugins
 ln -sf /opt/zerobrew/bin/docker-compose ~/.docker/cli-plugins/docker-compose
+ln -sf /opt/zerobrew/bin/docker-buildx ~/.docker/cli-plugins/docker-buildx
 
 if ! colima status >/dev/null 2>&1; then
   echo "==> starting colima (qemu driver)"
