@@ -688,6 +688,8 @@ A background worker checks hourly and refreshes within 24 hours of expiry. The n
 
 If plex.tv rejects the JWT PIN shape, onboarding falls back to the legacy PIN token flow and records the mode explicitly. Legacy tokens have no refresh: they are validated on use and require re-onboarding on 401. The fallback is logged loudly and never silent.
 
+A backup path accepts a pasted Plex token (`POST /api/v1/onboarding/token`, plus a panel field) for headless recovery when the PIN flow is unreachable. Pasted tokens are GetUser-validated before storage, never echoed back, and always treated as legacy: refresh signs with this installation's device key, which a token minted for another client will not renew.
+
 If refresh fails:
 
 ```text
@@ -2424,6 +2426,7 @@ Responses include:
 | GET | `/api/v1/onboarding/status` | Onboarding stage and identity |
 | POST | `/api/v1/onboarding/pin` | Issue Plex PIN (returns claim URL + code, never tokens) |
 | GET | `/api/v1/onboarding/pin` | Poll PIN claim |
+| POST | `/api/v1/onboarding/token` | Backup: validate + store a pasted Plex token (never echoed back; always legacy, no refresh) |
 | GET | `/api/v1/onboarding/resources` | Selectable PMS resources (tokens stripped) |
 | POST | `/api/v1/onboarding/select` | Bind one PMS (`{clientIdentifier}`) |
 | POST | `/api/v1/onboarding/verify` | Identity triple-check + Custom URL report |

@@ -58,6 +58,7 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 	m.mux.HandleFunc("/admin/logout", m.handleLogout)
 	m.mux.HandleFunc("/api/v1/onboarding/status", m.auth(m.handleStatus))
 	m.mux.HandleFunc("/api/v1/onboarding/pin", m.auth(m.handlePIN))
+	m.mux.HandleFunc("/api/v1/onboarding/token", m.auth(m.handleToken))
 	m.mux.HandleFunc("/api/v1/onboarding/resources", m.auth(m.handleResources))
 	m.mux.HandleFunc("/api/v1/onboarding/select", m.auth(m.handleSelect))
 	m.mux.HandleFunc("/api/v1/onboarding/verify", m.auth(m.handleVerify))
@@ -205,6 +206,43 @@ func (m *Mux) handlePIN(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleToken is the backup path: paste an existing Plex token. The token
+// is validated before storage and never echoed back.
+func (m *Mux) handleToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "POST only")
+		return
+	}
+	// Accept JSON {token} from API clients and form posts from the panel.
+	var token string
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_BODY", "JSON {token} required")
+			return
+		}
+		token = body.Token
+	} else {
+		if err := r.ParseForm(); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_BODY", "unparseable form")
+			return
+		}
+		token = r.FormValue("token")
+	}
+	username, err := m.svc.SubmitToken(r.Context(), token)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "TOKEN_REJECTED", err.Error())
+		return
+	}
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		writeData(w, http.StatusOK, map[string]any{"authenticated": true, "username": username, "stage": m.svc.Status(r.Context())["stage"]})
+		return
+	}
+	http.Redirect(w, r, "/admin/onboarding?msg="+url.QueryEscape("token accepted for "+username), http.StatusSeeOther)
+}
+
 func (m *Mux) handleResources(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
@@ -318,7 +356,11 @@ func (m *Mux) handlePanel(w http.ResponseWriter, r *http.Request) {
 <h2>3. Verify identity triple-check</h2>
 <form method="post"><input type="hidden" name="csrf" value="%s"><button name="verify" value="1" type="submit">Run verify</button></form>
 <p>Verify proves origin root, plex.tv resource and proxied root name the same machineIdentifier, and the Custom Server Access URL is published.</p>
-</body></html>`, csrf)
+<h2>Backup: paste a Plex token</h2>
+<p>Only if the PIN flow is unreachable. The token is validated before storage, never shown back, and treated as legacy (no refresh).</p>
+<form method="post" action="/api/v1/onboarding/token"><input type="hidden" name="csrf" value="%s"><input type="password" name="token" size="52" autocomplete="off">
+<button type="submit">Submit token</button></form>
+</body></html>`, csrf, csrf)
 }
 
 func (m *Mux) handleSpikeEvents(w http.ResponseWriter, r *http.Request) {

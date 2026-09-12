@@ -243,3 +243,62 @@ func TestLegacyFallbackLive(t *testing.T) {
 		t.Fatalf("expected legacy fallback, got %+v", issue)
 	}
 }
+
+func TestSubmitTokenLive(t *testing.T) {
+	dbURL := os.Getenv("REPLX_EDGE_TEST_POSTGRES_URL")
+	if dbURL == "" {
+		t.Skip("REPLX_EDGE_TEST_POSTGRES_URL not set")
+	}
+	ctx := t.Context()
+	pool, err := database.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := pool.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	for _, q := range []string{
+		"TRUNCATE plex_servers, plex_identities, client_instances, app_identity CASCADE",
+		"DELETE FROM app_settings WHERE key LIKE 'onboarding.%'",
+	} {
+		if _, err := pool.Raw().Exec(ctx, q); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	tv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/user" && r.Header.Get("X-Plex-Token") == "pasted-good-token" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 11, "username": "pasteowner"})
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer tv.Close()
+	svc := &Service{
+		DB:          pool.Raw(),
+		NewTV:       func(clientID string) TVClient { return &plextv.Client{BaseURL: tv.URL, ClientIdentifier: clientID} },
+		Secret:      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		PublicURL:   "https://test-public.example",
+		InternalURL: "http://127.0.0.1:9",
+	}
+	if _, err := svc.SubmitToken(ctx, "bogus"); err == nil {
+		t.Fatal("invalid token must be rejected")
+	}
+	if _, err := svc.SubmitToken(ctx, "short"); err == nil {
+		t.Fatal("short token must be rejected")
+	}
+	username, err := svc.SubmitToken(ctx, "pasted-good-token")
+	if err != nil || username != "pasteowner" {
+		t.Fatalf("submit: %q %v", username, err)
+	}
+	if got := svc.Status(ctx)["stage"]; got != StageOwnerAuthenticated {
+		t.Fatalf("stage: %v", got)
+	}
+	if got := svc.Status(ctx)["authMode"]; got != "legacy" {
+		t.Fatalf("pasted tokens are always legacy (no refresh), got %v", got)
+	}
+	// Cleanup so shared-DB siblings observe a clean slate.
+	for _, k := range []string{"onboarding.owner_token", "onboarding.owner_expires", "onboarding.auth_mode", "onboarding.pin_id", "onboarding.pin_code", "onboarding.verified"} {
+		_, _ = pool.Raw().Exec(ctx, "DELETE FROM app_settings WHERE key=$1", k)
+	}
+}

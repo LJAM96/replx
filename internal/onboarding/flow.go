@@ -183,6 +183,51 @@ func kidFor(clientID string) string {
 	return clientID
 }
 
+// SubmitToken is the backup onboarding path: the operator pastes an
+// existing Plex token (e.g. when the PIN flow is unreachable). The token
+// is validated with GetUser before storage and kept encrypted exactly
+// like a PIN-claimed one, but it is always treated as legacy: refresh
+// signs with this installation's device key, which a token minted for
+// another client will not renew. Re-onboarding is required on 401.
+func (s *Service) SubmitToken(ctx context.Context, rawToken string) (string, error) {
+	token := strings.TrimSpace(rawToken)
+	if len(token) < 8 {
+		return "", fmt.Errorf("onboarding: token too short to be valid")
+	}
+	id, err := s.EnsureIdentity(ctx)
+	if err != nil {
+		return "", err
+	}
+	user, err := s.NewTV(id.ClientID).GetUser(ctx, token)
+	if err != nil {
+		return "", fmt.Errorf("onboarding: token invalid: %w", err)
+	}
+	ct, err := crypto.Encrypt(s.Secret, PurposeOwnerJWT, []byte(token))
+	if err != nil {
+		return "", err
+	}
+	if exp, ok := plextv.ParseExpiry(token); ok {
+		_ = setSetting(ctx, s.DB, setOwnerExp, strconv.FormatInt(exp.Unix(), 10))
+	} else {
+		delSetting(ctx, s.DB, setOwnerExp)
+	}
+	tb := []byte(token)
+	for i := range tb {
+		tb[i] = 0
+	}
+	token = ""
+	if err := setSetting(ctx, s.DB, setOwnerToken, base64.StdEncoding.EncodeToString(ct)); err != nil {
+		return "", err
+	}
+	// A pasted credential replaces any in-flight PIN and voids prior
+	// verification, exactly like a fresh claim.
+	delSetting(ctx, s.DB, setPINID)
+	delSetting(ctx, s.DB, setPINCode)
+	delSetting(ctx, s.DB, setVerified)
+	_ = setSetting(ctx, s.DB, setAuthMode, authModeLegacy)
+	return user.Username, nil
+}
+
 // pendingOwnerToken decrypts the pre-selection owner token, if any.
 func (s *Service) pendingOwnerToken(ctx context.Context) (string, bool) {
 	raw, ok := getSetting(ctx, s.DB, setOwnerToken)
