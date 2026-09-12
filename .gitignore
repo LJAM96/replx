@@ -1,0 +1,7 @@
+.DS_Store
+.env
+deploy/.env
+bin/
+web/admin/node_modules/
+web/admin/dist/
+*.log

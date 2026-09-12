@@ -1,0 +1,12 @@
+.git/
+.gitignore
+.DS_Store
+.env
+deploy/.env
+REPLX_EDGE_COMPLETE_SPEC.md
+web/admin/node_modules/
+web/admin/dist/
+bin/
+*.log
+postgres_data/
+valkey_data/

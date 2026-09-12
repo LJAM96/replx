@@ -1,0 +1,12 @@
+{
+  "name": "replx-edge-admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "mkdir -p dist && cp index.html dist/index.html",
+    "lint": "echo 'admin lint: Svelte+TS lands in Iota; placeholder passes'",
+    "typecheck": "echo 'admin typecheck: placeholder passes'",
+    "test": "echo 'admin tests: placeholder passes'"
+  }
+}

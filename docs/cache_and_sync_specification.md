@@ -1,0 +1,116 @@
+# Cache and Synchronisation Specification
+
+## Cache layers
+
+Replx Edge uses three distinct data classes:
+
+```text
+PostgreSQL internal library index
+Valkey user scoped response cache
+Filesystem artwork and trace storage
+```
+
+The library index is shared internal data. It is not a ready made user response cache.
+
+## Safe default scope
+
+Any PMS response that may vary by permissions, watched state, progress, recommendations, sharing, user restrictions or personalization is cached per internal Plex identity.
+
+Production 1.0 defaults to user scoped response caching.
+
+This includes library browse responses and item metadata unless a route has been explicitly proven user independent.
+
+## Shared data
+
+The owner synchronized library index may be shared internally for:
+
+* media variant lookup
+* canonical identity
+* search candidate generation
+* administration
+* cache invalidation targeting
+
+Before a shared index result is returned to a user, Replx Edge must ensure the user's PMS permissions and visibility are respected. Local search should fall back to PMS when Replex cannot prove that a result is visible to that user.
+
+Artwork binaries may be shared when their URL and transformation key are identical and the user has already been authorized to reference the artwork.
+
+## Cache isolation invariant
+
+No user may receive another user's:
+
+```text
+Continue Watching
+watched state
+progress
+home hubs
+restricted library entries
+personalized metadata
+```
+
+CI must include a two user isolation test that poisons one user's cache and proves the second user never receives it.
+
+## Canonical cache key
+
+```text
+replx_edge:{schema}:{server}:{class}:{scope}:{representation}:{hash}
+```
+
+For user scoped entries:
+
+```text
+scope=user:{identity_uuid}
+```
+
+Raw Plex tokens never appear in keys.
+
+## Default TTLs
+
+| Class | TTL | Stale allowance |
+| --- | ---: | ---: |
+| PMS identity | 5 minutes | 30 minutes |
+| Library list | 5 minutes | 30 minutes |
+| Browse page | 60 seconds | 10 minutes |
+| Item metadata | 5 minutes | 30 minutes |
+| Collections | 2 minutes | 15 minutes |
+| Home hubs | 10 seconds | 30 seconds |
+| Continue Watching | 5 seconds | 30 seconds |
+| Recently Added | 15 seconds | 2 minutes |
+| Search response | 30 seconds | 2 minutes |
+| Artwork | 7 days | 30 days |
+
+Never stale serve writes, playback decisions, session termination, timeline or scrobble operations.
+
+## Stampede control
+
+Use a short Valkey refresh lock. One request refreshes an expired object while other requests either use the permitted stale value or wait for a bounded duration.
+
+## Owner library sync
+
+Owner sync uses the encrypted owner PMS credential obtained during onboarding.
+
+Initial sync indexes library sections, items, GUIDs, variants, parts and streams using pagination. Progress is persisted and resumable.
+
+## Events and reconciliation
+
+Use PMS event streams for targeted invalidation and refresh. Events are not assumed lossless, so reconcile periodically.
+
+Default schedule:
+
+```text
+light reconciliation every 15 minutes
+full consistency sweep every 6 hours
+```
+
+## Continue Watching
+
+Cache the actual user scoped PMS Continue Watching response. Do not attempt to reimplement Plex's Continue Watching ranking algorithm.
+
+Invalidate after successful timeline, scrobble and unscrobble changes.
+
+## Search
+
+PostgreSQL provides candidate search with FTS and trigram indexes. In Production 1.0 the local index covers `title`, `sort_title` and `original_title` only. Cast, director, collection and label search fall back to PMS. Search is an optimization. If visibility or index freshness is uncertain, use PMS.
+
+## Cloudflare
+
+Cloudflare edge cache remains disabled for Plex API routes in Production 1.0. Replx Edge owns cache correctness.

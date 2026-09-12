@@ -1,0 +1,119 @@
+name: replx-edge
+
+services:
+  postgres:
+    image: postgres:${POSTGRES_VERSION}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: replx_edge
+      POSTGRES_USER: replx_edge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U replx_edge -d replx_edge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  valkey:
+    image: valkey/valkey:${VALKEY_VERSION}
+    restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - valkey_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  replx-edge:
+    image: ghcr.io/${REPLX_EDGE_IMAGE_OWNER}/replx-edge:${REPLX_EDGE_VERSION}
+    restart: unless-stopped
+    user: "65532:65532"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - replx_edge_cache:/data/cache
+      - replx_edge_artwork:/data/artwork
+      - replx_edge_diagnostics:/data/diagnostics
+    ports:
+      - "127.0.0.1:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
+    networks:
+      - frontend
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "/app/replx-edge", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  cloudflared:
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION}
+    restart: unless-stopped
+    depends_on:
+      replx-edge:
+        condition: service_healthy
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    command: ["tunnel", "--no-autoupdate", "run"]
+    networks:
+      - frontend
+
+  media-gateway:
+    image: ghcr.io/${REPLX_EDGE_IMAGE_OWNER}/replx-edge:${REPLX_EDGE_VERSION}
+    profiles: ["media"]
+    restart: unless-stopped
+    user: "65532:65532"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: ["media-gateway"]
+    ports:
+      - "${REPLX_EDGE_MEDIA_PORT:-443}:32402"
+    networks:
+      - frontend
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "/app/replx-edge", "media-gateway-healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  postgres_data:
+  valkey_data:
+  replx_edge_cache:
+  replx_edge_artwork:
+  replx_edge_diagnostics:
+
+networks:
+  frontend:
+  backend:
+    internal: true

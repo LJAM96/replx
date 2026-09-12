@@ -1,0 +1,10 @@
+{
+  "MediaContainer": {
+    "decision": {"code": 2000, "text": "Direct Play"},
+    "directPlay": true,
+    "directStream": false,
+    "transcode": false,
+    "mediaIndex": 1,
+    "note": "SANITIZED fixture: Jodie 1080p selection must resolve to origin media index 1"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "MediaContainer": {
+    "size": 1,
+    "hub": [{"hubIdentifier": "continueWatching", "size": 1, "Video": [{"ratingKey": "1001", "viewOffset": 12345}]}],
+    "note": "SANITIZED: user scoped, 5s TTL, invalidated by timeline/scrobble"
+  }
+}

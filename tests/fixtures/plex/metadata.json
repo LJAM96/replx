@@ -1,0 +1,38 @@
+{
+  "MediaContainer": {
+    "size": 1,
+    "identifier": "tv.plex.provider.discover",
+    "Media": [
+      {
+        "id": 1,
+        "index": 0,
+        "container": "mkv",
+        "videoCodec": "hevc",
+        "videoProfile": "main 10",
+        "width": 3840,
+        "height": 2160,
+        "bitrate": 61000,
+        "videoResolution": "2160",
+        "dynamicRange": "HDR",
+        "Part": [
+          {"id": 11, "key": "/library/parts/11/file.mkv", "container": "mkv", "size": 1000, "duration": 1000}
+        ]
+      },
+      {
+        "id": 2,
+        "index": 1,
+        "container": "mp4",
+        "videoCodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "bitrate": 14000,
+        "videoResolution": "1080",
+        "dynamicRange": "SDR",
+        "Part": [
+          {"id": 12, "key": "/library/parts/12/file.mp4", "container": "mp4", "size": 500, "duration": 1000}
+        ]
+      }
+    ],
+    "title": "Fixture Movie (SANITIZED, no tokens, no user state)"
+  }
+}
