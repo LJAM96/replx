@@ -139,6 +139,7 @@ The files under `docs/` and `deploy/` are canonical source documents.
 | `docs/admin_api_and_ui.md` | Admin REST API and UI |
 | `docs/diagnostics_observability.md` | Tracing, logs, metrics and retention |
 | `docs/client_compatibility_testing.md` | Real client compatibility programme |
+| `docs/spike_runbook.md` | P0 307 spike procedure and decision gate |
 | `docs/configuration_reference.md` | Environment and runtime configuration |
 | `docs/operations_runbook.md` | Production operations |
 | `docs/ci_release_backup_upgrade.md` | CI, releases, backup and upgrade |

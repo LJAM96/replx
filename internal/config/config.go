@@ -42,6 +42,9 @@ type Config struct {
 	ValkeyAddr string
 	// PlexTVBase is the plex.tv API root (override for tests only).
 	PlexTVBase string
+	// SpikeRouting enables the P0 307 media spike. Default off: media
+	// fails closed in tunnel mode until the matrix validates a client.
+	SpikeRouting bool
 }
 
 func getenv(key, def string) string {
@@ -71,6 +74,7 @@ func Load() (Config, error) {
 		PostgresURL:       getenv("REPLX_EDGE_POSTGRES_URL", ""),
 		ValkeyAddr:        getenv("REPLX_EDGE_VALKEY_ADDR", getenv("VALKEY_ADDR", "valkey:6379")),
 		PlexTVBase:        getenv("REPLX_EDGE_PLEXTV_URL", "https://plex.tv"),
+		SpikeRouting:      strings.EqualFold(getenv("REPLX_EDGE_SPIKE_ROUTING", "false"), "true"),
 	}
 	adminPort, err := strconv.Atoi(getenv("REPLX_EDGE_ADMIN_PORT", "8080"))
 	if err != nil || adminPort <= 0 || adminPort > 65535 {

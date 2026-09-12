@@ -18,7 +18,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/LJAM96/replx-edge/internal/plextv"
 	"github.com/LJAM96/replx-edge/internal/pms"
 	"github.com/LJAM96/replx-edge/internal/proxy"
+	"github.com/LJAM96/replx-edge/internal/spike"
 	"github.com/LJAM96/replx-edge/internal/valkey"
 )
 
@@ -73,14 +76,6 @@ func runServe() error {
 
 	if cfg.OriginInternalURL == "" {
 		return fmt.Errorf("REPLX_EDGE_ORIGIN_INTERNAL_URL is required for serve")
-	}
-	proxyHandler, err := proxy.New(proxy.Options{
-		OriginBase:  cfg.OriginInternalURL,
-		IngressMode: cfg.IngressMode,
-		Logger:      logger,
-	})
-	if err != nil {
-		return err
 	}
 
 	// Postgres pool + advisory-locked migrations. Failure degrades
@@ -132,6 +127,26 @@ func runServe() error {
 	}()
 	valkeyOK := func() bool { return valkey.Ping(cfg.ValkeyAddr, 2*time.Second) }
 
+	// P0 spike: 307 media redirects with trace capture. Off by default;
+	// media fails closed until the matrix validates a client.
+	var spikeStore *spike.Store
+	var spikeOpt proxy.SpikeResolver
+	if cfg.SpikeRouting {
+		spikeStore = spike.NewPostgresStore(db.Raw(), publicHostOf(cfg.PublicURL), logger)
+		spikeOpt = spikeStore
+		logger.Log(logging.Entry{Level: "warn", Component: "routing.spike",
+			Fields: map[string]any{"event": "spike_enabled"}})
+	}
+	proxyHandler, err := proxy.New(proxy.Options{
+		OriginBase:  cfg.OriginInternalURL,
+		IngressMode: cfg.IngressMode,
+		Logger:      logger,
+		Spike:       spikeOpt,
+	})
+	if err != nil {
+		return err
+	}
+
 	onboard := &onboarding.Service{
 		DB:          db.Raw(),
 		NewTV:       func(clientID string) onboarding.TVClient { return tvClientFor(cfg, clientID) },
@@ -144,15 +159,17 @@ func runServe() error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stdout, "replx-edge onboarding panel: http://127.0.0.1:%d/admin/onboarding (setup token valid for this process)\n", cfg.AdminPort)
 	fmt.Fprintf(os.Stderr, "onboarding setup token: %s\n", setupToken)
 
+	spikeObs := spike.Observations{DB: db.Raw()}
 	adminMux := admin.NewMux(health.Checks{
 		MigrationsComplete: db.MigrationsComplete,
 		PostgresOK:         func() bool { return db.Ping(ctx) },
 		ValkeyOK:           valkeyOK,
 		PMSStatus:          func() string { return pmsStatus.Load().(string) },
-	}, onboard, setupToken, true)
+	}, onboard, setupToken, true, spikeStore, &spikeObs)
+	fmt.Fprintf(os.Stdout, "replx-edge onboarding panel: http://127.0.0.1:%d/admin/onboarding | spike matrix: http://127.0.0.1:%d/admin/spike\n",
+		cfg.AdminPort, cfg.AdminPort)
 	adminSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.AdminPort),
 		Handler:           adminMux,
@@ -199,6 +216,15 @@ func runMediaGateway() error {
 	}
 	fmt.Fprintf(os.Stdout, "replx-edge %s media-gateway starting\n", version)
 	return srv.ListenAndServe()
+}
+
+// publicHostOf returns the lowercase hostname of the public URL.
+func publicHostOf(publicURL string) string {
+	u, err := url.Parse(publicURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
 }
 
 // tvClientFor binds a plex.tv client to the installation client ID.

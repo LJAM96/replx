@@ -32,6 +32,7 @@
 | `REPLX_EDGE_POSTGRES_URL` | No | Full Postgres URL override (tests, non-Compose) |
 | `REPLX_EDGE_VALKEY_ADDR` | No | Valkey `host:port` (`valkey:6379`); down degrades cache, never readiness |
 | `REPLX_EDGE_PLEXTV_URL` | No | plex.tv API root override (tests only; default `https://plex.tv`) |
+| `REPLX_EDGE_SPIKE_ROUTING` | No | P0 spike 307 media redirects (`false` = fail-closed 403) |
 
 ## Removed ambiguous variable
 

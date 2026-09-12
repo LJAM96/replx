@@ -1,10 +1,10 @@
 // Package proxy is the Alpha transparent Plex reverse proxy.
 //
 // Non-media routes stream through untouched. Bulk media routes fail closed
-// with MEDIA_ROUTE_UNAVAILABLE in cloudflare_tunnel ingress mode: Replx
-// Edge must never silently stream video through the Cloudflare control
-// hostname. The P0 routing spike later upgrades allowed parts to ADR 001
-// 307 redirects; the fail-closed default stays for everything else.
+// with MEDIA_ROUTE_UNAVAILABLE in cloudflare_tunnel ingress mode unless a
+// SpikeResolver is configured (P0 spike): resolution upgrades the response
+// to an ADR 001 307 redirect, resolution failure still fails closed. Replx
+// Edge never silently streams video through the Cloudflare control hostname.
 package proxy
 
 import (
@@ -19,6 +19,7 @@ import (
 	"github.com/LJAM96/replx-edge/internal/gateway"
 	"github.com/LJAM96/replx-edge/internal/logging"
 	"github.com/LJAM96/replx-edge/internal/requestid"
+	"github.com/LJAM96/replx-edge/internal/routing"
 )
 
 // RequestIDHeader is returned on every control response. Plex clients
@@ -42,6 +43,12 @@ var hopByHop = map[string]bool{
 	"Proxy-Authorization": true,
 }
 
+// SpikeResolver maps a media request to an ADR 001 redirect target.
+// Nil disables spike routing and keeps fail-closed behaviour.
+type SpikeResolver interface {
+	Resolve(r *http.Request, requestID string) (location string, ok bool)
+}
+
 // Options configures the proxy handler.
 type Options struct {
 	// OriginBase is the server-to-server PMS URL, e.g. https://origin:32400.
@@ -52,12 +59,16 @@ type Options struct {
 	// Client overrides the origin HTTP client (tests). Nil uses a default
 	// client with a 30s response-header timeout.
 	Client *http.Client
+	// Spike, when non-nil, upgrades fail-closed media to 307 redirects
+	// where it resolves. Resolution failures still fail closed.
+	Spike SpikeResolver
 }
 
 // Handler proxies Plex requests to the origin PMS.
 type Handler struct {
 	origin *url.URL
 	mode   string
+	spike  SpikeResolver
 	log    *logging.Logger
 	client *http.Client
 }
@@ -81,7 +92,7 @@ func New(opts Options) (*Handler, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
-	return &Handler{origin: base, mode: opts.IngressMode, log: opts.Logger, client: client}, nil
+	return &Handler{origin: base, mode: opts.IngressMode, log: opts.Logger, client: client, spike: opts.Spike}, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -95,10 +106,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if routeClass == "media" && h.mode == "cloudflare_tunnel" {
+		if h.spike != nil {
+			if loc, ok := h.spike.Resolve(r, id); ok {
+				h.writeMediaRedirect(w, r, id, start, loc)
+				return
+			}
+		}
 		h.writeMediaUnavailable(w, r, id, start)
 		return
 	}
 	h.proxy(w, r, id, routeClass, start)
+}
+
+func (h *Handler) writeMediaRedirect(w http.ResponseWriter, r *http.Request, id string, start time.Time, location string) {
+	routing.WriteMediaRedirect(w, location)
+	h.emit(r, id, "media", http.StatusTemporaryRedirect, start, map[string]any{
+		"decision": "redirected",
+		"location": routing.RedactedLocation(location),
+		"range":    r.Header.Get("Range") != "",
+	})
 }
 
 func (h *Handler) writeMediaUnavailable(w http.ResponseWriter, r *http.Request, id string, start time.Time) {
@@ -112,7 +138,7 @@ func (h *Handler) writeMediaUnavailable(w http.ResponseWriter, r *http.Request, 
 			"requestId": id,
 		},
 	})
-	h.emit(r, id, "media", http.StatusForbidden, start)
+	h.emit(r, id, "media", http.StatusForbidden, start, map[string]any{"decision": "unavailable"})
 }
 
 func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id, routeClass string, start time.Time) {
@@ -151,7 +177,7 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id, routeClass s
 	w.Header().Set(RequestIDHeader, id)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
-	h.emit(r, id, routeClass, resp.StatusCode, start)
+	h.emit(r, id, routeClass, resp.StatusCode, start, nil)
 }
 
 func (h *Handler) writeBadGateway(w http.ResponseWriter, r *http.Request, id, routeClass string, start time.Time) {
@@ -165,10 +191,10 @@ func (h *Handler) writeBadGateway(w http.ResponseWriter, r *http.Request, id, ro
 			"requestId": id,
 		},
 	})
-	h.emit(r, id, routeClass, http.StatusBadGateway, start)
+	h.emit(r, id, routeClass, http.StatusBadGateway, start, nil)
 }
 
-func (h *Handler) emit(r *http.Request, id, routeClass string, status int, start time.Time) {
+func (h *Handler) emit(r *http.Request, id, routeClass string, status int, start time.Time, fields map[string]any) {
 	if h.log == nil {
 		return
 	}
@@ -182,6 +208,7 @@ func (h *Handler) emit(r *http.Request, id, routeClass string, status int, start
 		Duration:  time.Since(start).Milliseconds(),
 		Route:     routeClass,
 		Cache:     "bypass",
+		Fields:    fields,
 	})
 }
 

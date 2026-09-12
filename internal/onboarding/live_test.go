@@ -28,6 +28,16 @@ func TestLiveOnboardingFlow(t *testing.T) {
 	if err := pool.Migrate(ctx); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	// Isolate from other live tests sharing this database.
+	for _, q := range []string{
+		"TRUNCATE plex_servers, plex_identities, client_instances, app_identity CASCADE",
+		"DELETE FROM app_settings WHERE key LIKE 'onboarding.%'",
+		"DELETE FROM compatibility_profiles WHERE platform='Web' AND product='Plex Web'",
+	} {
+		if _, err := pool.Raw().Exec(ctx, q); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
 
 	const machine = "pms-machine-1"
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

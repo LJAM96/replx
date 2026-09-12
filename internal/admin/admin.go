@@ -21,6 +21,7 @@ import (
 
 	"github.com/LJAM96/replx-edge/internal/health"
 	"github.com/LJAM96/replx-edge/internal/onboarding"
+	"github.com/LJAM96/replx-edge/internal/spike"
 )
 
 // NewSetupToken generates a per-process bootstrap token.
@@ -36,14 +37,17 @@ func NewSetupToken() (string, error) {
 type Mux struct {
 	mux         *http.ServeMux
 	svc         *onboarding.Service
+	spike       *spike.Store
+	spikeObs    *spike.Observations
 	setupToken  string
 	requireAuth bool
 }
 
-// NewMux builds the admin mux. When requireAuth is true, onboarding routes
-// (API + panel) require the setup token bearer.
-func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, requireAuth bool) *Mux {
-	m := &Mux{mux: http.NewServeMux(), svc: svc, setupToken: setupToken, requireAuth: requireAuth}
+// NewMux builds the admin mux. When requireAuth is true, API and panel
+// routes require the setup token bearer. spikeStore may be nil (spike
+// disabled): the events endpoint then reports disabled instead of failing.
+func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, requireAuth bool, spikeStore *spike.Store, spikeObs *spike.Observations) *Mux {
+	m := &Mux{mux: http.NewServeMux(), svc: svc, spike: spikeStore, spikeObs: spikeObs, setupToken: setupToken, requireAuth: requireAuth}
 	m.mux.Handle("/health/", health.AdminMux(checks))
 	m.mux.HandleFunc("/api/v1/onboarding/status", m.auth(m.handleStatus))
 	m.mux.HandleFunc("/api/v1/onboarding/pin", m.auth(m.handlePIN))
@@ -51,6 +55,9 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 	m.mux.HandleFunc("/api/v1/onboarding/select", m.auth(m.handleSelect))
 	m.mux.HandleFunc("/api/v1/onboarding/verify", m.auth(m.handleVerify))
 	m.mux.HandleFunc("/admin/onboarding", m.auth(m.handlePanel))
+	m.mux.HandleFunc("/api/v1/spike/events", m.auth(m.handleSpikeEvents))
+	m.mux.HandleFunc("/api/v1/spike/observations", m.auth(m.handleSpikeObservations))
+	m.mux.HandleFunc("/admin/spike", m.auth(m.handleSpikePanel))
 	return m
 }
 
@@ -224,4 +231,101 @@ func (m *Mux) handlePanel(w http.ResponseWriter, r *http.Request) {
 <form method="post"><button name="verify" value="1" type="submit">Run verify</button></form>
 <p>Verify proves origin root, plex.tv resource and proxied root name the same machineIdentifier, and the Custom Server Access URL is published.</p>
 </body></html>`)
+}
+
+func (m *Mux) handleSpikeEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
+		return
+	}
+	events := []spike.Event{}
+	enabled := m.spike != nil
+	if enabled {
+		events = m.spike.Events()
+	}
+	writeData(w, http.StatusOK, map[string]any{"enabled": enabled, "events": events})
+}
+
+func (m *Mux) handleSpikeObservations(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		rows, err := m.spikeObs.Matrix(r.Context())
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "MATRIX_FAILED", err.Error())
+			return
+		}
+		if rows == nil {
+			rows = []spike.ObservationRow{}
+		}
+		writeData(w, http.StatusOK, map[string]any{"observations": rows})
+	case http.MethodPost:
+		var in spike.Observation
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&in); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_BODY", "observation JSON required")
+			return
+		}
+		if err := m.spikeObs.Record(r.Context(), in); err != nil {
+			writeError(w, http.StatusBadRequest, "RECORD_FAILED", err.Error())
+			return
+		}
+		writeData(w, http.StatusCreated, map[string]any{"recorded": true})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET or POST")
+	}
+}
+
+func (m *Mux) handleSpikePanel(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		_ = r.ParseForm()
+		msg := ""
+		var in spike.Observation
+		in.Platform = r.Form.Get("platform")
+		in.Product = r.Form.Get("product")
+		in.ProductVersion = r.Form.Get("productVersion")
+		in.PlaybackType = r.Form.Get("playbackType")
+		in.Status = r.Form.Get("status")
+		in.Notes = r.Form.Get("notes")
+		if err := m.spikeObs.Record(r.Context(), in); err != nil {
+			msg = "record failed: " + err.Error()
+		} else {
+			msg = "recorded " + in.Product + " " + in.PlaybackType + " " + in.Status
+		}
+		http.Redirect(w, r, "/admin/spike?msg="+url.QueryEscape(msg), http.StatusSeeOther)
+		return
+	}
+	rows, _ := m.spikeObs.Matrix(r.Context())
+	events := []spike.Event{}
+	enabled := m.spike != nil
+	if enabled {
+		events = m.spike.Events()
+		if len(events) > 20 {
+			events = events[len(events)-20:]
+		}
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><title>Replx Edge spike matrix</title></head><body>
+<h1>P0 spike matrix</h1>
+<p>Spike routing: <b>%v</b></p>
+<p>%s</p>
+<h2>Record observation</h2>
+<form method="post">
+platform <input name="platform" value="Web"> product <input name="product" value="Plex Web">
+version <input name="productVersion"> playbackType <input name="playbackType" value="progressive">
+status <select name="status"><option>SUPPORTED</option><option>DEGRADED</option><option>UNSUPPORTED</option><option>UNKNOWN</option><option>ADMIN_FORCED</option></select>
+notes <input name="notes" size="60"> <button type="submit">Record</button></form>
+<h2>Matrix</h2>
+<ul>`, enabled, html.EscapeString(r.URL.Query().Get("msg")))
+	for _, o := range rows {
+		_, _ = fmt.Fprintf(w, "<li>%s %s %s %s n=%d: %s</li>", html.EscapeString(o.Platform),
+			html.EscapeString(o.Product), html.EscapeString(o.PlaybackType), html.EscapeString(o.Status),
+			o.Observations, html.EscapeString(o.Notes))
+	}
+	_, _ = fmt.Fprint(w, "</ul><h2>Recent spike traces (redacted, newest last)</h2><ul>")
+	for _, e := range events {
+		_, _ = fmt.Fprintf(w, "<li>%s %s %s %s range=%v %s</li>", html.EscapeString(e.Timestamp),
+			html.EscapeString(e.Method), html.EscapeString(e.Path), html.EscapeString(e.Decision),
+			e.RangePresent, html.EscapeString(e.RedactedLocation))
+	}
+	_, _ = fmt.Fprint(w, "</ul></body></html>")
 }

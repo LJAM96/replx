@@ -120,3 +120,67 @@ func TestOriginDownIsBadGateway(t *testing.T) {
 		t.Fatalf("want 502 ORIGIN_UNAVAILABLE, got %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+type stubSpike struct {
+	location string
+	ok       bool
+}
+
+func (s stubSpike) Resolve(r *http.Request, requestID string) (string, bool) {
+	return s.location, s.ok
+}
+
+func TestSpikeRedirectUpgradesMedia(t *testing.T) {
+	var logs bytes.Buffer
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("origin must not be contacted on spike redirect")
+	}))
+	defer origin.Close()
+	h, err := New(Options{
+		OriginBase:  origin.URL,
+		IngressMode: "cloudflare_tunnel",
+		Logger:      logging.New(&logs),
+		Spike:       stubSpike{location: "https://origin.example:32400/library/parts/11/x?X-Plex-Token=s3cr3t", ok: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/parts/11/x", nil)
+	req.Header.Set("X-Plex-Token", "s3cr3t")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	res := rec.Result()
+	if res.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("want 307, got %d", res.StatusCode)
+	}
+	if got := res.Header.Get("Location"); !strings.HasPrefix(got, "https://origin.example:32400/") {
+		t.Fatalf("location: %s", got)
+	}
+	if res.Header.Get("Cache-Control") != "no-store" || res.Header.Get(RequestIDHeader) == "" {
+		t.Fatal("missing no-store or request id")
+	}
+	if strings.Contains(logs.String(), "s3cr3t") {
+		t.Fatalf("token leaked to logs: %s", logs.String())
+	}
+}
+
+func TestSpikeMissStaysFailClosed(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("origin must not be contacted")
+	}))
+	defer origin.Close()
+	h, err := New(Options{
+		OriginBase:  origin.URL,
+		IngressMode: "cloudflare_tunnel",
+		Spike:       stubSpike{ok: false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/parts/11/x", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), MediaRouteUnavailable) {
+		t.Fatalf("want fail-closed 403, got %d %s", rec.Code, rec.Body.String())
+	}
+}

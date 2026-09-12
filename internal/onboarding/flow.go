@@ -229,15 +229,20 @@ func (s *Service) SelectResource(ctx context.Context, clientIdentifier string) (
 		return SelectReport{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Serialize concurrent selections and satisfy the single-enabled
+	// partial unique index: disable first, then insert.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext('replx_edge_onboarding'))"); err != nil {
+		return SelectReport{}, fmt.Errorf("onboarding: lock: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "UPDATE plex_servers SET enabled=false WHERE enabled"); err != nil {
+		return SelectReport{}, fmt.Errorf("onboarding: single-origin guard: %w", err)
+	}
 	var serverID string
 	err = tx.QueryRow(ctx, `INSERT INTO plex_servers(name, internal_origin_url, client_media_origin_url, machine_identifier, friendly_name, plex_version, connection_status)
 		VALUES($1, $2, $3, $4, $5, $6, 'unknown') RETURNING id`,
 		picked.Name, s.InternalURL, mediaOrigin, originID.MachineIdentifier, originID.FriendlyName, originID.Version).Scan(&serverID)
 	if err != nil {
 		return SelectReport{}, fmt.Errorf("onboarding: save server: %w", err)
-	}
-	if _, err := tx.Exec(ctx, "UPDATE plex_servers SET enabled=false WHERE id != $1", serverID); err != nil {
-		return SelectReport{}, fmt.Errorf("onboarding: single-origin guard: %w", err)
 	}
 	var jwkPublic string
 	var jwkPriv []byte

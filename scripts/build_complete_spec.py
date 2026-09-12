@@ -19,6 +19,7 @@ order = [
     'docs/admin_api_and_ui.md',
     'docs/diagnostics_observability.md',
     'docs/client_compatibility_testing.md',
+    'docs/spike_runbook.md',
     'docs/configuration_reference.md',
     'docs/operations_runbook.md',
     'docs/ci_release_backup_upgrade.md',
