@@ -3298,6 +3298,7 @@ name: replx-edge
 
 services:
   postgres:
+    container_name: replx-edge-postgres
     image: postgres:${POSTGRES_VERSION}
     restart: unless-stopped
     environment:
@@ -3315,6 +3316,7 @@ services:
       retries: 5
 
   valkey:
+    container_name: replx-edge-valkey
     image: valkey/valkey:${VALKEY_VERSION}
     restart: unless-stopped
     command: ["valkey-server", "--appendonly", "yes"]
@@ -3329,6 +3331,7 @@ services:
       retries: 5
 
   replx-edge:
+    container_name: replx-edge
     image: ghcr.io/${REPLX_EDGE_IMAGE_OWNER}/replx-edge:${REPLX_EDGE_VERSION}
     restart: unless-stopped
     user: "65532:65532"
@@ -3387,6 +3390,7 @@ services:
       start_period: 60s
 
   cloudflared:
+    container_name: replx-edge-cloudflared
     image: cloudflare/cloudflared:${CLOUDFLARED_VERSION}
     restart: unless-stopped
     depends_on:
@@ -3399,6 +3403,7 @@ services:
       - frontend
 
   media-gateway:
+    container_name: replx-edge-media-gateway
     image: ghcr.io/${REPLX_EDGE_IMAGE_OWNER}/replx-edge:${REPLX_EDGE_VERSION}
     profiles: ["media"]
     restart: unless-stopped
