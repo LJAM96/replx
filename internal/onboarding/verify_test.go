@@ -3,7 +3,7 @@ package onboarding
 import (
 	"testing"
 
-	"github.com/LJAM96/replx-edge/internal/plextv"
+	"github.com/LJAM96/replx/internal/plextv"
 )
 
 func conns() []plextv.Connection {

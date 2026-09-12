@@ -3,58 +3,87 @@ package onboarding
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/LJAM96/replx-edge/internal/crypto"
-	"github.com/LJAM96/replx-edge/internal/plextv"
-	"github.com/LJAM96/replx-edge/internal/pms"
+	"github.com/LJAM96/replx/internal/crypto"
+	"github.com/LJAM96/replx/internal/plextv"
+	"github.com/LJAM96/replx/internal/pms"
 )
 
 // TVClient is the plex.tv surface onboarding needs (real client or fake).
 type TVClient interface {
 	AuthURL(pin plextv.PIN) string
 	CreatePIN(ctx context.Context) (plextv.PIN, error)
+	CreatePINJWT(ctx context.Context, jwk json.RawMessage) (plextv.PIN, error)
 	PollPIN(ctx context.Context, id int64) (string, error)
+	PollPINJWT(ctx context.Context, id int64, deviceJWT string) (string, error)
 	GetUser(ctx context.Context, token string) (plextv.User, error)
 	ListServers(ctx context.Context, token string) ([]plextv.Resource, error)
+	Nonce(ctx context.Context, token string) (string, error)
+	RefreshToken(ctx context.Context, deviceJWT string) (string, error)
 }
+
+// Auth modes persisted in app_settings.
+const (
+	authModeJWT    = "jwt"
+	authModeLegacy = "legacy"
+)
 
 const (
 	setPINID      = "onboarding.pin_id"
 	setPINCode    = "onboarding.pin_code"
 	setOwnerToken = "onboarding.owner_token"
 	setVerified   = "onboarding.verified"
+	setAuthMode   = "onboarding.auth_mode"
+	setOwnerExp   = "onboarding.owner_expires"
 )
 
 // PINIssue is the administrator-facing claim material.
 type PINIssue struct {
-	AuthURL string `json:"authUrl"`
-	Code    string `json:"code"`
-	Stage   string `json:"stage"`
+	AuthURL  string `json:"authUrl"`
+	Code     string `json:"code"`
+	Stage    string `json:"stage"`
+	AuthMode string `json:"authMode"`
 }
 
 // IssuePIN creates the installation identity if needed, issues a strong
-// PIN at plex.tv and persists the claim window so a restart never orphans it.
+// PIN bound to the device JWK (JWT flow), and persists the claim window.
+// If plex.tv rejects the JWT shape, it falls back to the legacy PIN and
+// records the mode so polling matches. The mode is surfaced in Status.
 func (s *Service) IssuePIN(ctx context.Context) (PINIssue, error) {
-	id, err := s.EnsureIdentity(ctx)
+	id, _, jwk, err := s.DeviceCredentials(ctx)
 	if err != nil {
 		return PINIssue{}, err
 	}
-	tv := s.NewTV(id.ClientID)
-	pin, err := tv.CreatePIN(ctx)
+	tv := s.NewTV(id)
+	mode := authModeJWT
+	pin, err := tv.CreatePINJWT(ctx, jwk)
 	if err != nil {
-		return PINIssue{}, fmt.Errorf("onboarding: PIN: %w", err)
+		if !plextv.IsClientError(err) {
+			return PINIssue{}, fmt.Errorf("onboarding: PIN: %w", err)
+		}
+		mode = authModeLegacy
+		if pin, err = tv.CreatePIN(ctx); err != nil {
+			return PINIssue{}, fmt.Errorf("onboarding: PIN: %w", err)
+		}
 	}
+	if err := setSetting(ctx, s.DB, setAuthMode, mode); err != nil {
+		return PINIssue{}, err
+	}
+	// New issuance voids any prior verification.
+	delSetting(ctx, s.DB, setVerified)
 	if err := setSetting(ctx, s.DB, setPINID, strconv.FormatInt(pin.ID, 10)); err != nil {
 		return PINIssue{}, err
 	}
 	if err := setSetting(ctx, s.DB, setPINCode, pin.Code); err != nil {
 		return PINIssue{}, err
 	}
-	return PINIssue{AuthURL: tv.AuthURL(pin), Code: pin.Code, Stage: StagePINIssued}, nil
+	return PINIssue{AuthURL: tv.AuthURL(pin), Code: pin.Code, Stage: StagePINIssued, AuthMode: mode}, nil
 }
 
 // PollClaim checks whether the administrator claimed the PIN. On first
@@ -70,18 +99,20 @@ func (s *Service) PollClaim(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("onboarding: bad PIN state")
 	}
-	id, err := s.EnsureIdentity(ctx)
+	clientID, seed, _, err := s.DeviceCredentials(ctx)
 	if err != nil {
 		return false, err
 	}
-	token, err := s.NewTV(id.ClientID).PollPIN(ctx, pinID)
+	tv := s.NewTV(clientID)
+	mode, _ := getSetting(ctx, s.DB, setAuthMode)
+	token, err := s.pollByMode(ctx, tv, pinID, mode, clientID, seed)
 	if err != nil {
-		return false, fmt.Errorf("onboarding: poll: %w", err)
+		return false, err
 	}
 	if token == "" {
 		return false, nil
 	}
-	user, err := s.NewTV(id.ClientID).GetUser(ctx, token)
+	user, err := tv.GetUser(ctx, token)
 	if err != nil {
 		return false, fmt.Errorf("onboarding: token invalid: %w", err)
 	}
@@ -89,14 +120,67 @@ func (s *Service) PollClaim(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if exp, ok := plextv.ParseExpiry(token); ok {
+		_ = setSetting(ctx, s.DB, setOwnerExp, strconv.FormatInt(exp.Unix(), 10))
+	} else {
+		delSetting(ctx, s.DB, setOwnerExp)
+	}
+	for i := range seed {
+		seed[i] = 0
+	}
 	token = ""
 	if err := setSetting(ctx, s.DB, setOwnerToken, base64.StdEncoding.EncodeToString(ct)); err != nil {
 		return false, err
 	}
 	delSetting(ctx, s.DB, setPINID)
 	delSetting(ctx, s.DB, setPINCode)
+	delSetting(ctx, s.DB, setVerified) // new authentication voids prior verification
 	_ = user
 	return true, nil
+}
+
+// pollByMode polls for the claim in the issuance mode, falling back from
+// JWT to legacy once if plex.tv rejects the device JWT.
+func (s *Service) pollByMode(ctx context.Context, tv TVClient, pinID int64, mode, clientID string, seed []byte) (string, error) {
+	if mode != authModeLegacy {
+		signer, err := deviceSigner(clientID, seed)
+		if err != nil {
+			return "", err
+		}
+		deviceJWT, err := signer.Sign("plex.tv", nil)
+		if err != nil {
+			return "", err
+		}
+		token, err := tv.PollPINJWT(ctx, pinID, deviceJWT)
+		if err == nil {
+			return token, nil
+		}
+		if !plextv.IsClientError(err) {
+			return "", fmt.Errorf("onboarding: poll: %w", err)
+		}
+		_ = setSetting(ctx, s.DB, setAuthMode, authModeLegacy)
+	}
+	token, err := tv.PollPIN(ctx, pinID)
+	if err != nil {
+		return "", fmt.Errorf("onboarding: poll: %w", err)
+	}
+	return token, nil
+}
+
+// deviceSigner builds the EdDSA signer. The kid matches the registered
+// JWK (first 8 client ID hex chars, as stored at identity creation).
+func deviceSigner(clientID string, seed []byte) (plextv.DeviceSigner, error) {
+	if len(seed) != 32 {
+		return plextv.DeviceSigner{}, fmt.Errorf("onboarding: bad device seed")
+	}
+	return plextv.DeviceSigner{Seed: append([]byte(nil), seed...), Kid: kidFor(clientID), ClientID: clientID}, nil
+}
+
+func kidFor(clientID string) string {
+	if len(clientID) >= 8 {
+		return clientID[:8]
+	}
+	return clientID
 }
 
 // pendingOwnerToken decrypts the pre-selection owner token, if any.
@@ -261,6 +345,9 @@ func (s *Service) SelectResource(ctx context.Context, clientIdentifier string) (
 		return SelectReport{}, fmt.Errorf("onboarding: commit: %w", err)
 	}
 	delSetting(ctx, s.DB, setOwnerToken)
+	// A new selection voids any prior verification: verified state is
+	// always tied to the currently enabled server (see Status).
+	delSetting(ctx, s.DB, setVerified)
 	return SelectReport{MachineIdentifier: originID.MachineIdentifier, MediaOrigin: mediaOrigin, Stage: StageSelected}, nil
 }
 
@@ -272,8 +359,14 @@ type SelectReport struct {
 }
 
 // Status reports the current onboarding stage for the admin panel.
+// Verification is tied to the enabled server: verified is reported only
+// when the stored verification machine matches it, so reselecting a
+// server can never inherit a stale verified state.
 func (s *Service) Status(ctx context.Context) map[string]any {
 	out := map[string]any{"stage": StagePending}
+	if mode, ok := getSetting(ctx, s.DB, setAuthMode); ok {
+		out["authMode"] = mode
+	}
 	if _, ok := getSetting(ctx, s.DB, setPINID); ok {
 		out["stage"] = StagePINIssued
 		if code, ok := getSetting(ctx, s.DB, setPINCode); ok {
@@ -288,10 +381,90 @@ func (s *Service) Status(ctx context.Context) map[string]any {
 		out["stage"] = StageSelected
 		out["machineIdentifier"] = machineID
 	}
-	if v, ok := getSetting(ctx, s.DB, setVerified); ok && v == "true" {
+	if v, ok := getSetting(ctx, s.DB, setVerified); ok && v == machineID && machineID != "" {
 		out["stage"] = StageVerified
 	}
 	return out
+}
+
+// RefreshOwnerJWT refreshes a JWT-mode owner credential when it expires
+// within 24h (nonce flow). Legacy tokens have no refresh: they are
+// validated on use and require re-onboarding on 401. Returns true when a
+// new token was stored. Failures degrade (status auth_degraded) without
+// destroying the existing credential.
+func (s *Service) RefreshOwnerJWT(ctx context.Context) (bool, error) {
+	mode, _ := getSetting(ctx, s.DB, setAuthMode)
+	if mode == authModeLegacy {
+		return false, nil
+	}
+	rawExp, ok := getSetting(ctx, s.DB, setOwnerExp)
+	if !ok {
+		return false, nil
+	}
+	expUnix, err := strconv.ParseInt(rawExp, 10, 64)
+	if err != nil || time.Until(time.Unix(expUnix, 0)) > 24*time.Hour {
+		return false, nil
+	}
+	var serverID string
+	var ownerCipher []byte
+	if err := s.DB.QueryRow(ctx, `SELECT server_id, owner_token_ciphertext FROM plex_owner_credentials
+		JOIN plex_servers ON plex_servers.id=server_id WHERE plex_servers.enabled
+		ORDER BY plex_servers.created_at DESC LIMIT 1`).Scan(&serverID, &ownerCipher); err != nil {
+		return false, nil
+	}
+	owner, err := crypto.Decrypt(s.Secret, PurposeOwnerJWT, ownerCipher)
+	if err != nil {
+		return false, err
+	}
+	defer zeroBytes(owner)
+	clientID, seed, _, err := s.DeviceCredentials(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		for i := range seed {
+			seed[i] = 0
+		}
+	}()
+	signer, err := deviceSigner(clientID, seed)
+	if err != nil {
+		return false, err
+	}
+	tv := s.NewTV(clientID)
+	nonce, err := tv.Nonce(ctx, string(owner))
+	if err != nil {
+		return s.degraded(serverID, err)
+	}
+	deviceJWT, err := signer.Sign("plex.tv", map[string]any{"nonce": nonce})
+	if err != nil {
+		return false, err
+	}
+	fresh, err := tv.RefreshToken(ctx, deviceJWT)
+	if err != nil {
+		return s.degraded(serverID, err)
+	}
+	freshCipher, err := crypto.Encrypt(s.Secret, PurposeOwnerJWT, []byte(fresh))
+	if err != nil {
+		return false, err
+	}
+	if _, err := s.DB.Exec(ctx, `UPDATE plex_owner_credentials SET owner_token_ciphertext=$1,
+		last_refreshed_at=now(), status='verified', last_error=NULL WHERE server_id=$2`, freshCipher, serverID); err != nil {
+		return false, err
+	}
+	if exp, ok := plextv.ParseExpiry(fresh); ok {
+		_ = setSetting(ctx, s.DB, setOwnerExp, strconv.FormatInt(exp.Unix(), 10))
+	}
+	fb := []byte(fresh)
+	for i := range fb {
+		fb[i] = 0
+	}
+	return true, nil
+}
+
+func (s *Service) degraded(serverID string, err error) (bool, error) {
+	_, _ = s.DB.Exec(context.Background(), `UPDATE plex_owner_credentials SET status='auth_degraded',
+		last_error=$1 WHERE server_id=$2`, err.Error(), serverID)
+	return false, fmt.Errorf("onboarding: refresh degraded: %w", err)
 }
 
 func publicHost(publicURL string) string {

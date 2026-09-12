@@ -8,9 +8,12 @@
 package plextv
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -67,9 +70,28 @@ func (c *Client) AuthURL(p PIN) string {
 
 // CreatePIN issues a strong PIN.
 func (c *Client) CreatePIN(ctx context.Context) (PIN, error) {
+	return c.createPIN(ctx, nil)
+}
+
+// CreatePINJWT issues a strong PIN bound to the device JWK. The JWK
+// registers the installation public key with plex.tv as part of the claim.
+func (c *Client) CreatePINJWT(ctx context.Context, jwk json.RawMessage) (PIN, error) {
+	body, err := json.Marshal(map[string]any{"jwk": json.RawMessage(jwk), "strong": true})
+	if err != nil {
+		return PIN{}, err
+	}
+	return c.createPIN(ctx, body)
+}
+
+func (c *Client) createPIN(ctx context.Context, body []byte) (PIN, error) {
 	req, err := c.newRequest(ctx, http.MethodPost, "/api/v2/pins?strong=true", "")
 	if err != nil {
 		return PIN{}, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
 	}
 	var pin PIN
 	if err := c.do(req, &pin); err != nil {
@@ -81,9 +103,75 @@ func (c *Client) CreatePIN(ctx context.Context) (PIN, error) {
 	return pin, nil
 }
 
+// Nonce fetches a 5-minute auth nonce for JWT refresh.
+func (c *Client) Nonce(ctx context.Context, token string) (string, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/api/v2/auth/nonce", token)
+	if err != nil {
+		return "", err
+	}
+	var body struct {
+		Nonce string `json:"nonce"`
+		Code  string `json:"code"`
+	}
+	if err := c.do(req, &body); err != nil {
+		return "", err
+	}
+	if body.Nonce == "" {
+		body.Nonce = body.Code
+	}
+	if body.Nonce == "" {
+		return "", fmt.Errorf("plextv: malformed nonce response")
+	}
+	return body.Nonce, nil
+}
+
+// RefreshToken exchanges a signed device JWT (carrying the nonce) for a
+// fresh 7-day Plex JWT.
+func (c *Client) RefreshToken(ctx context.Context, deviceJWT string) (string, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/api/v2/auth/token", "")
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(map[string]string{"deviceJWT": deviceJWT})
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	var out struct {
+		AuthToken *string `json:"authToken"`
+		Token     *string `json:"token"`
+	}
+	if err := c.do(req, &out); err != nil {
+		return "", err
+	}
+	if out.AuthToken != nil && *out.AuthToken != "" {
+		return *out.AuthToken, nil
+	}
+	if out.Token != nil && *out.Token != "" {
+		return *out.Token, nil
+	}
+	return "", fmt.Errorf("plextv: malformed token response")
+}
+
 // PollPIN returns the owner auth token once claimed, or "" while pending.
 func (c *Client) PollPIN(ctx context.Context, id int64) (string, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, "/api/v2/pins/"+fmt.Sprint(id), "")
+	return c.pollPIN(ctx, id, "")
+}
+
+// PollPINJWT polls with a signed device JWT (aud=plex.tv). The Plex JWT
+// arrives in authToken exactly as in the legacy flow.
+func (c *Client) PollPINJWT(ctx context.Context, id int64, deviceJWT string) (string, error) {
+	return c.pollPIN(ctx, id, deviceJWT)
+}
+
+func (c *Client) pollPIN(ctx context.Context, id int64, deviceJWT string) (string, error) {
+	path := "/api/v2/pins/" + fmt.Sprint(id)
+	if deviceJWT != "" {
+		path += "?deviceJWT=" + url.QueryEscape(deviceJWT)
+	}
+	req, err := c.newRequest(ctx, http.MethodGet, path, "")
 	if err != nil {
 		return "", err
 	}
@@ -168,10 +256,25 @@ func (c *Client) do(req *http.Request, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("plextv: status %s", resp.Status)
+		return &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("plextv: decode: %w", err)
 	}
 	return nil
+}
+
+// StatusError is a non-2xx plex.tv response. Callers use errors.As to
+// decide fallback (e.g. JWT shape rejected -> legacy PIN).
+type StatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *StatusError) Error() string { return fmt.Sprintf("plextv: status %s", e.Status) }
+
+// IsClientError reports 4xx responses (caller-shaped requests).
+func IsClientError(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.StatusCode >= 400 && se.StatusCode < 500
 }

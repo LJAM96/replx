@@ -81,14 +81,27 @@ Cache-Control: no-store
 
 Do not rely on official clients to resend `X-Plex-Token` as a header to a different host.
 
-For the routing spike, replx-edge explicitly places a PMS accepted token in the redirect URL query string.
+Replx-edge places a PMS transient delegation token in the redirect URL query string. Flow per media request:
 
-Preferred token source:
+```text
+incoming user token
+        |
+        v
+GET {internal origin}/security/token?type=delegation&scope=all (server to server, header auth)
+        |
+        v
+transient token (same access as the caller, <=48h, dies on PMS restart)
+        |
+        v
+307 Location with transient query token
+```
 
-1. request a PMS transient delegation token from the user's existing PMS token when the endpoint is supported
-2. otherwise use the same user scoped PMS token already presented by that client for the minimum duration necessary for the spike
+Rules:
 
-Never put the replx-edge owner token into a client media redirect.
+- Only transient tokens ever enter a redirect URL.
+- The persistent user token is used solely for the server-to-server delegation call and is never placed in a Location, log, or trace.
+- Never put the replx-edge owner token into a client media redirect. Delegation always runs under the requesting user's own token, so a transient can never escalate beyond that user's access.
+- If delegation fails: use the media gateway profile, or fail with `MEDIA_ROUTE_UNAVAILABLE`. There is no persistent-token fallback.
 
 Transient PMS tokens have the same access level as the caller and are not path scoped. They reduce persistence but do not create a strict media capability. Treat them as secrets.
 

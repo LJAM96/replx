@@ -12,9 +12,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/LJAM96/replx-edge/migrations"
+	"github.com/LJAM96/replx/migrations"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -22,10 +23,11 @@ import (
 // lockKey scopes the advisory lock to replx-edge migrations.
 const lockKey = "replx_edge_migrations"
 
-// Pool wraps pgxpool with migration state.
+// Pool wraps pgxpool with migration state. Completion is an atomic bool:
+// Migrate runs on a background goroutine while readiness probes read it.
 type Pool struct {
 	inner     *pgxpool.Pool
-	completed bool
+	completed atomic.Bool
 }
 
 // Open creates a pool. It does not connect until first use.
@@ -72,7 +74,7 @@ func (p *Pool) Ping(ctx context.Context) bool {
 
 // MigrationsComplete reports whether the startup migration succeeded.
 func (p *Pool) MigrationsComplete() bool {
-	return p != nil && p.completed
+	return p != nil && p.completed.Load()
 }
 
 // Migrate applies pending embedded migrations under an advisory lock.
@@ -134,7 +136,7 @@ func (p *Pool) Migrate(ctx context.Context) error {
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("database: commit: %w", err)
 	}
-	p.completed = true
+	p.completed.Store(true)
 	return nil
 }
 

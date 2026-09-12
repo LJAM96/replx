@@ -396,7 +396,7 @@ CREATE INDEX playback_sessions_client_time_idx ON playback_sessions(client_insta
 CREATE INDEX playback_sessions_plex_session_idx ON playback_sessions(plex_session_identifier);
 ```
 
-`playback_sessions.trace_id` is a loose correlation to `diagnostic_traces.id`, not a hard foreign key. A playback session may exist without a targeted protocol trace, and trace expiry must never cascade-delete playback history.
+`playback_sessions.trace_id` references `diagnostic_traces.id` (`0003_trace_fk.sql`, `ON DELETE SET NULL`): trace expiry never deletes playback history. It is a loose lifecycle link, not a creation dependency — sessions exist without targeted traces.
 
 ## playback_decisions
 

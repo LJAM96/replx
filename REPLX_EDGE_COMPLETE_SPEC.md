@@ -102,7 +102,7 @@ Product           Replx Edge
 Go binary         replx-edge
 Compose service   replx-edge
 Container image   ghcr.io/<owner>/replx-edge
-Go module         repository chosen at project creation, ending in /replx-edge
+Go module         github.com/LJAM96/replx (repository path; binary/service stay replx-edge)
 Metric prefix     replx_edge_
 Database          replx_edge
 Env prefix        REPLX_EDGE_
@@ -466,14 +466,27 @@ Cache-Control: no-store
 
 Do not rely on official clients to resend `X-Plex-Token` as a header to a different host.
 
-For the routing spike, replx-edge explicitly places a PMS accepted token in the redirect URL query string.
+Replx-edge places a PMS transient delegation token in the redirect URL query string. Flow per media request:
 
-Preferred token source:
+```text
+incoming user token
+        |
+        v
+GET {internal origin}/security/token?type=delegation&scope=all (server to server, header auth)
+        |
+        v
+transient token (same access as the caller, <=48h, dies on PMS restart)
+        |
+        v
+307 Location with transient query token
+```
 
-1. request a PMS transient delegation token from the user's existing PMS token when the endpoint is supported
-2. otherwise use the same user scoped PMS token already presented by that client for the minimum duration necessary for the spike
+Rules:
 
-Never put the replx-edge owner token into a client media redirect.
+- Only transient tokens ever enter a redirect URL.
+- The persistent user token is used solely for the server-to-server delegation call and is never placed in a Location, log, or trace.
+- Never put the replx-edge owner token into a client media redirect. Delegation always runs under the requesting user's own token, so a transient can never escalate beyond that user's access.
+- If delegation fails: use the media gateway profile, or fail with `MEDIA_ROUTE_UNAVAILABLE`. There is no persistent-token fallback.
 
 Transient PMS tokens have the same access level as the caller and are not path scoped. They reduce persistence but do not create a strict media capability. Treat them as secrets.
 
@@ -671,6 +684,10 @@ Plaintext credentials must exist only in process memory for the shortest necessa
 
 Before the owner JWT expires, refresh it using the Plex nonce flow. After refresh, refresh the PMS resources record and PMS access token.
 
+A background worker checks hourly and refreshes within 24 hours of expiry. The negotiated mode (`jwt` or `legacy`) is persisted and surfaced in onboarding status.
+
+If plex.tv rejects the JWT PIN shape, onboarding falls back to the legacy PIN token flow and records the mode explicitly. Legacy tokens have no refresh: they are validated on use and require re-onboarding on 401. The fallback is logged loudly and never silent.
+
 If refresh fails:
 
 ```text
@@ -846,7 +863,7 @@ replx-edge/
   scripts/
 ```
 
-The Go module path is the actual repository URL selected at project creation. It must end in `/replx-edge` and contain no spaces.
+The Go module path is the repository location `github.com/LJAM96/replx`. The binary, Compose service, image and user-facing names stay `replx-edge` / Replx Edge; only the module/import path follows the repo.
 
 ## Production 1.0 scope
 
@@ -1236,7 +1253,7 @@ The optional media gateway is a separate public attack surface and must remain d
 
 Admin binds to loopback and should be reached through Tailscale or another private path. It is not routed through `plex.example.com`.
 
-Admin bootstrap uses a single-use setup token from server logs on first run. There is no default admin password and no password-via-environment in production.
+Admin bootstrap uses a per-process setup token from server logs: `/admin/login` exchanges it for an HttpOnly session cookie (12h), and cookie-authenticated mutations require a per-session CSRF token. API clients use the bearer directly (no CSRF exposure). There is no default admin password and no password-via-environment in production.
 
 ## Owner credentials
 
@@ -1260,9 +1277,13 @@ The UI must display this clearly. Do not use security language that implies Repl
 
 ## Media redirect token
 
-A direct origin redirect may include a PMS accepted token in the query. Treat the full Location URL as a secret.
+A direct origin redirect carries a PMS transient delegation token in the query. Treat the full Location URL as a secret.
 
-Prefer a user scoped transient PMS delegation token when supported. Never expose the owner token.
+Only transient tokens (minted per request under the caller's own token, ≤48h, dead on PMS restart) ever enter a redirect. Persistent user tokens never appear in a Location, log, or trace; the owner token never enters this path at all. Delegation failure fails closed.
+
+## Credential separation
+
+The Tunnel token belongs exclusively to the `cloudflared` sidecar. The replx-edge application never receives it: Compose passes explicit environment (no shared env file), and the app refuses no configuration for its absence. A compromised app process must not yield control-plane credentials.
 
 ## SSRF
 
@@ -1344,6 +1365,8 @@ All `X-Plex-*` values may also appear as query parameters.
 | `/:/unscrobble` | Never | User | No | State invalidation | No |
 | `/status/sessions` | Never | Owner admin via admin API only | Deny on control with explanation | No | No |
 | universal playback decision | Never | User | Query and response validation | Critical | No body media |
+| transcode decision (`*/transcode/universal/decision`) | Never | User | Control: future policy inspection point, never bulk media | Critical | No |
+| transcode session/stop control | Never | User | Control | Session state | No |
 | play queue creation | Never | User | Observe + correlate; no queue rewrite in 1.0 | Correlation, enforced at part boundary | No |
 | `/library/parts/*` | Never | User | Allowed part substitution only | Critical | Direct origin or media gateway |
 | transcode start manifest | Never | User | Source query enforcement | Critical | Redirect initial manifest or media gateway |
@@ -2182,7 +2205,7 @@ CREATE INDEX playback_sessions_client_time_idx ON playback_sessions(client_insta
 CREATE INDEX playback_sessions_plex_session_idx ON playback_sessions(plex_session_identifier);
 ```
 
-`playback_sessions.trace_id` is a loose correlation to `diagnostic_traces.id`, not a hard foreign key. A playback session may exist without a targeted protocol trace, and trace expiry must never cascade-delete playback history.
+`playback_sessions.trace_id` references `diagnostic_traces.id` (`0003_trace_fk.sql`, `ON DELETE SET NULL`): trace expiry never deletes playback history. It is a loose lifecycle link, not a creation dependency — sessions exist without targeted traces.
 
 ## playback_decisions
 
@@ -2404,6 +2427,15 @@ Responses include:
 | POST | `/api/v1/onboarding/select` | Bind one PMS (`{clientIdentifier}`) |
 | POST | `/api/v1/onboarding/verify` | Identity triple-check + Custom URL report |
 | GET | `/admin/onboarding` | Server-rendered onboarding and verification panel |
+| GET | `/admin/login` | Bootstrap sign-in form (setup token) |
+| POST | `/admin/login` | Exchange setup token for HttpOnly session cookie |
+| POST | `/admin/logout` | Revoke bootstrap session |
+| GET | `/api/v1/spike/events` | Redacted spike trace ring |
+| GET | `/api/v1/spike/observations` | Compatibility matrix |
+| POST | `/api/v1/spike/observations` | Record a client observation |
+| GET | `/admin/spike` | Spike matrix panel |
+
+Browser panels authenticate with the session cookie plus per-session CSRF token; API clients use the setup token bearer (no CSRF exposure).
 
 ## Rate limiting and job control
 
@@ -3210,6 +3242,11 @@ Production 1.0 contains the supported Cloudflare control path, validated media r
 
 # Optional Media Fallback Deployment
 
+> Alpha status: the `media-gateway` Compose profile runs a placeholder
+> (health endpoint only). Enabling it today opens the listener but serves
+> no media; capability validation, session lookup, policy enforcement and
+> streaming land with the media gateway phase. Do not rely on it yet.
+
 ## Purpose
 
 The media gateway exists only for clients or playback protocols that cannot use validated direct origin media routing.
@@ -3298,14 +3335,31 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-    env_file:
-      - .env
+    # Explicit environment: the app never receives TUNNEL_TOKEN.
+    # Only cloudflared below gets the Tunnel credential.
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: replx_edge
       POSTGRES_USER: replx_edge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       REPLX_EDGE_VALKEY_ADDR: valkey:6379
+      REPLX_EDGE_SECRET_KEY: ${REPLX_EDGE_SECRET_KEY}
+      REPLX_EDGE_PUBLIC_URL: ${REPLX_EDGE_PUBLIC_URL}
+      REPLX_EDGE_ORIGIN_INTERNAL_URL: ${REPLX_EDGE_ORIGIN_INTERNAL_URL}
+      REPLX_EDGE_INGRESS_MODE: ${REPLX_EDGE_INGRESS_MODE}
+      REPLX_EDGE_ADMIN_PORT: ${REPLX_EDGE_ADMIN_PORT:-8080}
+      REPLX_EDGE_LOG_LEVEL: ${REPLX_EDGE_LOG_LEVEL:-info}
+      REPLX_EDGE_CACHE_MAX_GB: ${REPLX_EDGE_CACHE_MAX_GB:-20}
+      REPLX_EDGE_ARTWORK_MAX_GB: ${REPLX_EDGE_ARTWORK_MAX_GB:-50}
+      REPLX_EDGE_DIAGNOSTICS_MAX_GB: ${REPLX_EDGE_DIAGNOSTICS_MAX_GB:-10}
+      REPLX_EDGE_TRACE_RETENTION_DAYS: ${REPLX_EDGE_TRACE_RETENTION_DAYS:-7}
+      REPLX_EDGE_PLAYBACK_RETENTION_DAYS: ${REPLX_EDGE_PLAYBACK_RETENTION_DAYS:-30}
+      REPLX_EDGE_AUDIT_RETENTION_DAYS: ${REPLX_EDGE_AUDIT_RETENTION_DAYS:-180}
+      REPLX_EDGE_MEDIA_FALLBACK_ENABLED: ${REPLX_EDGE_MEDIA_FALLBACK_ENABLED:-false}
+      REPLX_EDGE_MEDIA_PUBLIC_URL: ${REPLX_EDGE_MEDIA_PUBLIC_URL:-}
+      REPLX_EDGE_MEDIA_PORT: ${REPLX_EDGE_MEDIA_PORT:-443}
+      REPLX_EDGE_SPIKE_ROUTING: ${REPLX_EDGE_SPIKE_ROUTING:-false}
     volumes:
       - replx_edge_cache:/data/cache
       - replx_edge_artwork:/data/artwork
@@ -3321,11 +3375,11 @@ services:
     tmpfs:
       - /tmp
     healthcheck:
-      test: ["CMD", "/app/replx-edge", "healthcheck"]
+      test: ["CMD", "/app/replx-edge", "readycheck"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 60s
 
   cloudflared:
     image: cloudflare/cloudflared:${CLOUDFLARED_VERSION}
@@ -3349,14 +3403,24 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-    env_file:
-      - .env
+    # Placeholder profile (Alpha): the gateway serves health only until
+    # capability/session/policy enforcement lands. Explicit env mirrors
+    # replx-edge without TUNNEL_TOKEN.
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: replx_edge
       POSTGRES_USER: replx_edge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       REPLX_EDGE_VALKEY_ADDR: valkey:6379
+      REPLX_EDGE_SECRET_KEY: ${REPLX_EDGE_SECRET_KEY}
+      REPLX_EDGE_PUBLIC_URL: ${REPLX_EDGE_PUBLIC_URL}
+      REPLX_EDGE_ORIGIN_INTERNAL_URL: ${REPLX_EDGE_ORIGIN_INTERNAL_URL}
+      REPLX_EDGE_INGRESS_MODE: ${REPLX_EDGE_INGRESS_MODE}
+      REPLX_EDGE_LOG_LEVEL: ${REPLX_EDGE_LOG_LEVEL:-info}
+      REPLX_EDGE_MEDIA_FALLBACK_ENABLED: ${REPLX_EDGE_MEDIA_FALLBACK_ENABLED:-false}
+      REPLX_EDGE_MEDIA_PUBLIC_URL: ${REPLX_EDGE_MEDIA_PUBLIC_URL:-}
+      REPLX_EDGE_MEDIA_PORT: ${REPLX_EDGE_MEDIA_PORT:-443}
     command: ["media-gateway"]
     ports:
       - "${REPLX_EDGE_MEDIA_PORT:-443}:32402"

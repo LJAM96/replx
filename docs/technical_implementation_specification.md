@@ -63,7 +63,7 @@ replx-edge/
   scripts/
 ```
 
-The Go module path is the actual repository URL selected at project creation. It must end in `/replx-edge` and contain no spaces.
+The Go module path is the repository location `github.com/LJAM96/replx`. The binary, Compose service, image and user-facing names stay `replx-edge` / Replx Edge; only the module/import path follows the repo.
 
 ## Production 1.0 scope
 

@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/LJAM96/replx-edge/internal/cache"
-	"github.com/LJAM96/replx-edge/internal/gateway"
-	"github.com/LJAM96/replx-edge/internal/routing"
+	"github.com/LJAM96/replx/internal/cache"
+	"github.com/LJAM96/replx/internal/gateway"
+	"github.com/LJAM96/replx/internal/routing"
 )
 
 // fakePMS serves sanitized fixtures like origin PMS metadata.

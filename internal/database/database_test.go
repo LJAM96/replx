@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 )
 
@@ -38,4 +39,19 @@ func TestMigrateLive(t *testing.T) {
 	if !pool.Ping(ctx) {
 		t.Fatal("expected ping true")
 	}
+	// Concurrent migrators + readiness readers must not race (race
+	// detector watches the completion flag here).
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = pool.Migrate(context.Background())
+			_ = pool.MigrationsComplete()
+		}()
+	}
+	for i := 0; i < 32; i++ {
+		_ = pool.MigrationsComplete()
+	}
+	wg.Wait()
 }

@@ -9,6 +9,7 @@
 package admin
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -19,9 +20,9 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/LJAM96/replx-edge/internal/health"
-	"github.com/LJAM96/replx-edge/internal/onboarding"
-	"github.com/LJAM96/replx-edge/internal/spike"
+	"github.com/LJAM96/replx/internal/health"
+	"github.com/LJAM96/replx/internal/onboarding"
+	"github.com/LJAM96/replx/internal/spike"
 )
 
 // NewSetupToken generates a per-process bootstrap token.
@@ -41,14 +42,20 @@ type Mux struct {
 	spikeObs    *spike.Observations
 	setupToken  string
 	requireAuth bool
+	sessions    *sessionStore
 }
 
+type ctxKey struct{}
+
 // NewMux builds the admin mux. When requireAuth is true, API and panel
-// routes require the setup token bearer. spikeStore may be nil (spike
-// disabled): the events endpoint then reports disabled instead of failing.
+// routes require the setup token bearer or a bootstrap session cookie
+// (CSRF-checked on mutation). spikeStore may be nil (spike disabled):
+// the events endpoint then reports disabled instead of failing.
 func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, requireAuth bool, spikeStore *spike.Store, spikeObs *spike.Observations) *Mux {
-	m := &Mux{mux: http.NewServeMux(), svc: svc, spike: spikeStore, spikeObs: spikeObs, setupToken: setupToken, requireAuth: requireAuth}
+	m := &Mux{mux: http.NewServeMux(), svc: svc, spike: spikeStore, spikeObs: spikeObs, setupToken: setupToken, requireAuth: requireAuth, sessions: newSessionStore()}
 	m.mux.Handle("/health/", health.AdminMux(checks))
+	m.mux.HandleFunc("/admin/login", m.handleLogin)
+	m.mux.HandleFunc("/admin/logout", m.handleLogout)
 	m.mux.HandleFunc("/api/v1/onboarding/status", m.auth(m.handleStatus))
 	m.mux.HandleFunc("/api/v1/onboarding/pin", m.auth(m.handlePIN))
 	m.mux.HandleFunc("/api/v1/onboarding/resources", m.auth(m.handleResources))
@@ -63,17 +70,96 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 
 func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) { m.mux.ServeHTTP(w, r) }
 
+// sessionOf returns the request's bootstrap session, if any.
+func (m *Mux) sessionOf(r *http.Request) (session, bool) {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return session{}, false
+	}
+	return m.sessions.lookup(c.Value)
+}
+
+// csrfToken returns the CSRF token for rendering forms ("" for bearer auth).
+func csrfToken(r *http.Request) string {
+	if sess, ok := r.Context().Value(ctxKey{}).(session); ok {
+		return sess.csrf
+	}
+	return ""
+}
+
 func (m *Mux) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if m.requireAuth {
-			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(m.setupToken)) != 1 {
-				writeError(w, http.StatusUnauthorized, "SETUP_TOKEN_REQUIRED", "provide the per-process setup token as Authorization: Bearer")
+		if !m.requireAuth {
+			next(w, r)
+			return
+		}
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(m.setupToken)) == 1 {
+			next(w, r) // API-style auth: no CSRF exposure.
+			return
+		}
+		sess, ok := m.sessionOf(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "SETUP_TOKEN_REQUIRED", "provide the per-process setup token as Authorization: Bearer, or sign in at /admin/login")
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			if err := r.ParseForm(); err != nil {
+				writeError(w, http.StatusBadRequest, "INVALID_BODY", "unparseable form")
+				return
+			}
+			if subtle.ConstantTimeCompare([]byte(r.FormValue("csrf")), []byte(sess.csrf)) != 1 &&
+				subtle.ConstantTimeCompare([]byte(r.Header.Get("X-CSRF-Token")), []byte(sess.csrf)) != 1 {
+				writeError(w, http.StatusForbidden, "CSRF_REQUIRED", "valid CSRF token required for cookie-authenticated mutation")
 				return
 			}
 		}
-		next(w, r)
+		next(w, withSession(r, sess))
 	}
+}
+
+func withSession(r *http.Request, sess session) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), ctxKey{}, sess))
+}
+
+func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = fmt.Fprint(w, `<!doctype html><html><head><meta charset="utf-8"><title>Replx Edge admin sign in</title></head><body>
+<h1>Replx Edge admin sign in</h1>
+<form method="post"><label>Setup token <input type="password" name="token" size="52"></label>
+<button type="submit">Sign in</button></form>
+<p>The token is printed once in the server log at startup and rotates on restart.</p>
+</body></html>`)
+	case http.MethodPost:
+		if err := r.ParseForm(); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_BODY", "unparseable form")
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(r.FormValue("token")), []byte(m.setupToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "wrong setup token")
+			return
+		}
+		id, _, err := m.sessions.create()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "SESSION_FAILED", "could not create session")
+			return
+		}
+		setSessionCookie(w, id)
+		http.Redirect(w, r, "/admin/onboarding", http.StatusSeeOther)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET or POST")
+	}
+}
+
+func (m *Mux) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		m.sessions.revoke(c.Value)
+	}
+	clearSessionCookie(w)
+	http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
 }
 
 func writeData(w http.ResponseWriter, status int, data any) {
@@ -209,6 +295,7 @@ func (m *Mux) handlePanel(w http.ResponseWriter, r *http.Request) {
 	}
 	status := m.svc.Status(r.Context())
 	servers, _ := m.svc.ListServers(r.Context())
+	csrf := html.EscapeString(csrfToken(r))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><title>Replx Edge onboarding</title></head><body>
@@ -216,21 +303,21 @@ func (m *Mux) handlePanel(w http.ResponseWriter, r *http.Request) {
 <p>Stage: <b>%s</b></p>
 <p>%s</p>
 <h2>1. PIN</h2>
-<form method="post"><button name="issue-pin" value="1" type="submit">Issue PIN</button>
+<form method="post"><input type="hidden" name="csrf" value="%s"><button name="issue-pin" value="1" type="submit">Issue PIN</button>
 <button name="poll-pin" value="1" type="submit">Poll claim</button></form>
 <h2>2. Select PMS (exactly one)</h2>
-<ul>`, html.EscapeString(fmt.Sprint(status["stage"])), html.EscapeString(r.URL.Query().Get("msg")))
+<ul>`, html.EscapeString(fmt.Sprint(status["stage"])), html.EscapeString(r.URL.Query().Get("msg")), csrf)
 	for _, s := range servers {
 		_, _ = fmt.Fprintf(w, `<li>%s (%s) connections=%d httpsDirect=%v
-<form method="post" style="display:inline"><input type="hidden" name="clientIdentifier" value="%s">
+<form method="post" style="display:inline"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="clientIdentifier" value="%s">
 <button name="select" value="1" type="submit">Select</button></form></li>`,
-			html.EscapeString(s.Name), html.EscapeString(s.ClientIdentifier), s.Connections, s.HTTPSDirect, html.EscapeString(s.ClientIdentifier))
+			html.EscapeString(s.Name), html.EscapeString(s.ClientIdentifier), s.Connections, s.HTTPSDirect, csrf, html.EscapeString(s.ClientIdentifier))
 	}
-	_, _ = fmt.Fprint(w, `</ul>
+	_, _ = fmt.Fprintf(w, `</ul>
 <h2>3. Verify identity triple-check</h2>
-<form method="post"><button name="verify" value="1" type="submit">Run verify</button></form>
+<form method="post"><input type="hidden" name="csrf" value="%s"><button name="verify" value="1" type="submit">Run verify</button></form>
 <p>Verify proves origin root, plex.tv resource and proxied root name the same machineIdentifier, and the Custom Server Access URL is published.</p>
-</body></html>`)
+</body></html>`, csrf)
 }
 
 func (m *Mux) handleSpikeEvents(w http.ResponseWriter, r *http.Request) {
@@ -304,18 +391,20 @@ func (m *Mux) handleSpikePanel(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	csrf := html.EscapeString(csrfToken(r))
 	_, _ = fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><title>Replx Edge spike matrix</title></head><body>
 <h1>P0 spike matrix</h1>
 <p>Spike routing: <b>%v</b></p>
 <p>%s</p>
 <h2>Record observation</h2>
 <form method="post">
+<input type="hidden" name="csrf" value="%s">
 platform <input name="platform" value="Web"> product <input name="product" value="Plex Web">
 version <input name="productVersion"> playbackType <input name="playbackType" value="progressive">
 status <select name="status"><option>SUPPORTED</option><option>DEGRADED</option><option>UNSUPPORTED</option><option>UNKNOWN</option><option>ADMIN_FORCED</option></select>
 notes <input name="notes" size="60"> <button type="submit">Record</button></form>
 <h2>Matrix</h2>
-<ul>`, enabled, html.EscapeString(r.URL.Query().Get("msg")))
+<ul>`, enabled, html.EscapeString(r.URL.Query().Get("msg")), csrf)
 	for _, o := range rows {
 		_, _ = fmt.Fprintf(w, "<li>%s %s %s %s n=%d: %s</li>", html.EscapeString(o.Platform),
 			html.EscapeString(o.Product), html.EscapeString(o.PlaybackType), html.EscapeString(o.Status),

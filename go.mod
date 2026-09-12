@@ -1,4 +1,4 @@
-module github.com/LJAM96/replx-edge
+module github.com/LJAM96/replx
 
 go 1.25.0
 

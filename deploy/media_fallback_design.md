@@ -1,5 +1,10 @@
 # Optional Media Fallback Deployment
 
+> Alpha status: the `media-gateway` Compose profile runs a placeholder
+> (health endpoint only). Enabling it today opens the listener but serves
+> no media; capability validation, session lookup, policy enforcement and
+> streaming land with the media gateway phase. Do not rely on it yet.
+
 ## Purpose
 
 The media gateway exists only for clients or playback protocols that cannot use validated direct origin media routing.

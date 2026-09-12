@@ -4,7 +4,8 @@
 //
 //	serve (default)              run control (32400) + admin (8080) listeners
 //	media-gateway                run media fallback listener (32402) only
-//	healthcheck                  probe admin /health/live from inside the container
+//	healthcheck                  probe admin /health/live (liveness)
+//	readycheck                   probe admin /health/ready (readiness; gates cloudflared)
 //	media-gateway-healthcheck    probe media /health/live from inside the container
 //	version                      print build version
 //
@@ -20,21 +21,23 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
-	"github.com/LJAM96/replx-edge/internal/admin"
-	"github.com/LJAM96/replx-edge/internal/config"
-	"github.com/LJAM96/replx-edge/internal/database"
-	"github.com/LJAM96/replx-edge/internal/health"
-	"github.com/LJAM96/replx-edge/internal/logging"
-	"github.com/LJAM96/replx-edge/internal/onboarding"
-	"github.com/LJAM96/replx-edge/internal/plextv"
-	"github.com/LJAM96/replx-edge/internal/pms"
-	"github.com/LJAM96/replx-edge/internal/proxy"
-	"github.com/LJAM96/replx-edge/internal/spike"
-	"github.com/LJAM96/replx-edge/internal/valkey"
+	"github.com/LJAM96/replx/internal/admin"
+	"github.com/LJAM96/replx/internal/config"
+	"github.com/LJAM96/replx/internal/database"
+	"github.com/LJAM96/replx/internal/health"
+	"github.com/LJAM96/replx/internal/logging"
+	"github.com/LJAM96/replx/internal/onboarding"
+	"github.com/LJAM96/replx/internal/plextv"
+	"github.com/LJAM96/replx/internal/pms"
+	"github.com/LJAM96/replx/internal/proxy"
+	"github.com/LJAM96/replx/internal/spike"
+	"github.com/LJAM96/replx/internal/valkey"
 )
 
 var version = "dev"
@@ -56,13 +59,15 @@ func main() {
 			os.Exit(1)
 		}
 	case "healthcheck":
-		os.Exit(runProbe(adminHealthURL(), 2*time.Second))
+		os.Exit(runProbe(adminHealthURL("/health/live"), 2*time.Second))
+	case "readycheck":
+		os.Exit(runProbe(adminHealthURL("/health/ready"), 5*time.Second))
 	case "media-gateway-healthcheck":
 		os.Exit(runProbe(mediaHealthURL(), 2*time.Second))
 	case "version", "--version", "-v":
 		fmt.Println("replx-edge", version)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q (want serve|media-gateway|healthcheck|media-gateway-healthcheck|version)\n", cmd)
+		fmt.Fprintf(os.Stderr, "unknown command %q (want serve|media-gateway|healthcheck|readycheck|media-gateway-healthcheck|version)\n", cmd)
 		os.Exit(2)
 	}
 }
@@ -81,7 +86,8 @@ func runServe() error {
 	// Postgres pool + advisory-locked migrations. Failure degrades
 	// readiness but never takes down the admin plane: operators need
 	// the admin UI to inspect and recover.
-	ctx := context.Background()
+	ctx, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
 	db, err := database.Open(ctx, cfg.DatabaseURL())
 	if err != nil {
 		return err
@@ -105,7 +111,12 @@ func runServe() error {
 		}
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 			migrate()
 			if db.MigrationsComplete() {
 				return
@@ -121,7 +132,12 @@ func runServe() error {
 		refresh()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 			refresh()
 		}
 	}()
@@ -161,6 +177,24 @@ func runServe() error {
 	}
 	fmt.Fprintf(os.Stderr, "onboarding setup token: %s\n", setupToken)
 
+	// Owner JWT refresh (JWT mode only): hourly check, refresh within 24h
+	// of expiry. Failures degrade credentials without destroying them.
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if _, err := onboard.RefreshOwnerJWT(ctx); err != nil {
+				logger.Log(logging.Entry{Level: "warn", Component: "onboarding",
+					Fields: map[string]any{"event": "owner_refresh", "error": err.Error()}})
+			}
+		}
+	}()
+
 	spikeObs := spike.Observations{DB: db.Raw()}
 	adminMux := admin.NewMux(health.Checks{
 		MigrationsComplete: db.MigrationsComplete,
@@ -186,6 +220,12 @@ func runServe() error {
 	fmt.Fprintf(os.Stdout, "replx-edge %s starting (ingress=%s public=%s origin=%s)\n",
 		version, cfg.IngressMode, cfg.PublicURL, logging.RedactURLString(cfg.OriginInternalURL))
 
+	// Graceful shutdown: SIGINT/SIGTERM stops listeners and background
+	// loops instead of dying at Docker's kill timeout.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
 	errCh := make(chan error, 2)
 	go func() {
 		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -197,7 +237,18 @@ func runServe() error {
 			errCh <- fmt.Errorf("control listener: %w", err)
 		}
 	}()
-	return <-errCh
+	select {
+	case err := <-errCh:
+		return err
+	case sig := <-sigCh:
+		fmt.Fprintf(os.Stdout, "replx-edge received %s, shutting down\n", sig)
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = adminSrv.Shutdown(shutdown)
+		_ = controlSrv.Shutdown(shutdown)
+		stopWorkers()
+		return nil
+	}
 }
 
 func runMediaGateway() error {
@@ -208,13 +259,17 @@ func runMediaGateway() error {
 	if !cfg.MediaFallbackEnabled {
 		return fmt.Errorf("media gateway disabled (REPLX_EDGE_MEDIA_FALLBACK_ENABLED=false)")
 	}
+	// Alpha placeholder: health endpoint only. Capability validation,
+	// session lookup, policy enforcement and media streaming land with
+	// the media gateway phase; enabling the profile today only opens
+	// the listener, it does not serve media.
+	fmt.Fprintf(os.Stdout, "replx-edge %s media-gateway starting (PLACEHOLDER: health only, no media yet)\n", version)
 	mux := health.MediaMux()
 	srv := &http.Server{
 		Addr:              ":32402",
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	fmt.Fprintf(os.Stdout, "replx-edge %s media-gateway starting\n", version)
 	return srv.ListenAndServe()
 }
 
@@ -238,12 +293,12 @@ func tvClientFor(cfg config.Config, clientID string) *plextv.Client {
 	}
 }
 
-func adminHealthURL() string {
+func adminHealthURL(path string) string {
 	port := os.Getenv("REPLX_EDGE_ADMIN_PORT")
 	if port == "" {
 		port = "8080"
 	}
-	return "http://127.0.0.1:" + port + "/health/live"
+	return "http://127.0.0.1:" + port + path
 }
 
 func mediaHealthURL() string {

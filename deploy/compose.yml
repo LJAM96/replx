@@ -41,14 +41,31 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-    env_file:
-      - .env
+    # Explicit environment: the app never receives TUNNEL_TOKEN.
+    # Only cloudflared below gets the Tunnel credential.
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: replx_edge
       POSTGRES_USER: replx_edge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       REPLX_EDGE_VALKEY_ADDR: valkey:6379
+      REPLX_EDGE_SECRET_KEY: ${REPLX_EDGE_SECRET_KEY}
+      REPLX_EDGE_PUBLIC_URL: ${REPLX_EDGE_PUBLIC_URL}
+      REPLX_EDGE_ORIGIN_INTERNAL_URL: ${REPLX_EDGE_ORIGIN_INTERNAL_URL}
+      REPLX_EDGE_INGRESS_MODE: ${REPLX_EDGE_INGRESS_MODE}
+      REPLX_EDGE_ADMIN_PORT: ${REPLX_EDGE_ADMIN_PORT:-8080}
+      REPLX_EDGE_LOG_LEVEL: ${REPLX_EDGE_LOG_LEVEL:-info}
+      REPLX_EDGE_CACHE_MAX_GB: ${REPLX_EDGE_CACHE_MAX_GB:-20}
+      REPLX_EDGE_ARTWORK_MAX_GB: ${REPLX_EDGE_ARTWORK_MAX_GB:-50}
+      REPLX_EDGE_DIAGNOSTICS_MAX_GB: ${REPLX_EDGE_DIAGNOSTICS_MAX_GB:-10}
+      REPLX_EDGE_TRACE_RETENTION_DAYS: ${REPLX_EDGE_TRACE_RETENTION_DAYS:-7}
+      REPLX_EDGE_PLAYBACK_RETENTION_DAYS: ${REPLX_EDGE_PLAYBACK_RETENTION_DAYS:-30}
+      REPLX_EDGE_AUDIT_RETENTION_DAYS: ${REPLX_EDGE_AUDIT_RETENTION_DAYS:-180}
+      REPLX_EDGE_MEDIA_FALLBACK_ENABLED: ${REPLX_EDGE_MEDIA_FALLBACK_ENABLED:-false}
+      REPLX_EDGE_MEDIA_PUBLIC_URL: ${REPLX_EDGE_MEDIA_PUBLIC_URL:-}
+      REPLX_EDGE_MEDIA_PORT: ${REPLX_EDGE_MEDIA_PORT:-443}
+      REPLX_EDGE_SPIKE_ROUTING: ${REPLX_EDGE_SPIKE_ROUTING:-false}
     volumes:
       - replx_edge_cache:/data/cache
       - replx_edge_artwork:/data/artwork
@@ -64,11 +81,11 @@ services:
     tmpfs:
       - /tmp
     healthcheck:
-      test: ["CMD", "/app/replx-edge", "healthcheck"]
+      test: ["CMD", "/app/replx-edge", "readycheck"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 60s
 
   cloudflared:
     image: cloudflare/cloudflared:${CLOUDFLARED_VERSION}
@@ -92,14 +109,24 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-    env_file:
-      - .env
+    # Placeholder profile (Alpha): the gateway serves health only until
+    # capability/session/policy enforcement lands. Explicit env mirrors
+    # replx-edge without TUNNEL_TOKEN.
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: replx_edge
       POSTGRES_USER: replx_edge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       REPLX_EDGE_VALKEY_ADDR: valkey:6379
+      REPLX_EDGE_SECRET_KEY: ${REPLX_EDGE_SECRET_KEY}
+      REPLX_EDGE_PUBLIC_URL: ${REPLX_EDGE_PUBLIC_URL}
+      REPLX_EDGE_ORIGIN_INTERNAL_URL: ${REPLX_EDGE_ORIGIN_INTERNAL_URL}
+      REPLX_EDGE_INGRESS_MODE: ${REPLX_EDGE_INGRESS_MODE}
+      REPLX_EDGE_LOG_LEVEL: ${REPLX_EDGE_LOG_LEVEL:-info}
+      REPLX_EDGE_MEDIA_FALLBACK_ENABLED: ${REPLX_EDGE_MEDIA_FALLBACK_ENABLED:-false}
+      REPLX_EDGE_MEDIA_PUBLIC_URL: ${REPLX_EDGE_MEDIA_PUBLIC_URL:-}
+      REPLX_EDGE_MEDIA_PORT: ${REPLX_EDGE_MEDIA_PORT:-443}
     command: ["media-gateway"]
     ports:
       - "${REPLX_EDGE_MEDIA_PORT:-443}:32402"

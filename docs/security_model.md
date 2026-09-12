@@ -16,7 +16,7 @@ The optional media gateway is a separate public attack surface and must remain d
 
 Admin binds to loopback and should be reached through Tailscale or another private path. It is not routed through `plex.example.com`.
 
-Admin bootstrap uses a single-use setup token from server logs on first run. There is no default admin password and no password-via-environment in production.
+Admin bootstrap uses a per-process setup token from server logs: `/admin/login` exchanges it for an HttpOnly session cookie (12h), and cookie-authenticated mutations require a per-session CSRF token. API clients use the bearer directly (no CSRF exposure). There is no default admin password and no password-via-environment in production.
 
 ## Owner credentials
 
@@ -40,9 +40,13 @@ The UI must display this clearly. Do not use security language that implies Repl
 
 ## Media redirect token
 
-A direct origin redirect may include a PMS accepted token in the query. Treat the full Location URL as a secret.
+A direct origin redirect carries a PMS transient delegation token in the query. Treat the full Location URL as a secret.
 
-Prefer a user scoped transient PMS delegation token when supported. Never expose the owner token.
+Only transient tokens (minted per request under the caller's own token, ≤48h, dead on PMS restart) ever enter a redirect. Persistent user tokens never appear in a Location, log, or trace; the owner token never enters this path at all. Delegation failure fails closed.
+
+## Credential separation
+
+The Tunnel token belongs exclusively to the `cloudflared` sidecar. The replx-edge application never receives it: Compose passes explicit environment (no shared env file), and the app refuses no configuration for its absence. A compromised app process must not yield control-plane credentials.
 
 ## SSRF
 

@@ -77,6 +77,15 @@ Responses include:
 | POST | `/api/v1/onboarding/select` | Bind one PMS (`{clientIdentifier}`) |
 | POST | `/api/v1/onboarding/verify` | Identity triple-check + Custom URL report |
 | GET | `/admin/onboarding` | Server-rendered onboarding and verification panel |
+| GET | `/admin/login` | Bootstrap sign-in form (setup token) |
+| POST | `/admin/login` | Exchange setup token for HttpOnly session cookie |
+| POST | `/admin/logout` | Revoke bootstrap session |
+| GET | `/api/v1/spike/events` | Redacted spike trace ring |
+| GET | `/api/v1/spike/observations` | Compatibility matrix |
+| POST | `/api/v1/spike/observations` | Record a client observation |
+| GET | `/admin/spike` | Spike matrix panel |
+
+Browser panels authenticate with the session cookie plus per-session CSRF token; API clients use the setup token bearer (no CSRF exposure).
 
 ## Rate limiting and job control
 

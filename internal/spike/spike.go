@@ -16,8 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/LJAM96/replx-edge/internal/logging"
-	"github.com/LJAM96/replx-edge/internal/routing"
+	"github.com/LJAM96/replx/internal/delegation"
+	"github.com/LJAM96/replx/internal/logging"
+	"github.com/LJAM96/replx/internal/routing"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -39,64 +40,81 @@ const maxEvents = 200
 
 // Store resolves media redirects and keeps the trace ring.
 type Store struct {
-	// Lookup returns the enabled server's client media origin URL.
-	Lookup     func(ctx context.Context) (string, bool)
-	PublicHost string
-	Logger     *logging.Logger
-	mu         sync.Mutex
-	events     []Event
+	// Lookup returns the enabled server's client media origin URL and
+	// internal origin URL for delegation calls.
+	Lookup func(ctx context.Context) (mediaOrigin, internalOrigin string, ok bool)
+	// FetchTransient mints a delegation token under the caller's token.
+	// Only transient tokens ever enter a redirect Location.
+	FetchTransient func(ctx context.Context, internalOrigin, userToken string) (string, error)
+	PublicHost     string
+	Logger         *logging.Logger
+	mu             sync.Mutex
+	events         []Event
 }
 
 // NewPostgresStore builds a Store reading the onboarded server row.
 func NewPostgresStore(db *pgxpool.Pool, publicHost string, logger *logging.Logger) *Store {
 	return &Store{
-		Lookup: func(ctx context.Context) (string, bool) {
+		Lookup: func(ctx context.Context) (string, string, bool) {
 			if db == nil {
-				return "", false
+				return "", "", false
 			}
 			cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
-			var origin *string
-			if err := db.QueryRow(cctx, `SELECT client_media_origin_url FROM plex_servers
-				WHERE enabled ORDER BY created_at DESC LIMIT 1`).Scan(&origin); err != nil || origin == nil || *origin == "" {
-				return "", false
+			var media, internal *string
+			if err := db.QueryRow(cctx, `SELECT client_media_origin_url, internal_origin_url FROM plex_servers
+				WHERE enabled ORDER BY created_at DESC LIMIT 1`).Scan(&media, &internal); err != nil ||
+				media == nil || *media == "" || internal == nil || *internal == "" {
+				return "", "", false
 			}
-			return *origin, true
+			return *media, *internal, true
 		},
-		PublicHost: publicHost,
-		Logger:     logger,
+		FetchTransient: delegation.Fetch,
+		PublicHost:     publicHost,
+		Logger:         logger,
 	}
 }
 
 // Resolve maps a media request to its 307 Location. ok=false means fall
-// back to fail-closed MEDIA_ROUTE_UNAVAILABLE.
+// back to fail-closed MEDIA_ROUTE_UNAVAILABLE (or the media gateway).
+// Persistent caller tokens are never placed in the redirect: on delegation
+// failure the request fails closed.
 func (s *Store) Resolve(r *http.Request, requestID string) (string, bool) {
-	origin, ok := s.Lookup(r.Context())
+	base := spikeEventBase(r, requestID)
+	mediaOrigin, internalOrigin, ok := s.Lookup(r.Context())
 	if !ok {
-		s.record(Event{RequestID: requestID, Method: r.Method, Path: logging.RedactURLString(r.URL.RequestURI()),
-			Client: r.Header.Get("X-Plex-Client-Identifier"), Decision: "unavailable", Reason: "no onboarded media origin",
-			RangePresent: r.Header.Get("Range") != ""})
+		base.Decision, base.Reason = "unavailable", "no onboarded media origin"
+		s.record(base)
 		return "", false
 	}
-	token := ExtractToken(r)
-	if token == "" {
-		s.record(Event{RequestID: requestID, Method: r.Method, Path: logging.RedactURLString(r.URL.RequestURI()),
-			Client: r.Header.Get("X-Plex-Client-Identifier"), Decision: "unavailable", Reason: "no user token presented",
-			RangePresent: r.Header.Get("Range") != ""})
+	userToken := ExtractToken(r)
+	if userToken == "" {
+		base.Decision, base.Reason = "unavailable", "no user token presented"
+		s.record(base)
 		return "", false
 	}
-	loc, err := routing.BuildDirectOriginURL(origin, r.URL.RequestURI(), token, s.PublicHost)
-	token = ""
+	transient, err := s.FetchTransient(r.Context(), internalOrigin, userToken)
+	userToken = ""
 	if err != nil {
-		s.record(Event{RequestID: requestID, Method: r.Method, Path: logging.RedactURLString(r.URL.RequestURI()),
-			Client: r.Header.Get("X-Plex-Client-Identifier"), Decision: "unavailable", Reason: err.Error(),
-			RangePresent: r.Header.Get("Range") != ""})
+		base.Decision, base.Reason = "unavailable", "delegation failed: "+err.Error()
+		s.record(base)
 		return "", false
 	}
-	s.record(Event{RequestID: requestID, Method: r.Method, Path: logging.RedactURLString(r.URL.RequestURI()),
-		Client: r.Header.Get("X-Plex-Client-Identifier"), Decision: "redirected", RedactedLocation: routing.RedactedLocation(loc),
-		RangePresent: r.Header.Get("Range") != ""})
+	loc, err := routing.BuildDirectOriginURL(mediaOrigin, r.URL.RequestURI(), transient, s.PublicHost)
+	transient = ""
+	if err != nil {
+		base.Decision, base.Reason = "unavailable", err.Error()
+		s.record(base)
+		return "", false
+	}
+	base.Decision, base.RedactedLocation = "redirected", routing.RedactedLocation(loc)
+	s.record(base)
 	return loc, true
+}
+
+func spikeEventBase(r *http.Request, requestID string) Event {
+	return Event{RequestID: requestID, Method: r.Method, Path: logging.RedactURLString(r.URL.RequestURI()),
+		Client: r.Header.Get("X-Plex-Client-Identifier"), RangePresent: r.Header.Get("Range") != ""}
 }
 
 // Events returns a copy of the trace ring, newest last.

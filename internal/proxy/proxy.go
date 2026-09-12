@@ -16,15 +16,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/LJAM96/replx-edge/internal/gateway"
-	"github.com/LJAM96/replx-edge/internal/logging"
-	"github.com/LJAM96/replx-edge/internal/requestid"
-	"github.com/LJAM96/replx-edge/internal/routing"
+	"github.com/LJAM96/replx/internal/gateway"
+	"github.com/LJAM96/replx/internal/logging"
+	"github.com/LJAM96/replx/internal/requestid"
+	"github.com/LJAM96/replx/internal/routing"
 )
 
 // RequestIDHeader is returned on every control response. Plex clients
 // ignore it; operators use it to join logs and traces.
-const RequestIDHeader = "X-Replex-Edge-Request-ID"
+const RequestIDHeader = "X-Replx-Edge-Request-ID"
 
 // MediaRouteUnavailable is the stable diagnostic reason for fail-closed media.
 const MediaRouteUnavailable = "MEDIA_ROUTE_UNAVAILABLE"
@@ -113,6 +113,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		h.writeMediaUnavailable(w, r, id, start)
+		return
+	}
+	if h.serveStreaming(w, r, id, start) {
 		return
 	}
 	h.proxy(w, r, id, routeClass, start)

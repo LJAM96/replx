@@ -94,7 +94,7 @@ Product           Replx Edge
 Go binary         replx-edge
 Compose service   replx-edge
 Container image   ghcr.io/<owner>/replx-edge
-Go module         repository chosen at project creation, ending in /replx-edge
+Go module         github.com/LJAM96/replx (repository path; binary/service stay replx-edge)
 Metric prefix     replx_edge_
 Database          replx_edge
 Env prefix        REPLX_EDGE_

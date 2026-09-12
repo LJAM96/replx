@@ -6,24 +6,20 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/LJAM96/replx-edge/internal/crypto"
-	"github.com/LJAM96/replx-edge/internal/plextv"
-	"github.com/LJAM96/replx-edge/internal/pms"
+	"github.com/LJAM96/replx/internal/crypto"
+	"github.com/LJAM96/replx/internal/plextv"
+	"github.com/LJAM96/replx/internal/pms"
 )
 
-// SelectMediaOrigin picks the client reachable HTTPS origin connection.
-// Preference: https, non-relay, non-local, and never the replx-edge public
-// hostname itself. A LAN-only https connection is accepted as degraded
-// (documented in the report); with no https candidate at all it fails
-// closed and points at the media gateway profile.
+// SelectMediaOrigin picks the client reachable HTTPS origin connection:
+// https, non-relay, non-local, and never the replx-edge public hostname
+// itself. There is deliberately no LAN fallback: a 307 to a private
+// address is useless to a remote client and would present as a mysterious
+// playback failure. Without a non-local https candidate it fails closed
+// and points at the media gateway profile.
 func SelectMediaOrigin(conns []plextv.Connection, publicHost string) (string, error) {
-	type candidate struct {
-		uri   string
-		local bool
-	}
-	var direct []candidate
 	for _, c := range conns {
-		if !strings.EqualFold(c.Protocol, "https") || c.Relay || c.URI == "" {
+		if !strings.EqualFold(c.Protocol, "https") || c.Relay || c.Local || c.URI == "" {
 			continue
 		}
 		u, err := url.Parse(c.URI)
@@ -33,17 +29,9 @@ func SelectMediaOrigin(conns []plextv.Connection, publicHost string) (string, er
 		if publicHost != "" && strings.EqualFold(u.Hostname(), publicHost) {
 			continue
 		}
-		direct = append(direct, candidate{uri: strings.TrimSuffix(c.URI, "/"), local: c.Local})
+		return strings.TrimSuffix(c.URI, "/"), nil
 	}
-	for _, c := range direct {
-		if !c.local {
-			return c.uri, nil
-		}
-	}
-	if len(direct) > 0 {
-		return direct[0].uri, nil
-	}
-	return "", fmt.Errorf("onboarding: no client reachable https origin connection: fix origin TLS (plex.direct or public hostname) or enable the DNS-only media gateway profile")
+	return "", fmt.Errorf("onboarding: no non-local https origin connection: fix origin TLS (public hostname or plex.direct) or enable the DNS-only media gateway profile")
 }
 
 // TripleMatch is the identity invariant: origin root, plex.tv resource and
@@ -162,7 +150,8 @@ func (s *Service) Verify(ctx context.Context) (VerifyReport, error) {
 	if _, err := s.DB.Exec(ctx, "UPDATE plex_owner_credentials SET status='verified' WHERE server_id=$1", serverID); err != nil {
 		return VerifyReport{}, err
 	}
-	if err := setSetting(ctx, s.DB, setVerified, "true"); err != nil {
+	// Verification is tied to this exact machine; reselecting clears it.
+	if err := setSetting(ctx, s.DB, setVerified, originID.MachineIdentifier); err != nil {
 		return VerifyReport{}, err
 	}
 	return report, nil

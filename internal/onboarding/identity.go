@@ -21,9 +21,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 
-	"github.com/LJAM96/replx-edge/internal/crypto"
+	"github.com/LJAM96/replx/internal/crypto"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -65,11 +68,18 @@ type AppIdentity struct {
 
 // EnsureIdentity returns the installation identity, creating and persisting
 // it (client ID + Ed25519 JWK keypair, private half encrypted) on first run.
+// Concurrent creators race safely: INSERT ... ON CONFLICT DO NOTHING
+// followed by a re-read means losers return the stored winner, never a
+// phantom local ID. Genuine database errors surface instead of masquerading
+// as "no identity".
 func (s *Service) EnsureIdentity(ctx context.Context) (AppIdentity, error) {
 	var clientID string
 	err := s.DB.QueryRow(ctx, "SELECT client_identifier FROM app_identity WHERE id='singleton'").Scan(&clientID)
 	if err == nil {
 		return AppIdentity{ClientID: clientID}, nil
+	}
+	if err != nil && !isNoRows(err) {
+		return AppIdentity{}, fmt.Errorf("onboarding: identity lookup: %w", err)
 	}
 	id, priv, err := generateIdentity()
 	if err != nil {
@@ -91,7 +101,40 @@ func (s *Service) EnsureIdentity(ctx context.Context) (AppIdentity, error) {
 		VALUES('singleton', $1, $2, $3) ON CONFLICT (id) DO NOTHING`, id, string(jwk), seedCipher); err != nil {
 		return AppIdentity{}, fmt.Errorf("onboarding: save identity: %w", err)
 	}
-	return AppIdentity{ClientID: id}, nil
+	if err := s.DB.QueryRow(ctx, "SELECT client_identifier FROM app_identity WHERE id='singleton'").Scan(&clientID); err != nil {
+		return AppIdentity{}, fmt.Errorf("onboarding: identity re-read: %w", err)
+	}
+	return AppIdentity{ClientID: clientID}, nil
+}
+
+// DeviceCredentials returns the client ID, decrypted Ed25519 seed and
+// public JWK for plex.tv device-JWT calls.
+func (s *Service) DeviceCredentials(ctx context.Context) (clientID string, seed []byte, jwk json.RawMessage, err error) {
+	var jwkRaw string
+	var seedCipher []byte
+	qerr := s.DB.QueryRow(ctx, `SELECT client_identifier, jwk_public, jwk_private_ciphertext
+		FROM app_identity WHERE id='singleton'`).Scan(&clientID, &jwkRaw, &seedCipher)
+	if qerr != nil {
+		if !isNoRows(qerr) {
+			return "", nil, nil, fmt.Errorf("onboarding: identity lookup: %w", qerr)
+		}
+		if _, cerr := s.EnsureIdentity(ctx); cerr != nil {
+			return "", nil, nil, cerr
+		}
+		if qerr = s.DB.QueryRow(ctx, `SELECT client_identifier, jwk_public, jwk_private_ciphertext
+			FROM app_identity WHERE id='singleton'`).Scan(&clientID, &jwkRaw, &seedCipher); qerr != nil {
+			return "", nil, nil, fmt.Errorf("onboarding: identity re-read: %w", qerr)
+		}
+	}
+	seed, err = crypto.Decrypt(s.Secret, PurposeDeviceKey, seedCipher)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("onboarding: device key: %w", err)
+	}
+	return clientID, seed, json.RawMessage(jwkRaw), nil
+}
+
+func isNoRows(err error) bool {
+	return err != nil && (errors.Is(err, pgx.ErrNoRows) || strings.Contains(err.Error(), "no rows"))
 }
 
 func generateIdentity() (string, ed25519.PrivateKey, error) {

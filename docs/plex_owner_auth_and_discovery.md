@@ -112,6 +112,10 @@ Plaintext credentials must exist only in process memory for the shortest necessa
 
 Before the owner JWT expires, refresh it using the Plex nonce flow. After refresh, refresh the PMS resources record and PMS access token.
 
+A background worker checks hourly and refreshes within 24 hours of expiry. The negotiated mode (`jwt` or `legacy`) is persisted and surfaced in onboarding status.
+
+If plex.tv rejects the JWT PIN shape, onboarding falls back to the legacy PIN token flow and records the mode explicitly. Legacy tokens have no refresh: they are validated on use and require re-onboarding on 401. The fallback is logged loudly and never silent.
+
 If refresh fails:
 
 ```text

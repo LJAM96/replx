@@ -1,3 +1,10 @@
+"""Build or verify the generated Replx Edge complete specification.
+
+Usage:
+    python3 scripts/build_complete_spec.py          # regenerate
+    python3 scripts/build_complete_spec.py --check  # fail if stale (CI)
+"""
+import sys
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
@@ -46,5 +53,12 @@ for rel in order:
     else:
         parts.append(text)
 
-(root / 'REPLX_EDGE_COMPLETE_SPEC.md').write_text(''.join(parts), encoding='utf-8')
-print(root / 'REPLX_EDGE_COMPLETE_SPEC.md')
+generated = ''.join(parts)
+target = root / 'REPLX_EDGE_COMPLETE_SPEC.md'
+if '--check' in sys.argv:
+    if not target.exists() or target.read_text(encoding='utf-8') != generated:
+        raise SystemExit('REPLX_EDGE_COMPLETE_SPEC.md is stale: run scripts/build_complete_spec.py')
+    print('spec in sync')
+else:
+    target.write_text(generated, encoding='utf-8')
+    print(target)

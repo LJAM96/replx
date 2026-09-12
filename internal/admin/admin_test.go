@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/LJAM96/replx-edge/internal/health"
-	"github.com/LJAM96/replx-edge/internal/spike"
+	"github.com/LJAM96/replx/internal/health"
+	"github.com/LJAM96/replx/internal/spike"
 )
 
 func TestSetupGate(t *testing.T) {
@@ -43,5 +43,51 @@ func TestSpikeEventsDisabled(t *testing.T) {
 	m.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"enabled":false`) {
 		t.Fatalf("disabled spike must report enabled=false, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func loginCookie(t *testing.T, m *Mux) *http.Cookie {
+	t.Helper()
+	form := strings.NewReader("token=tok123")
+	req := httptest.NewRequest(http.MethodPost, "/admin/login", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("login: %d %s", rec.Code, rec.Body.String())
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			return c
+		}
+	}
+	t.Fatal("no session cookie")
+	return nil
+}
+
+func TestBrowserLoginThenCookieAuth(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	cookie := loginCookie(t, m)
+	// Cookie-authenticated GET proves the browser flow without a bearer.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/spike/events", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cookie GET: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCookieMutationNeedsCSRF(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	cookie := loginCookie(t, m)
+	// POST without CSRF must be rejected even with a valid cookie.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/spike/observations", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("want 403 CSRF_REQUIRED, got %d %s", rec.Code, rec.Body.String())
 	}
 }

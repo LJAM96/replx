@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/LJAM96/replx-edge/internal/database"
+	"github.com/LJAM96/replx/internal/database"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

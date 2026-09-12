@@ -2,18 +2,29 @@ package spike
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/LJAM96/replx/internal/routing"
 )
+
+var errNoToken = errors.New("spike test: no token")
 
 func stubStore(origin string) *Store {
 	return &Store{
-		Lookup: func(ctx context.Context) (string, bool) {
+		Lookup: func(ctx context.Context) (string, string, bool) {
 			if origin == "" {
-				return "", false
+				return "", "", false
 			}
-			return origin, true
+			return origin, "http://internal-origin:32400", true
+		},
+		FetchTransient: func(ctx context.Context, internalOrigin, userToken string) (string, error) {
+			if userToken == "" {
+				return "", errNoToken
+			}
+			return "transient-test-token", nil
 		},
 		PublicHost: "plex.example.com",
 	}
@@ -30,6 +41,12 @@ func TestResolveRedirects(t *testing.T) {
 	}
 	if !strings.HasPrefix(loc, "https://origin.example:32400/library/parts/11/file.mkv?") || !strings.Contains(loc, "foo=bar") {
 		t.Fatalf("location: %s", loc)
+	}
+	if strings.Contains(loc, "user-tok") {
+		t.Fatal("persistent caller token must never enter the redirect")
+	}
+	if !strings.Contains(loc, "transient-test-token") {
+		t.Fatalf("expected transient token in location: %s", routing.RedactedLocation(loc))
 	}
 	events := s.Events()
 	if len(events) != 1 || events[0].Decision != "redirected" || !events[0].RangePresent {
@@ -61,6 +78,24 @@ func TestResolveFailsClosed(t *testing.T) {
 	req2.Header.Set("X-Plex-Token", "t")
 	if _, ok := self.Resolve(req2, "r"); ok {
 		t.Fatal("loopback origin must not resolve")
+	}
+}
+
+func TestDelegationFailureHasNoPersistentFallback(t *testing.T) {
+	s := stubStore("https://origin.example:32400")
+	s.FetchTransient = func(ctx context.Context, internalOrigin, userToken string) (string, error) {
+		return "", errors.New("pms down")
+	}
+	req := httptest.NewRequest("GET", "/library/parts/1/x", nil)
+	req.Header.Set("X-Plex-Token", "persistent-user-token")
+	loc, ok := s.Resolve(req, "r")
+	if ok || loc != "" {
+		t.Fatalf("delegation failure must fail closed, got %q", loc)
+	}
+	for _, e := range s.Events() {
+		if strings.Contains(e.RedactedLocation, "persistent-user-token") {
+			t.Fatal("persistent token leaked into trace")
+		}
 	}
 }
 

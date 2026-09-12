@@ -44,6 +44,8 @@ All `X-Plex-*` values may also appear as query parameters.
 | `/:/unscrobble` | Never | User | No | State invalidation | No |
 | `/status/sessions` | Never | Owner admin via admin API only | Deny on control with explanation | No | No |
 | universal playback decision | Never | User | Query and response validation | Critical | No body media |
+| transcode decision (`*/transcode/universal/decision`) | Never | User | Control: future policy inspection point, never bulk media | Critical | No |
+| transcode session/stop control | Never | User | Control | Session state | No |
 | play queue creation | Never | User | Observe + correlate; no queue rewrite in 1.0 | Correlation, enforced at part boundary | No |
 | `/library/parts/*` | Never | User | Allowed part substitution only | Critical | Direct origin or media gateway |
 | transcode start manifest | Never | User | Source query enforcement | Critical | Redirect initial manifest or media gateway |

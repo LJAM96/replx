@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/LJAM96/replx-edge/internal/logging"
+	"github.com/LJAM96/replx/internal/logging"
 )
 
 func TestPassthroughPreservesSemantics(t *testing.T) {
