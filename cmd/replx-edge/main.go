@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/LJAM96/replx/internal/admin"
+	"github.com/LJAM96/replx/internal/cache"
 	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/config"
 	"github.com/LJAM96/replx/internal/database"
@@ -160,6 +161,17 @@ func runServe() error {
 	// restart; the secret keys fingerprinting and trace IDs.
 	registry := &metrics.Registry{}
 	captureStore := capture.New()
+	// Zeta browse cache: best-effort Valkey store with a short op timeout
+	// so a down Valkey degrades to origin fall-through instead of stalling
+	// requests. Store errors read as misses; see internal/cache.
+	cacheClient := valkey.NewClient(cfg.ValkeyAddr, 300*time.Millisecond)
+	if valkey.Ping(cfg.ValkeyAddr, 2*time.Second) {
+		logger.Log(logging.Entry{Level: "info", Component: "cache",
+			Fields: map[string]any{"event": "cache_enabled"}})
+	} else {
+		logger.Log(logging.Entry{Level: "warn", Component: "cache",
+			Fields: map[string]any{"event": "cache_degraded", "reason": "valkey unreachable; browse falls through to origin"}})
+	}
 	proxyHandler, err := proxy.New(proxy.Options{
 		OriginBase:  cfg.OriginInternalURL,
 		IngressMode: cfg.IngressMode,
@@ -167,6 +179,7 @@ func runServe() error {
 		Secret:      cfg.SecretKey,
 		Metrics:     registry,
 		Capture:     captureStore,
+		Cache:       cache.NewValkeyStore(cacheClient),
 		Spike:       spikeOpt,
 	})
 	if err != nil {
