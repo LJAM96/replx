@@ -19,8 +19,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
+	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/health"
+	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/onboarding"
 	"github.com/LJAM96/replx/internal/spike"
 )
@@ -43,6 +46,8 @@ type Mux struct {
 	setupToken  string
 	requireAuth bool
 	sessions    *sessionStore
+	registry    *metrics.Registry
+	cap         *capture.Store
 }
 
 type ctxKey struct{}
@@ -67,6 +72,35 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 	m.mux.HandleFunc("/api/v1/spike/observations", m.auth(m.handleSpikeObservations))
 	m.mux.HandleFunc("/admin/spike", m.auth(m.handleSpikePanel))
 	return m
+}
+
+// SetMetrics registers the open Prometheus exposition endpoint. The admin
+// listener is private (loopback/Tailscale) by deployment contract, matching
+// /health/*. Nil disables exposition with an explanatory comment.
+func (m *Mux) SetMetrics(reg *metrics.Registry) {
+	m.registry = reg
+	m.mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		if m.registry == nil {
+			_, _ = fmt.Fprintln(w, "# no metrics registry wired")
+			return
+		}
+		m.registry.WritePrometheus(w)
+	})
+	m.mux.HandleFunc("/api/v1/cache/stats", m.auth(m.handleCacheStats))
+}
+
+// SetCapture registers the targeted protocol capture API behind setup auth:
+// GET lists live targets plus recent events, POST arms a target, DELETE
+// disarms. Capture is time-limited by the store; see internal/capture.
+func (m *Mux) SetCapture(store *capture.Store) {
+	m.cap = store
+	m.mux.HandleFunc("/api/v1/diagnostics/capture", m.auth(m.handleCapture))
 }
 
 func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) { m.mux.ServeHTTP(w, r) }
@@ -363,6 +397,26 @@ func (m *Mux) handlePanel(w http.ResponseWriter, r *http.Request) {
 </body></html>`, csrf, csrf)
 }
 
+// handleCacheStats reports user-scoped cache counters plus the static v1
+// policy (cacheable prefixes and TTLs) so operators can verify the fast
+// path is serving without reading code.
+func (m *Mux) handleCacheStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
+		return
+	}
+	var hits, misses int64
+	if m.registry != nil {
+		s := m.registry.Snapshot()
+		hits, misses = s.CacheHits, s.CacheMisses
+	}
+	writeData(w, http.StatusOK, map[string]any{
+		"hits":   hits,
+		"misses": misses,
+		"policy": "GET /hubs/* 2m, /library/collections/* 5m, /library/metadata/* 5m, /library/sections* 5m, /identity 5m; timeline/decisions/media/artwork never; TTL-only invalidation until Gamma events",
+	})
+}
+
 func (m *Mux) handleSpikeEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
@@ -374,6 +428,58 @@ func (m *Mux) handleSpikeEvents(w http.ResponseWriter, r *http.Request) {
 		events = m.spike.Events()
 	}
 	writeData(w, http.StatusOK, map[string]any{"enabled": enabled, "events": events})
+}
+
+func (m *Mux) handleCapture(w http.ResponseWriter, r *http.Request) {
+	if m.cap == nil {
+		writeError(w, http.StatusConflict, "CAPTURE_DISABLED", "no capture store wired")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		events := m.cap.Events()
+		if len(events) > 50 {
+			events = events[len(events)-50:]
+		}
+		targets := m.cap.Targets()
+		if targets == nil {
+			targets = []capture.Target{}
+		}
+		writeData(w, http.StatusOK, map[string]any{"targets": targets, "events": events})
+	case http.MethodPost:
+		var body struct {
+			ClientID  string `json:"clientId"`
+			RatingKey string `json:"ratingKey"`
+			Minutes   int    `json:"minutes"`
+			Reason    string `json:"reason"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_BODY", "capture JSON required")
+			return
+		}
+		ttl := time.Duration(body.Minutes) * time.Minute
+		if ttl <= 0 {
+			ttl = 30 * time.Minute
+		}
+		t, err := m.cap.Start(body.ClientID, body.RatingKey, ttl, body.Reason)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "CAPTURE_FAILED", err.Error())
+			return
+		}
+		writeData(w, http.StatusCreated, map[string]any{"target": t})
+	case http.MethodDelete:
+		var body struct {
+			ClientID  string `json:"clientId"`
+			RatingKey string `json:"ratingKey"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_BODY", "capture JSON required")
+			return
+		}
+		writeData(w, http.StatusOK, map[string]any{"removed": m.cap.Stop(body.ClientID, body.RatingKey)})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET, POST or DELETE")
+	}
 }
 
 func (m *Mux) handleSpikeObservations(w http.ResponseWriter, r *http.Request) {

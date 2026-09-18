@@ -28,10 +28,12 @@ import (
 	"time"
 
 	"github.com/LJAM96/replx/internal/admin"
+	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/config"
 	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/health"
 	"github.com/LJAM96/replx/internal/logging"
+	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/onboarding"
 	"github.com/LJAM96/replx/internal/plextv"
 	"github.com/LJAM96/replx/internal/pms"
@@ -153,10 +155,18 @@ func runServe() error {
 		logger.Log(logging.Entry{Level: "warn", Component: "routing.spike",
 			Fields: map[string]any{"event": "spike_enabled"}})
 	}
+	// Beta observability: live Prometheus counters plus targeted,
+	// time-limited protocol capture. Both are process-local and reset on
+	// restart; the secret keys fingerprinting and trace IDs.
+	registry := &metrics.Registry{}
+	captureStore := capture.New()
 	proxyHandler, err := proxy.New(proxy.Options{
 		OriginBase:  cfg.OriginInternalURL,
 		IngressMode: cfg.IngressMode,
 		Logger:      logger,
+		Secret:      cfg.SecretKey,
+		Metrics:     registry,
+		Capture:     captureStore,
 		Spike:       spikeOpt,
 	})
 	if err != nil {
@@ -202,6 +212,8 @@ func runServe() error {
 		ValkeyOK:           valkeyOK,
 		PMSStatus:          func() string { return pmsStatus.Load().(string) },
 	}, onboard, setupToken, true, spikeStore, &spikeObs)
+	adminMux.SetMetrics(registry)
+	adminMux.SetCapture(captureStore)
 	fmt.Fprintf(os.Stdout, "replx-edge onboarding panel: http://127.0.0.1:%d/admin/onboarding | spike matrix: http://127.0.0.1:%d/admin/spike\n",
 		cfg.AdminPort, cfg.AdminPort)
 	adminSrv := &http.Server{

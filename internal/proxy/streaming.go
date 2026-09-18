@@ -37,27 +37,27 @@ func isWebSocket(r *http.Request) bool {
 
 // serveStreaming dispatches SSE and WebSocket requests. It reports whether
 // it handled the request.
-func (h *Handler) serveStreaming(w http.ResponseWriter, r *http.Request, id string, start time.Time) bool {
+func (h *Handler) serveStreaming(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) bool {
 	switch {
 	case isWebSocket(r):
-		h.tunnelWebSocket(w, r, id, start)
+		h.tunnelWebSocket(w, r, id, o, start)
 		return true
 	case isSSE(r):
-		h.streamSSE(w, r, id, start)
+		h.streamSSE(w, r, id, o, start)
 		return true
 	default:
 		return false
 	}
 }
 
-func (h *Handler) streamSSE(w http.ResponseWriter, r *http.Request, id string, start time.Time) {
+func (h *Handler) streamSSE(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) {
 	target := *h.origin
 	target.Path = singleJoin(h.origin.Path, r.URL.Path)
 	target.RawPath = ""
 	target.RawQuery = r.URL.RawQuery
 	out, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), nil)
 	if err != nil {
-		h.writeBadGateway(w, r, id, "control", start)
+		h.writeBadGateway(w, r, id, o, "control", start)
 		return
 	}
 	copyHeaders(out.Header, r.Header)
@@ -66,7 +66,7 @@ func (h *Handler) streamSSE(w http.ResponseWriter, r *http.Request, id string, s
 	// No timeout: lifetime is bound to the client request context.
 	resp, err := http.DefaultClient.Do(out) //nolint:gosec // admin-configured origin only
 	if err != nil {
-		h.writeBadGateway(w, r, id, "control", start)
+		h.writeBadGateway(w, r, id, o, "control", start)
 		return
 	}
 	defer resp.Body.Close()
@@ -75,7 +75,7 @@ func (h *Handler) streamSSE(w http.ResponseWriter, r *http.Request, id string, s
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		w.WriteHeader(http.StatusBadGateway)
-		h.emit(r, id, "control", http.StatusBadGateway, start, map[string]any{"decision": "no-flusher"})
+		h.emit(r, id, o, "control", http.StatusBadGateway, start, map[string]any{"decision": "no-flusher"})
 		return
 	}
 	w.WriteHeader(resp.StatusCode)
@@ -93,20 +93,20 @@ func (h *Handler) streamSSE(w http.ResponseWriter, r *http.Request, id string, s
 			break
 		}
 	}
-	h.emit(r, id, "control", resp.StatusCode, start, map[string]any{"decision": "streamed"})
+	h.emit(r, id, o, "control", resp.StatusCode, start, map[string]any{"decision": "streamed"})
 }
 
 // tunnelWebSocket hijacks the client connection and pipes raw bytes to the
 // origin, preserving the WebSocket handshake end to end.
-func (h *Handler) tunnelWebSocket(w http.ResponseWriter, r *http.Request, id string, start time.Time) {
+func (h *Handler) tunnelWebSocket(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		h.writeBadGateway(w, r, id, "control", start)
+		h.writeBadGateway(w, r, id, o, "control", start)
 		return
 	}
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		h.emit(r, id, "control", http.StatusBadGateway, start, map[string]any{"decision": "hijack-failed"})
+		h.emit(r, id, o, "control", http.StatusBadGateway, start, map[string]any{"decision": "hijack-failed"})
 		return
 	}
 	defer clientConn.Close()
@@ -114,16 +114,16 @@ func (h *Handler) tunnelWebSocket(w http.ResponseWriter, r *http.Request, id str
 	originConn, err := h.dialOrigin()
 	if err != nil {
 		_, _ = fmt.Fprint(clientConn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-		h.emit(r, id, "control", http.StatusBadGateway, start, map[string]any{"decision": "origin-dial-failed"})
+		h.emit(r, id, o, "control", http.StatusBadGateway, start, map[string]any{"decision": "origin-dial-failed"})
 		return
 	}
 	defer originConn.Close()
 
 	if err := r.Write(originConn); err != nil {
-		h.emit(r, id, "control", http.StatusBadGateway, start, map[string]any{"decision": "origin-write-failed"})
+		h.emit(r, id, o, "control", http.StatusBadGateway, start, map[string]any{"decision": "origin-write-failed"})
 		return
 	}
-	h.emit(r, id, "control", http.StatusSwitchingProtocols, start, map[string]any{"decision": "tunneled"})
+	h.emit(r, id, o, "control", http.StatusSwitchingProtocols, start, map[string]any{"decision": "tunneled"})
 	go func() { _, _ = io.Copy(originConn, clientConn) }()
 	_, _ = io.Copy(clientConn, originConn)
 }

@@ -6,7 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/health"
+	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/spike"
 )
 
@@ -89,5 +91,68 @@ func TestCookieMutationNeedsCSRF(t *testing.T) {
 	m.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("want 403 CSRF_REQUIRED, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMetricsOpen(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	var reg metrics.Registry
+	m.SetMetrics(&reg)
+	// /metrics stays open like /health/*: the listener itself is private.
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), metrics.HTTPRequestsTotal) {
+		t.Fatalf("metrics exposition: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCaptureAPIGated(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	m.SetCapture(capture.New())
+	// Unauthenticated capture access must gate.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/diagnostics/capture", nil)
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("capture GET must gate, got %d", rec.Code)
+	}
+	// Bearer round trip: arm then list.
+	post := httptest.NewRequest(http.MethodPost, "/api/v1/diagnostics/capture",
+		strings.NewReader(`{"clientId":"c1","minutes":5,"reason":"test"}`))
+	post.Header.Set("Content-Type", "application/json")
+	post.Header.Set("Authorization", "Bearer tok123")
+	postRec := httptest.NewRecorder()
+	m.ServeHTTP(postRec, post)
+	if postRec.Code != http.StatusCreated {
+		t.Fatalf("capture POST: %d %s", postRec.Code, postRec.Body.String())
+	}
+	get := httptest.NewRequest(http.MethodGet, "/api/v1/diagnostics/capture", nil)
+	get.Header.Set("Authorization", "Bearer tok123")
+	getRec := httptest.NewRecorder()
+	m.ServeHTTP(getRec, get)
+	if getRec.Code != http.StatusOK || !strings.Contains(getRec.Body.String(), "c1") {
+		t.Fatalf("capture GET: %d %s", getRec.Code, getRec.Body.String())
+	}
+}
+
+func TestCacheStats(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	var reg metrics.Registry
+	reg.IncCacheHit()
+	m.SetMetrics(&reg)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/cache/stats", nil)
+	req.Header.Set("Authorization", "Bearer tok123")
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"hits":1`) {
+		t.Fatalf("cache stats: %d %s", rec.Code, rec.Body.String())
+	}
+	// Unauthenticated stats must gate like the rest of the API.
+	anon := httptest.NewRequest(http.MethodGet, "/api/v1/cache/stats", nil)
+	anonRec := httptest.NewRecorder()
+	m.ServeHTTP(anonRec, anon)
+	if anonRec.Code != http.StatusUnauthorized {
+		t.Fatalf("cache stats must gate, got %d", anonRec.Code)
 	}
 }

@@ -7,8 +7,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/LJAM96/replx/internal/cache"
+	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/logging"
+	"github.com/LJAM96/replx/internal/metrics"
+	"github.com/LJAM96/replx/internal/trace"
 )
 
 func TestPassthroughPreservesSemantics(t *testing.T) {
@@ -230,5 +235,303 @@ func TestSpikeMissStaysFailClosed(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), MediaRouteUnavailable) {
 		t.Fatalf("want fail-closed 403, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFingerprintLoggedNotToken(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	var logs bytes.Buffer
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Logger: logging.New(&logs), Secret: secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+	req.Header.Set("X-Plex-Token", "user-secret-xyz")
+	req.Header.Set("X-Plex-Client-Identifier", "client-1")
+	req.Header.Set("X-Plex-Product", "Plex Web")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	want := trace.Fingerprint(secret, "user-secret-xyz")
+	if !strings.Contains(logs.String(), want) {
+		t.Fatalf("want fingerprint in logs, got: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), "user-secret-xyz") {
+		t.Fatalf("raw token leaked to logs: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "client-1") || !strings.Contains(logs.String(), "Plex Web") {
+		t.Fatalf("want client identity in logs, got: %s", logs.String())
+	}
+}
+
+func TestNoFingerprintWithoutSecret(t *testing.T) {
+	var logs bytes.Buffer
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Logger: logging.New(&logs)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+	req.Header.Set("X-Plex-Token", "user-secret-xyz")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if strings.Contains(logs.String(), "userFingerprint") {
+		t.Fatalf("no fingerprint without secret, got: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), "user-secret-xyz") {
+		t.Fatalf("raw token leaked to logs: %s", logs.String())
+	}
+}
+
+func TestPlaybackTraceHeader(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := httptest.NewRequest(http.MethodGet, "/video/:/transcode/universal/start.mpd?session=abc", nil)
+	media.Header.Set("X-Plex-Client-Identifier", "client-1")
+	mediaRec := httptest.NewRecorder()
+	h.ServeHTTP(mediaRec, media)
+	if mediaRec.Header().Get(trace.PlaybackTraceHeader) == "" {
+		t.Fatal("playback route must carry a playback trace header")
+	}
+	control := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+	controlRec := httptest.NewRecorder()
+	h.ServeHTTP(controlRec, control)
+	if controlRec.Header().Get(trace.PlaybackTraceHeader) != "" {
+		t.Fatal("control route must not carry a playback trace header")
+	}
+}
+
+func TestMetricsObserved(t *testing.T) {
+	var reg metrics.Registry
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel", Metrics: &reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/library/sections", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/library/parts/11/x", nil))
+	s := reg.Snapshot()
+	if s.ReqTotal["control|200"] != 1 {
+		t.Fatalf("control total: %+v", s.ReqTotal)
+	}
+	if s.ReqTotal["media|403"] != 1 || s.MediaFailure["unavailable"] != 1 {
+		t.Fatalf("media failure: %+v %+v", s.ReqTotal, s.MediaFailure)
+	}
+	if s.OriginTotal != 1 || s.OriginErrors != 0 {
+		t.Fatalf("origin: total=%d errors=%d", s.OriginTotal, s.OriginErrors)
+	}
+}
+
+func TestCaptureProtocolLog(t *testing.T) {
+	var logs bytes.Buffer
+	store := capture.New()
+	if _, err := store.Start("client-1", "", 10*time.Minute, "test"); err != nil {
+		t.Fatal(err)
+	}
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Logger: logging.New(&logs), Capture: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+	req.Header.Set("X-Plex-Client-Identifier", "client-1")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if !strings.Contains(logs.String(), "diagnostics.protocol") {
+		t.Fatalf("want protocol capture line, got: %s", logs.String())
+	}
+	if len(store.Events()) != 1 {
+		t.Fatalf("want 1 capture event, got %d", len(store.Events()))
+	}
+	plain := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+	h.ServeHTTP(httptest.NewRecorder(), plain)
+	if len(store.Events()) != 1 {
+		t.Fatal("untargeted request must not record")
+	}
+}
+
+func cacheTestHandler(originHits *int, body func(r *http.Request) string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		*originHits++
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(body(r)))
+	}
+}
+
+func TestCacheHitServesWithoutOrigin(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	var logs bytes.Buffer
+	hits := 0
+	origin := httptest.NewServer(cacheTestHandler(&hits, func(r *http.Request) string {
+		return "<MediaContainer size=\"1\"/>"
+	}))
+	defer origin.Close()
+	var reg metrics.Registry
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct",
+		Logger: logging.New(&logs), Secret: secret, Metrics: &reg, Cache: cache.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/hubs/home/recentlyAdded?contentDirectoryID=22", nil)
+		req.Header.Set("X-Plex-Token", "user-a-token")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	first := get()
+	if first.Header().Get(CacheHeader) != "miss" || hits != 1 {
+		t.Fatalf("first must miss and hit origin: cache=%s hits=%d", first.Header().Get(CacheHeader), hits)
+	}
+	second := get()
+	if second.Header().Get(CacheHeader) != "hit" || hits != 1 {
+		t.Fatalf("second must hit without origin: cache=%s hits=%d", second.Header().Get(CacheHeader), hits)
+	}
+	if second.Body.String() != first.Body.String() {
+		t.Fatal("hit body must equal miss body")
+	}
+	s := reg.Snapshot()
+	if s.CacheHits != 1 || s.CacheMisses != 1 {
+		t.Fatalf("cache counters: hits=%d misses=%d", s.CacheHits, s.CacheMisses)
+	}
+	if strings.Contains(logs.String(), "user-a-token") {
+		t.Fatal("raw token leaked to logs")
+	}
+}
+
+// TestCacheIsolation is the acceptance gate: one user's watched state,
+// Continue Watching and restricted libraries must never appear in another
+// user's cached response.
+func TestCacheIsolation(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	hits := 0
+	origin := httptest.NewServer(cacheTestHandler(&hits, func(r *http.Request) string {
+		return "<MediaContainer user=\"" + r.Header.Get("X-Plex-Token") + "\"/>"
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: cache.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(token string) string {
+		req := httptest.NewRequest(http.MethodGet, "/hubs/home/continueWatching", nil)
+		req.Header.Set("X-Plex-Token", token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Body.String()
+	}
+	a1 := get("token-user-a")
+	b1 := get("token-user-b")
+	a2 := get("token-user-a")
+	if hits != 2 {
+		t.Fatalf("want 2 origin hits (one per user), got %d", hits)
+	}
+	if !strings.Contains(a1, "token-user-a") || !strings.Contains(a2, "token-user-a") {
+		t.Fatalf("user A responses wrong: %q %q", a1, a2)
+	}
+	if !strings.Contains(b1, "token-user-b") || strings.Contains(b1, "token-user-a") {
+		t.Fatalf("user B response leaked user A: %q", b1)
+	}
+}
+
+func TestCacheSkipsTimelineAndMedia(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	hits := 0
+	origin := httptest.NewServer(cacheTestHandler(&hits, func(r *http.Request) string { return "ok" }))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel",
+		Secret: secret, Cache: cache.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Watch-state timeline must always reach the origin.
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/:/timeline?ratingKey=1&state=playing&time=100", nil)
+		req.Header.Set("X-Plex-Token", "user-a-token")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Header().Get(CacheHeader) != "bypass" {
+			t.Fatalf("timeline must bypass, got %s", rec.Header().Get(CacheHeader))
+		}
+	}
+	// Fail-closed media carries no cache header at all.
+	mreq := httptest.NewRequest(http.MethodGet, "/library/parts/11/file.mkv", nil)
+	mreq.Header.Set("X-Plex-Token", "user-a-token")
+	mrec := httptest.NewRecorder()
+	h.ServeHTTP(mrec, mreq)
+	if mrec.Header().Get(CacheHeader) != "" {
+		t.Fatalf("media must not carry cache header, got %s", mrec.Header().Get(CacheHeader))
+	}
+	if hits != 2 {
+		t.Fatalf("timeline must hit origin twice, hits=%d", hits)
+	}
+}
+
+func TestCacheLargeBodyStreamsUncached(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	hits := 0
+	big := bytes.Repeat([]byte("x"), cache.MaxEntryBytes+1024)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write(big)
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: cache.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/library/collections/1/children", nil)
+		req.Header.Set("X-Plex-Token", "user-a-token")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Header().Get(CacheHeader) != "miss" {
+			t.Fatalf("oversize must miss, got %s", rec.Header().Get(CacheHeader))
+		}
+		if rec.Body.String() != string(big) {
+			t.Fatalf("oversize body truncated: %d", rec.Body.Len())
+		}
+	}
+	if hits != 2 {
+		t.Fatalf("oversize must never populate cache, hits=%d", hits)
+	}
+}
+
+func TestCacheAnonymousBypass(t *testing.T) {
+	hits := 0
+	origin := httptest.NewServer(cacheTestHandler(&hits, func(r *http.Request) string { return "ok" }))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: "s", Cache: cache.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/hubs/home/recentlyAdded", nil))
+		if rec.Header().Get(CacheHeader) != "bypass" {
+			t.Fatalf("anonymous must bypass, got %s", rec.Header().Get(CacheHeader))
+		}
+	}
+	if hits != 2 {
+		t.Fatalf("anonymous must always reach origin, hits=%d", hits)
 	}
 }
