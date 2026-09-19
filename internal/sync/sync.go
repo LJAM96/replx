@@ -6,10 +6,12 @@
 // user response: user visibility is enforced at serving time (policy and
 // search fall back to PMS whenever visibility is uncertain).
 //
-// Sync is resumable: per-section page cursors persist in sync_cursors, so a
-// restart continues mid-section. A full sweep deletes rows absent from the
-// origin; light passes only refresh the section list plus dirty sections
-// flagged by the PMS event consumer.
+// Sync is resumable: per-section page cursors persist in sync_cursors, so
+// an interrupted pass continues mid-section within the same process run.
+// A process restart begins the current section at zero under a fresh
+// sweep generation instead of trusting a stale cursor: restarts cost some
+// origin requests but can never skip pages. Crash safety beats resume
+// precision for 1.0.
 package sync
 
 import (

@@ -85,7 +85,10 @@ type itemsPage struct {
 }
 
 // parseItemsPage decodes one section page. total is the origin-reported
-// total (totalSize preferred, size as legacy fallback, -1 when absent).
+// totalSize. There is deliberately NO fallback to size: Plex defines size
+// as the number of items in THIS response, so a 100-item first page of a
+// 10,000-item collection would otherwise terminate the sweep. Builds that
+// omit totalSize terminate by short page instead (total -1).
 func parseItemsPage(raw []byte) ([]itemJSON, int, error) {
 	var parsed itemsPage
 	if err := json.Unmarshal(raw, &parsed); err != nil {
@@ -94,8 +97,6 @@ func parseItemsPage(raw []byte) ([]itemJSON, int, error) {
 	total := -1
 	if parsed.MediaContainer.TotalSize != nil {
 		total = *parsed.MediaContainer.TotalSize
-	} else if parsed.MediaContainer.Size != nil {
-		total = *parsed.MediaContainer.Size
 	}
 	return parsed.MediaContainer.Metadata, total, nil
 }

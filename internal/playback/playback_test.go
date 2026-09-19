@@ -279,3 +279,53 @@ func TestSessionBindsIdentity(t *testing.T) {
 		t.Fatalf("binding: %+v %v %v", got, ok, err)
 	}
 }
+
+func TestBindingMismatch(t *testing.T) {
+	cases := []struct {
+		name               string
+		storedID, storedCl string
+		curID, curCl       string
+		mismatch           bool
+	}{
+		{"unbound session", "", "", "", "", false},
+		{"unbound session, identified caller", "", "", "id-1", "cl-1", false},
+		{"exact match", "id-1", "cl-1", "id-1", "cl-1", false},
+		{"identity drift", "id-1", "cl-1", "id-2", "cl-1", true},
+		{"unresolved caller vs bound", "id-1", "cl-1", "", "", true},
+		{"client drift", "id-1", "cl-1", "id-1", "cl-2", true},
+		{"client unknown, identity matches", "id-1", "cl-1", "id-1", "", false},
+		{"identity bound only, matches", "id-1", "", "id-1", "cl-9", false},
+	}
+	for _, tc := range cases {
+		if got := bindingMismatch(tc.storedID, tc.storedCl, tc.curID, tc.curCl); got != tc.mismatch {
+			t.Errorf("%s: want %v", tc.name, tc.mismatch)
+		}
+	}
+}
+
+func TestManifestMalformedIndexDenied(t *testing.T) {
+	e := &Engine{Store: NewMemoryStore()}
+	_, _ = e.Store.Create(context.Background(), Session{
+		PlexSessionID: "sess-mal", RatingKey: "999", SelectedMediaIndex: 1,
+		PlaybackMode: "directStream",
+	})
+	r := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=sess-mal&mediaIndex=garbage", nil)
+	if _, deny, reason := e.EnforcePart(r, "", "sess-mal"); !deny || reason != policy.OriginMismatch {
+		t.Fatalf("malformed mediaIndex must fail closed: %v %q", deny, reason)
+	}
+}
+
+func TestBoundSessionEnforced(t *testing.T) {
+	e := &Engine{Store: NewMemoryStore()}
+	_, _ = e.Store.Create(context.Background(), Session{
+		PlexSessionID: "sess-bound", RatingKey: "999", SelectedMediaIndex: 1,
+		IdentityID: "ident-1", ClientUUID: "client-1",
+		SelectedPartPlexID: "302", SelectedPartKey: "/library/parts/302/file.mp4",
+	})
+	// No token at all: identity unprovable against a bound session.
+	r := httptest.NewRequest(http.MethodGet, "/library/parts/302/file.mp4", nil)
+	if _, deny, reason := e.EnforcePart(r, "302", "sess-bound"); !deny || reason != SessionIdentityMismatch {
+		t.Fatalf("tokenless use of bound session must deny: %v %q", deny, reason)
+	}
+}

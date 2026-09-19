@@ -45,7 +45,7 @@ func TestNormalizeDynamicRange(t *testing.T) {
 }
 
 func TestParseItemsPage(t *testing.T) {
-	raw := `{"MediaContainer":{"size":2,"Metadata":[
+	raw := `{"MediaContainer":{"size":2,"totalSize":2,"offset":0,"Metadata":[
 		{"ratingKey":"1001","key":"/library/metadata/1001","type":"movie","title":"Fixture Film","titleSort":"Fixture Film","year":2024,
 		 "duration":5400000,"thumb":"/t/1","art":"/a/1","addedAt":1700000000,"updatedAt":1700000100,
 		 "Guid":[{"id":"imdb://tt1234567"},{"id":"tmdb://98765"}],
@@ -90,8 +90,8 @@ func TestParseItemsPage(t *testing.T) {
 		t.Fatalf("totalSize must win: total=%d err=%v", total, err)
 	}
 	legacyRaw := `{"MediaContainer":{"size":2,"Metadata":[]}}`
-	if _, total, err := parseItemsPage([]byte(legacyRaw)); err != nil || total != 2 {
-		t.Fatalf("legacy size fallback: total=%d err=%v", total, err)
+	if _, total, err := parseItemsPage([]byte(legacyRaw)); err != nil || total != -1 {
+		t.Fatalf("absent totalSize must not fall back to size: total=%d err=%v", total, err)
 	}
 }
 

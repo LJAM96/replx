@@ -213,12 +213,14 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 	}
 	iid := r.upsertIdentity(cctx, serverID, id, username)
 	r.upsertLink(cctx, serverID, fingerprint, iid)
-	res := Resolved{Scope: "acct:" + strconv.FormatInt(id, 10), AccountID: id, Known: true}
-	if iid != "" {
-		res.IdentityID = iid
-		res.ClientID = r.recordClient(cctx, serverID, iid, client)
+	if iid == "" {
+		// Account proven by plex.tv but not persistable: stay
+		// token-scoped rather than claim an identity we cannot bind.
+		return fallback, true
 	}
-	return res, true
+	return Resolved{Scope: "acct:" + strconv.FormatInt(id, 10), AccountID: id,
+		IdentityID: iid, Known: true,
+		ClientID: r.recordClient(cctx, serverID, iid, client)}, true
 }
 
 // resolveClient records (or reuses) the client instance for one device.
@@ -291,17 +293,21 @@ func (r *Resolver) evictCliLocked() {
 }
 
 func (r *Resolver) upsertIdentity(ctx context.Context, serverID string, accountID int64, username string) string {
-	var id string
-	err := r.DB.QueryRow(ctx, `INSERT INTO plex_identities(server_id, plex_account_id, username, identity_type, updated_at)
+	// No ON CONFLICT arbiter and no fallback-after-error: a failed
+	// statement inside a transaction aborts it, so a fallback SELECT
+	// after an error can never work. INSERT ... DO NOTHING needs no
+	// inference, then SELECT reads what won (ours or a concurrent row).
+	if _, err := r.DB.Exec(ctx, `INSERT INTO plex_identities(server_id, plex_account_id, username, identity_type, updated_at)
 		VALUES($1,$2,$3,'user',now())
-		ON CONFLICT (server_id, plex_account_id) WHERE plex_account_id IS NOT NULL
-		DO UPDATE SET username=EXCLUDED.username, updated_at=now() RETURNING id`).Scan(&id)
-	if err != nil {
-		// Partial unique index needs predicate in the arbiter; fall back
-		// to lookup-then-insert for exotic planners.
-		_ = r.DB.QueryRow(ctx, `SELECT id FROM plex_identities WHERE server_id=$1 AND plex_account_id=$2`,
-			serverID, accountID).Scan(&id)
+		ON CONFLICT DO NOTHING`, serverID, accountID, username); err != nil {
+		return ""
 	}
+	var id string
+	if err := r.DB.QueryRow(ctx, `SELECT id FROM plex_identities WHERE server_id=$1 AND plex_account_id=$2`,
+		serverID, accountID).Scan(&id); err != nil {
+		return ""
+	}
+	_, _ = r.DB.Exec(ctx, `UPDATE plex_identities SET username=$2, updated_at=now() WHERE id=$1`, id, username)
 	return id
 }
 

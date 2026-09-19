@@ -129,6 +129,11 @@ func (w *Worker) syncSection(ctx context.Context, serverID, token string, s sect
 			start = 0
 		}
 		trackGen = gen
+	} else {
+		// Light dirty refreshes always restart at zero: a completed
+		// cursor points at the end, and resuming it would revisit
+		// nothing. Progress is still saved per page for visibility.
+		start = 0
 	}
 	page := w.PageSize
 	if page <= 0 {

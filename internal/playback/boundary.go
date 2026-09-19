@@ -55,6 +55,9 @@ func (e *Engine) EnforcePart(r *http.Request, partID, sessionID string) (substit
 	if err != nil || !ok {
 		return e.enforceStateless(r, partID)
 	}
+	if deny, reason := e.checkSessionBinding(r, sess); deny {
+		return "", true, reason
+	}
 	if sess.SelectedPartPlexID != "" && partID == sess.SelectedPartPlexID {
 		return "", false, ""
 	}
@@ -67,6 +70,55 @@ func (e *Engine) EnforcePart(r *http.Request, partID, sessionID string) (substit
 		return sess.SelectedPartKey, false, "substituted"
 	}
 	return "", false, ""
+}
+
+// SessionIdentityMismatch is denied when the request's identity or client
+// does not match the session's bound identity/client: a session identifier
+// alone is not a bearer capability. Pre-binding sessions (empty stored
+// IDs) are grandfathered, and companion remote control across Replx Edge
+// remains unsupported in 1.0.
+const SessionIdentityMismatch = "POLICY_SESSION_IDENTITY_MISMATCH"
+
+// checkSessionBinding compares the stored session binding against the
+// current request. It reports deny=true with the mismatch code when the
+// session names an identity or client the request cannot prove.
+func (e *Engine) checkSessionBinding(r *http.Request, sess Session) (bool, string) {
+	if sess.IdentityID == "" && sess.ClientUUID == "" {
+		return false, ""
+	}
+	token := trace.ExtractToken(r)
+	if token == "" {
+		return true, SessionIdentityMismatch
+	}
+	var curIdentity, curClient string
+	if e.Identity != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		res := e.Identity.Resolve(ctx, trace.Fingerprint(e.Secret, token), token,
+			identity.FromTrace(trace.ExtractClient(r)))
+		curIdentity, curClient = res.IdentityID, res.ClientID
+	}
+	if bindingMismatch(sess.IdentityID, sess.ClientUUID, curIdentity, curClient) {
+		return true, SessionIdentityMismatch
+	}
+	return false, ""
+}
+
+// bindingMismatch is pure for unit testing: stored bindings must match
+// the current request whenever both sides are known. Unknown current
+// identity against a bound session mismatches (fail closed); unbound
+// sessions (both stored empty) never mismatch.
+func bindingMismatch(storedIdentity, storedClient, curIdentity, curClient string) bool {
+	if storedIdentity == "" && storedClient == "" {
+		return false
+	}
+	if storedIdentity != "" && storedIdentity != curIdentity {
+		return true
+	}
+	if storedClient != "" && curClient != "" && storedClient != curClient {
+		return true
+	}
+	return false
 }
 
 // Stateless decision code: the boundary cannot consult negotiation state,
@@ -164,9 +216,11 @@ func (e *Engine) enforceManifest(r *http.Request, sessionID string) (string, boo
 	}
 	// The manifest must stay on the negotiated variant: a client that
 	// re-requests a different mediaIndex after the decision is retrying
-	// around negotiation.
+	// around negotiation. Malformed values fail closed too: a
+	// policy-critical value that cannot be parsed cannot be proven safe.
 	if mi := r.URL.Query().Get("mediaIndex"); mi != "" {
-		if n, err := strconv.Atoi(mi); err == nil && n != sess.SelectedMediaIndex {
+		n, err := strconv.Atoi(mi)
+		if err != nil || n != sess.SelectedMediaIndex {
 			return "", true, policy.OriginMismatch
 		}
 	}

@@ -47,9 +47,10 @@ func seedServer(t *testing.T, db database.DBTX) {
 
 // fakePMS serves sections plus a mutable paginated item list.
 type fakePMS struct {
-	mu       atomic.Int64 // counts /all hits
-	items    []string     // item JSON fragments
-	sections string
+	mu        atomic.Int64 // counts /all hits
+	items     []string     // item JSON fragments
+	sections  string
+	omitTotal bool // legacy builds without totalSize
 }
 
 func (f *fakePMS) handler(w http.ResponseWriter, r *http.Request) {
@@ -73,9 +74,15 @@ func (f *fakePMS) handler(w http.ResponseWriter, r *http.Request) {
 			page = "[" + strings.Join(f.items[start:end], ",") + "]"
 		}
 		// Plex semantics: size counts this response, totalSize the
-		// collection; offset echoes the request start.
-		_, _ = fmt.Fprintf(w, `{"MediaContainer":{"size":%d,"totalSize":%d,"offset":%d,"Metadata":%s}}`,
-			end-start, len(f.items), start, page)
+		// collection; offset echoes the request start. Legacy mode
+		// omits totalSize entirely (short-page termination only).
+		if f.omitTotal {
+			_, _ = fmt.Fprintf(w, `{"MediaContainer":{"size":%d,"offset":%d,"Metadata":%s}}`,
+				end-start, start, page)
+		} else {
+			_, _ = fmt.Fprintf(w, `{"MediaContainer":{"size":%d,"totalSize":%d,"offset":%d,"Metadata":%s}}`,
+				end-start, len(f.items), start, page)
+		}
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -262,5 +269,66 @@ func TestLiveCrashResumeAndHistory(t *testing.T) {
 	var items int
 	if err := db.QueryRow(ctx, `SELECT count(*) FROM library_items WHERE library_id=$1`, libraryID).Scan(&items); err != nil || items != 1 {
 		t.Fatalf("sweep must delete absent item: %d %v", items, err)
+	}
+}
+
+func TestLiveNoTotalSizePaginatesFully(t *testing.T) {
+	ctx, db := liveDB(t)
+	seedServer(t, db)
+	// 250 items, page size 100, no totalSize anywhere: the sweep must
+	// still index all 250 via short-page termination (100+100+50).
+	items := make([]string, 0, 250)
+	for i := 0; i < 250; i++ {
+		key := fmt.Sprint(9000 + i)
+		items = append(items, `{"ratingKey":"`+key+`","type":"movie","title":"Bulk Film `+key+`"}`)
+	}
+	fx := &fakePMS{
+		sections:  `{"MediaContainer":{"Directory":[{"key":"22","type":"movie","title":"Movies","updatedAt":1700000000}]}}`,
+		items:     items,
+		omitTotal: true,
+	}
+	origin := httptest.NewServer(http.HandlerFunc(fx.handler))
+	defer origin.Close()
+	var reg metrics.Registry
+	w := New(db, origin.URL, func(ctx context.Context) (string, bool) { return "owner-test-token", true },
+		logging.New(io.Discard), &reg)
+	w.PageSize = 100
+	if err := w.SyncOnce(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM library_items`).Scan(&n); err != nil || n != 250 {
+		t.Fatalf("all 250 must index without totalSize: %d %v", n, err)
+	}
+}
+
+func TestLiveDirtyLightRefreshRevisits(t *testing.T) {
+	ctx, db := liveDB(t)
+	seedServer(t, db)
+	title := "Original Title"
+	fx := &fakePMS{
+		sections: `{"MediaContainer":{"Directory":[{"key":"22","type":"movie","title":"Movies","updatedAt":1700000000}]}}`,
+	}
+	fx.items = []string{`{"ratingKey":"3001","type":"movie","title":"` + title + `"}`}
+	origin := httptest.NewServer(http.HandlerFunc(fx.handler))
+	defer origin.Close()
+	var reg metrics.Registry
+	w := New(db, origin.URL, func(ctx context.Context) (string, bool) { return "owner-test-token", true },
+		logging.New(io.Discard), &reg)
+	w.PageSize = 100
+	if err := w.SyncOnce(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	// Cursor now points at the end with status complete. Change the
+	// origin, flag dirty, run a light pass: the refresh must restart at
+	// zero and pick up the change, not resume at the end into nothing.
+	fx.items = []string{`{"ratingKey":"3001","type":"movie","title":"Changed Title"}`}
+	w.MarkDirty("22")
+	if err := w.SyncOnce(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := db.QueryRow(ctx, `SELECT title FROM library_items WHERE rating_key='3001'`).Scan(&got); err != nil || got != "Changed Title" {
+		t.Fatalf("light refresh must revisit changed records: %q %v", got, err)
 	}
 }
