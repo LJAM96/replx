@@ -21,6 +21,7 @@ import (
 	"github.com/LJAM96/replx/internal/cache"
 	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/gateway"
+	"github.com/LJAM96/replx/internal/identity"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/requestid"
@@ -65,7 +66,7 @@ type SpikeResolver interface {
 type PlaybackEngine interface {
 	// HandleDecision intercepts one universal negotiation request,
 	// reporting whether it wrote the response.
-	HandleDecision(w http.ResponseWriter, r *http.Request, id, fingerprint, sessionID string) bool
+	HandleDecision(w http.ResponseWriter, r *http.Request, id, fingerprint, sessionID, identityID, clientUUID string) bool
 	// EndSession closes playback sessions on stop verbs. Best-effort:
 	// it must never break the proxied control flow.
 	EndSession(r *http.Request)
@@ -97,6 +98,9 @@ type Options struct {
 	// Artwork is the shared filesystem transcode cache (Eta). Nil
 	// disables it; artwork falls through to origin uncached.
 	Artwork *artwork.Store
+	// Identity resolves fingerprints to Plex identities for account
+	// scoping and policy levels. Nil keeps token-fingerprint scoping.
+	Identity *identity.Resolver
 	// Client overrides the origin HTTP client (tests). Nil uses a default
 	// client with a 30s response-header timeout.
 	Client *http.Client
@@ -118,6 +122,7 @@ type Handler struct {
 	warmer   *warmer.Warmer
 	playback PlaybackEngine
 	artwork  *artwork.Store
+	identity *identity.Resolver
 	client   *http.Client
 }
 
@@ -142,14 +147,18 @@ func New(opts Options) (*Handler, error) {
 	}
 	return &Handler{origin: base, mode: opts.IngressMode, log: opts.Logger, secret: opts.Secret,
 		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, warmer: opts.Warmer,
-		playback: opts.Playback, artwork: opts.Artwork, client: client, spike: opts.Spike}, nil
+		playback: opts.Playback, artwork: opts.Artwork, identity: opts.Identity,
+		client: client, spike: opts.Spike}, nil
 }
 
 // obs is the per-request Beta observability identity: fingerprinted user,
-// client, session/rating correlation and capture match. The raw token is
-// never stored here.
+// resolved identity scope, client, session/rating correlation and capture
+// match. Raw tokens are never stored here.
 type obs struct {
 	fingerprint string
+	scope       string
+	identityID  string
+	clientUUID  string
 	client      trace.Client
 	session     string
 	ratingKey   string
@@ -171,8 +180,17 @@ func (h *Handler) observe(r *http.Request) obs {
 		ratingKey:  trace.ExtractRatingKey(r),
 		cacheState: "bypass",
 	}
-	if token := trace.ExtractToken(r); token != "" {
+	token := trace.ExtractToken(r)
+	if token != "" {
 		o.fingerprint = trace.Fingerprint(h.secret, token)
+		o.scope = "tok:" + o.fingerprint
+		if h.identity != nil {
+			res := h.identity.Resolve(r.Context(), o.fingerprint, token, identity.FromTrace(o.client))
+			if res.Scope != "" {
+				o.scope = res.Scope
+			}
+			o.identityID, o.clientUUID = res.IdentityID, res.ClientID
+		}
 	}
 	if trace.IsPlaybackRoute(r.URL.Path) {
 		o.playback = trace.PlaybackTraceID(h.secret, o.fingerprint, o.client.ID, o.session, o.ratingKey)
@@ -182,11 +200,14 @@ func (h *Handler) observe(r *http.Request) obs {
 	}
 	// User-scoped browse cache: anonymous requests and non-cacheable
 	// routes stay bypass so no response is ever shared across users.
-	if h.cache != nil && o.fingerprint != "" {
+	// Resolved accounts share one scope across all their devices. The
+	// fingerprint gate (secret+token required) keeps a missing secret
+	// from collapsing everyone into one bucket.
+	if h.cache != nil && o.fingerprint != "" && o.scope != "" {
 		if ttl, ok := cache.Cacheable(r.Method, r.URL.Path); ok {
 			o.cacheable = true
 			o.cacheTTL = ttl
-			o.cacheKey = cache.ResponseKey(o.fingerprint, r.Method, r.URL.Path, r.URL.Query())
+			o.cacheKey = cache.ResponseKey(o.scope, r.Method, r.URL.Path, r.URL.Query())
 		}
 	}
 	return o
@@ -263,7 +284,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.playback.EndSession(r)
 		}
 		if gateway.IsDecision(r.URL.Path) {
-			if h.playback.HandleDecision(w, r, id, o.fingerprint, o.session) {
+			if h.playback.HandleDecision(w, r, id, o.fingerprint, o.session, o.identityID, o.clientUUID) {
 				return
 			}
 		}
@@ -453,12 +474,12 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 	}, o.cacheTTL)
 	if h.warmer != nil {
 		h.warmer.Track(o.cacheKey, warmer.Snapshot{
-			Method:      r.Method,
-			Path:        r.URL.Path,
-			RawQuery:    r.URL.RawQuery,
-			Accept:      r.Header.Get("Accept"),
-			Fingerprint: o.fingerprint,
-			TTL:         o.cacheTTL,
+			Method:   r.Method,
+			Path:     r.URL.Path,
+			RawQuery: r.URL.RawQuery,
+			Accept:   r.Header.Get("Accept"),
+			Scope:    o.scope,
+			TTL:      o.cacheTTL,
 		})
 	}
 	return n
@@ -492,6 +513,12 @@ func (h *Handler) emit(r *http.Request, id string, o obs, routeClass string, sta
 	// Raw tokens never reach fields; see trace.Fingerprint.
 	if o.fingerprint != "" {
 		fields["userFingerprint"] = o.fingerprint
+	}
+	if o.identityID != "" {
+		fields["identityId"] = o.identityID
+	}
+	if o.clientUUID != "" {
+		fields["clientInstanceId"] = o.clientUUID
 	}
 	if o.client.ID != "" {
 		fields["client"] = o.client.ID

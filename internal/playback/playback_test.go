@@ -54,7 +54,7 @@ func miOr(mi string) string {
 	return mi
 }
 
-func jodiePolicy(context.Context) (policy.Policy, string, error) {
+func jodiePolicy(context.Context, *string, *string) (policy.Policy, string, error) {
 	return policy.Effective(policy.Policy{}, policy.Policy{
 		MaxSourceWidth: intp(1920), MaxSourceHeight: intp(1080),
 	}, policy.Policy{}), "USER", nil
@@ -69,7 +69,7 @@ func TestHandleDecisionSelects1080p(t *testing.T) {
 		"/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F999&mediaIndex=0&session=sess-1", nil)
 	req.Header.Set("X-Plex-Token", "user-tok")
 	rec := httptest.NewRecorder()
-	if !e.HandleDecision(rec, req, "req-1", "fp-1", "sess-1") {
+	if !e.HandleDecision(rec, req, "req-1", "fp-1", "sess-1", "", "") {
 		t.Fatal("decision must be handled")
 	}
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"mediaIndex":1`) {
@@ -87,8 +87,8 @@ func TestHandleDecisionSelects1080p(t *testing.T) {
 func TestHandleDecisionDeniesTranscode(t *testing.T) {
 	origin := fakeOrigin(t, true) // PMS insists on transcoding
 	defer origin.Close()
-	e := &Engine{Origin: origin.URL, Store: NewMemoryStore(), LoadPolicy: func(context.Context) (policy.Policy, string, error) {
-		p, s, _ := jodiePolicy(context.Background())
+	e := &Engine{Origin: origin.URL, Store: NewMemoryStore(), LoadPolicy: func(context.Context, *string, *string) (policy.Policy, string, error) {
+		p, s, _ := jodiePolicy(context.Background(), nil, nil)
 		p.AllowTranscode = policy.Deny
 		return p, s, nil
 	}}
@@ -96,7 +96,7 @@ func TestHandleDecisionDeniesTranscode(t *testing.T) {
 		"/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F999&mediaIndex=1&session=s2", nil)
 	req.Header.Set("X-Plex-Token", "user-tok")
 	rec := httptest.NewRecorder()
-	if !e.HandleDecision(rec, req, "req-2", "fp-1", "s2") {
+	if !e.HandleDecision(rec, req, "req-2", "fp-1", "s2", "", "") {
 		t.Fatal("must handle")
 	}
 	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), policy.TranscodeForbidden) {
@@ -107,14 +107,14 @@ func TestHandleDecisionDeniesTranscode(t *testing.T) {
 func TestHandleDecisionNoVariant(t *testing.T) {
 	origin := fakeOrigin(t, false)
 	defer origin.Close()
-	e := &Engine{Origin: origin.URL, Store: NewMemoryStore(), LoadPolicy: func(context.Context) (policy.Policy, string, error) {
+	e := &Engine{Origin: origin.URL, Store: NewMemoryStore(), LoadPolicy: func(context.Context, *string, *string) (policy.Policy, string, error) {
 		return policy.Effective(policy.Policy{}, policy.Policy{MaxSourceHeight: intp(100)}, policy.Policy{}), "USER", nil
 	}}
 	req := httptest.NewRequest(http.MethodGet,
 		"/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F999&session=s3", nil)
 	req.Header.Set("X-Plex-Token", "user-tok")
 	rec := httptest.NewRecorder()
-	if !e.HandleDecision(rec, req, "req-3", "fp-1", "s3") {
+	if !e.HandleDecision(rec, req, "req-3", "fp-1", "s3", "", "") {
 		t.Fatal("must handle")
 	}
 	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), policy.NoAllowedVariant) {
@@ -126,13 +126,13 @@ func TestHandleDecisionPassthrough(t *testing.T) {
 	e := &Engine{Store: NewMemoryStore()}
 	// No rating key: not a negotiation the engine understands.
 	req := httptest.NewRequest(http.MethodGet, "/video/:/transcode/universal/decision?session=s", nil)
-	if e.HandleDecision(httptest.NewRecorder(), req, "id", "fp", "s") {
+	if e.HandleDecision(httptest.NewRecorder(), req, "id", "fp", "s", "", "") {
 		t.Fatal("must pass through without rating key")
 	}
 	// No token: cannot forward under user context.
 	req2 := httptest.NewRequest(http.MethodGet,
 		"/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F999", nil)
-	if e.HandleDecision(httptest.NewRecorder(), req2, "id", "fp", "s") {
+	if e.HandleDecision(httptest.NewRecorder(), req2, "id", "fp", "s", "", "") {
 		t.Fatal("must pass through without token")
 	}
 }
@@ -201,5 +201,39 @@ func TestRewriteQuery(t *testing.T) {
 	// No cap: index rewritten, bitrate untouched.
 	if got := rewriteQuery(mk(), 2, nil); got.Get("mediaIndex") != "2" || got.Get("maxVideoBitrate") != "3000" {
 		t.Fatalf("no-cap rewrite: %v", got)
+	}
+}
+
+func TestManifestBoundary(t *testing.T) {
+	newEngine := func() *Engine {
+		e := &Engine{Store: NewMemoryStore()}
+		_, _ = e.Store.Create(context.Background(), Session{
+			PlexSessionID: "sess-m", RatingKey: "999", SelectedMediaIndex: 1,
+			SelectedPartPlexID: "302", SelectedPartKey: "/library/parts/302/file.mp4",
+			PlaybackMode:    "directPlay",
+			EffectivePolicy: []byte(`{"allowTranscode":"deny"}`),
+		})
+		return e
+	}
+	// Explicit transcode manifest after a direct-play decision: deny.
+	e := newEngine()
+	r := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=sess-m&directPlay=0&directStream=0", nil)
+	if _, deny, reason := e.EnforcePart(r, "", "sess-m"); !deny || reason != policy.TranscodeForbidden {
+		t.Fatalf("transcode retry must fail closed: %v %q", deny, reason)
+	}
+	// Direct-stream manifest on the same session: legitimate upgrade path.
+	e2 := newEngine()
+	r2 := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=sess-m&directPlay=0&directStream=1", nil)
+	if _, deny, _ := e2.EnforcePart(r2, "", "sess-m"); deny {
+		t.Fatal("direct-stream manifest must pass")
+	}
+	// No session: Alpha allow-through.
+	e3 := &Engine{Store: NewMemoryStore()}
+	r3 := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=ghost&directPlay=0&directStream=0", nil)
+	if _, deny, _ := e3.EnforcePart(r3, "", "ghost"); deny {
+		t.Fatal("absent session must allow")
 	}
 }

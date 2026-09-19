@@ -95,12 +95,13 @@ func (p *PGStore) FindActive(ctx context.Context, plexSessionID string) (Session
 	var variantID, partID *string
 	err := p.DB.QueryRow(cctx, `SELECT ps.id, ps.plex_session_identifier, ps.rating_key,
 		COALESCE(ps.selected_media_variant_id::text,''), COALESCE(ps.selected_media_part_id::text,''),
-		COALESCE(mp.plex_part_id,''), COALESCE(mp.plex_key,''), ps.playback_mode, ps.routing_mode
+		COALESCE(mp.plex_part_id,''), COALESCE(mp.plex_key,''), ps.playback_mode, ps.routing_mode,
+		COALESCE(ps.effective_policy,'{}')
 		FROM playback_sessions ps LEFT JOIN media_parts mp ON mp.id = ps.selected_media_part_id
 		WHERE ps.plex_session_identifier=$1 AND ps.ended_at IS NULL
 		ORDER BY ps.started_at DESC LIMIT 1`,
 		plexSessionID).Scan(&s.ID, &s.PlexSessionID, &s.RatingKey, &variantID, &partID,
-		&s.SelectedPartPlexID, &s.SelectedPartKey, &s.PlaybackMode, &s.RoutingMode)
+		&s.SelectedPartPlexID, &s.SelectedPartKey, &s.PlaybackMode, &s.RoutingMode, &s.EffectivePolicy)
 	if err != nil {
 		return Session{}, false, nil // no session reads as absent, never as failure
 	}

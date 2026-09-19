@@ -35,6 +35,7 @@ import (
 	"github.com/LJAM96/replx/internal/crypto"
 	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/health"
+	"github.com/LJAM96/replx/internal/identity"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/onboarding"
@@ -179,9 +180,24 @@ func runServe() error {
 			Fields: map[string]any{"event": "cache_degraded", "reason": "valkey unreachable; browse falls through to origin"}})
 	}
 	cacheStore := cache.NewValkeyStore(cacheClient)
-	// Owner warmer: refreshes due owner-scoped entries ahead of TTL
-	// expiry. The provider decrypts the stored PMS token per cycle; no
-	// owner material is retained between cycles.
+	// Identity pipeline: fingerprint to Plex account resolution with
+	// account-scoped cache sharing across a user's devices. plex.tv is
+	// consulted on cold fingerprints only; user tokens are never stored.
+	idResolver := identity.New(db.Raw(), tvAccount{client: &plextv.Client{
+		BaseURL: cfg.PlexTVBase, ClientIdentifier: "replx-edge-identity",
+		Product: "Replx Edge", Version: version, Platform: "Linux",
+	}})
+	ownerAccount := func(ctx context.Context) (int64, bool) {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		var id *int64
+		if err := db.Raw().QueryRow(cctx, `SELECT c.plex_account_id FROM plex_owner_credentials c
+			JOIN plex_servers s ON s.id = c.server_id
+			WHERE s.enabled ORDER BY s.created_at DESC LIMIT 1`).Scan(&id); err != nil || id == nil {
+			return 0, false
+		}
+		return *id, true
+	}
 	ownerPMSToken := func(ctx context.Context) (string, bool) {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -202,6 +218,7 @@ func runServe() error {
 		return string(pt), true
 	}
 	warm := warmer.New(cacheStore, cfg.OriginInternalURL, cfg.SecretKey, ownerPMSToken, logger, registry)
+	warm.OwnerAccount = ownerAccount
 	go warm.Run(ctx, 15*time.Second)
 	// Eta artwork: shared filesystem transcode cache with oldest-first
 	// janitor. Directory failure degrades to uncached artwork, never to
@@ -242,6 +259,7 @@ func runServe() error {
 		Warmer:      warm,
 		Playback:    playbackEngine,
 		Artwork:     artworkStore,
+		Identity:    idResolver,
 		Spike:       spikeOpt,
 	})
 	if err != nil {
@@ -385,6 +403,20 @@ func tvClientFor(cfg config.Config, clientID string) *plextv.Client {
 		Version:          version,
 		Platform:         "Linux",
 	}
+}
+
+// tvAccount adapts plextv.Client to the identity resolver's account
+// surface (ID plus username only, never tokens).
+type tvAccount struct {
+	client *plextv.Client
+}
+
+func (a tvAccount) GetUser(ctx context.Context, token string) (int64, string, error) {
+	u, err := a.client.GetUser(ctx, token)
+	if err != nil {
+		return 0, "", err
+	}
+	return u.ID, u.Username, nil
 }
 
 func adminHealthURL(path string) string {

@@ -18,6 +18,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,20 +26,21 @@ import (
 	"github.com/LJAM96/replx/internal/cache"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
-	"github.com/LJAM96/replx/internal/trace"
 )
 
 // maxTracked bounds memory when many distinct paths are browsed.
 const maxTracked = 512
 
-// Snapshot captures how to reproduce one cache entry.
+// Snapshot captures how to reproduce one cache entry. Scope is the
+// identity scope ("acct:<id>" or "tok:<fingerprint>"): refresh compares
+// against the owner scope, never raw tokens.
 type Snapshot struct {
-	Method      string
-	Path        string
-	RawQuery    string // secret-stripped by Track
-	Accept      string
-	Fingerprint string
-	TTL         time.Duration
+	Method   string
+	Path     string
+	RawQuery string // secret-stripped by Track
+	Accept   string
+	Scope    string
+	TTL      time.Duration
 }
 
 // Stats is the operator-visible warmer state.
@@ -55,16 +57,23 @@ type Warmer struct {
 	origin     string
 	secret     string
 	ownerToken func(ctx context.Context) (string, bool)
-	log        *logging.Logger
-	metrics    *metrics.Registry
-	client     *http.Client
-	now        func() time.Time
+	// OwnerAccount resolves the owner account ID for scope comparison,
+	// cached for a minute. Refresh compares snapshot scopes against
+	// "acct:<ownerID>": account identity, never token material.
+	OwnerAccount func(ctx context.Context) (int64, bool)
+	log          *logging.Logger
+	metrics      *metrics.Registry
+	client       *http.Client
+	now          func() time.Time
 
 	mu        sync.Mutex
 	tracked   map[string]tracked
 	refreshed int64
 	errors    int64
 	warming   bool
+	ownerAcct int64
+	ownerOK   bool
+	ownerAt   time.Time
 }
 
 type tracked struct {
@@ -89,7 +98,7 @@ func New(store cache.Store, origin, secret string,
 // Track records a freshly stored entry for future refresh. Snapshots with
 // empty keys, fingerprints or TTLs are ignored.
 func (w *Warmer) Track(key string, s Snapshot) {
-	if w == nil || w.store == nil || key == "" || s.Fingerprint == "" || s.TTL <= 0 {
+	if w == nil || w.store == nil || key == "" || s.Scope == "" || s.TTL <= 0 {
 		return
 	}
 	s.RawQuery = stripSecrets(s.RawQuery)
@@ -154,7 +163,10 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 	if !ok {
 		return
 	}
-	ownerFP := trace.Fingerprint(w.secret, owner)
+	ownerScope := w.ownerScope(ctx)
+	if ownerScope == "" {
+		return
+	}
 	for _, k := range due {
 		w.mu.Lock()
 		t, exists := w.tracked[k]
@@ -162,10 +174,10 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 		if !exists {
 			continue
 		}
-		if t.snap.Fingerprint != ownerFP {
-			// Not owner-scoped (different user, or rotated owner
-			// token): drop rather than refresh under the wrong
-			// identity. It re-tracks on its next store if current.
+		if t.snap.Scope != ownerScope {
+			// Not owner-scoped (different account): drop rather than
+			// refresh under the wrong identity. It re-tracks on its
+			// next store if current.
 			w.mu.Lock()
 			delete(w.tracked, k)
 			w.mu.Unlock()
@@ -205,6 +217,31 @@ func (w *Warmer) owner(ctx context.Context) (string, bool) {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	return w.ownerToken(cctx)
+}
+
+// ownerScope returns "acct:<ownerID>", caching the account lookup for a
+// minute. Empty when the owner account is unknown: nothing refreshes.
+func (w *Warmer) ownerScope(ctx context.Context) string {
+	if w.OwnerAccount == nil {
+		return ""
+	}
+	w.mu.Lock()
+	if w.ownerOK && w.now().Sub(w.ownerAt) < time.Minute {
+		id := w.ownerAcct
+		w.mu.Unlock()
+		return "acct:" + strconv.FormatInt(id, 10)
+	}
+	w.mu.Unlock()
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	id, ok := w.OwnerAccount(cctx)
+	w.mu.Lock()
+	w.ownerAcct, w.ownerOK, w.ownerAt = id, ok, w.now()
+	w.mu.Unlock()
+	if !ok {
+		return ""
+	}
+	return "acct:" + strconv.FormatInt(id, 10)
 }
 
 func (w *Warmer) countErr() {

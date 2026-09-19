@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/LJAM96/replx/internal/cache"
-	"github.com/LJAM96/replx/internal/trace"
 )
 
 const testSecret = "warmer-test-secret-0123456789abcdef"
@@ -39,18 +38,26 @@ func ownerProvider(token string) func(ctx context.Context) (string, bool) {
 	return func(ctx context.Context) (string, bool) { return token, token != "" }
 }
 
+func ownerAccount(id int64) func(ctx context.Context) (int64, bool) {
+	return func(ctx context.Context) (int64, bool) { return id, id != 0 }
+}
+
+func withOwnerAccount(w *Warmer, id int64) *Warmer {
+	w.OwnerAccount = ownerAccount(id)
+	return w
+}
+
 func TestRefreshesOwnerEntry(t *testing.T) {
 	fx := &fixture{token: "owner-tok", body: "<v>1</v>"}
 	origin := httptest.NewServer(http.HandlerFunc(fx.handler))
 	defer origin.Close()
 	store := cache.NewMemory()
-	w := New(store, origin.URL, testSecret, ownerProvider("owner-tok"), nil, nil)
+	w := withOwnerAccount(New(store, origin.URL, testSecret, ownerProvider("owner-tok"), nil, nil), 7)
 	w.now = time.Now
 
 	ctx := context.Background()
 	key := "k-owner"
-	ownerFP := trace.Fingerprint(testSecret, "owner-tok")
-	w.Track(key, Snapshot{Method: "GET", Path: "/library/sections", Fingerprint: ownerFP, TTL: time.Minute})
+	w.Track(key, Snapshot{Method: "GET", Path: "/library/sections", Scope: "acct:7", TTL: time.Minute})
 	// Not due yet: no fetch.
 	w.RefreshOnce(ctx)
 	if fx.hits != 0 {
@@ -77,8 +84,8 @@ func TestDropsNonOwnerEntry(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(fx.handler))
 	defer origin.Close()
 	store := cache.NewMemory()
-	w := New(store, origin.URL, testSecret, ownerProvider("owner-tok"), nil, nil)
-	w.Track("k-user", Snapshot{Method: "GET", Path: "/hubs/x", Fingerprint: "fp-someone-else", TTL: time.Minute})
+	w := withOwnerAccount(New(store, origin.URL, testSecret, ownerProvider("owner-tok"), nil, nil), 7)
+	w.Track("k-user", Snapshot{Method: "GET", Path: "/hubs/x", Scope: "acct:9", TTL: time.Minute})
 	// Age the clock so the entry is immediately due.
 	w.now = func() time.Time { return time.Now().Add(time.Hour) }
 	w.RefreshOnce(context.Background())
@@ -97,7 +104,7 @@ func TestNoCredentialsSkips(t *testing.T) {
 	defer origin.Close()
 	w := New(cache.NewMemory(), origin.URL, testSecret, ownerProvider(""), nil, nil)
 	w.now = func() time.Time { return time.Now().Add(time.Hour) }
-	w.Track("k", Snapshot{Method: "GET", Path: "/x", Fingerprint: "fp", TTL: time.Minute})
+	w.Track("k", Snapshot{Method: "GET", Path: "/x", Scope: "tok:fp", TTL: time.Minute})
 	w.RefreshOnce(context.Background())
 	if st := w.Stats(); st.OwnerWarming {
 		t.Fatal("warming must be false without credentials")
@@ -109,9 +116,8 @@ func TestErrorStatusNotStored(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(fx.handler))
 	defer origin.Close()
 	store := cache.NewMemory()
-	w := New(store, origin.URL, testSecret, ownerProvider("owner-tok"), nil, nil)
-	ownerFP := trace.Fingerprint(testSecret, "owner-tok")
-	w.Track("k-err", Snapshot{Method: "GET", Path: "/x", Fingerprint: ownerFP, TTL: time.Minute})
+	w := withOwnerAccount(New(store, origin.URL, testSecret, ownerProvider("owner-tok"), nil, nil), 7)
+	w.Track("k-err", Snapshot{Method: "GET", Path: "/x", Scope: "acct:7", TTL: time.Minute})
 	w.now = func() time.Time { return time.Now().Add(time.Hour) }
 	w.RefreshOnce(context.Background())
 	if _, ok, _ := store.Get(context.Background(), "k-err"); ok {

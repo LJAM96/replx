@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/LJAM96/replx/internal/delegation"
+	"github.com/LJAM96/replx/internal/gateway"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/routing"
 	"github.com/LJAM96/replx/internal/trace"
@@ -101,7 +102,10 @@ func (s *Store) Resolve(r *http.Request, requestID string) (string, bool) {
 	}
 	uri := r.URL.RequestURI()
 	if s.PartPolicy != nil {
-		if partID := partIDFromPath(r.URL.Path); partID != "" {
+		// Parts carry an ID; manifests (empty ID) take the manifest
+		// consistency check inside the same hook.
+		partID := partIDFromPath(r.URL.Path)
+		if partID != "" || gateway.IsBulkMediaRoute(r.URL.Path) {
 			substitute, deny, reason := s.PartPolicy(r, partID, trace.ExtractSession(r))
 			if deny {
 				base.Decision, base.Reason = "unavailable", reason

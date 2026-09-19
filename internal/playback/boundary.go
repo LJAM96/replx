@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -29,9 +30,16 @@ func PartIDFromPath(path string) string {
 // deny=true is reserved for known-prohibited parts once identity resolution
 // lands (Gamma phase), and empty results mean allow: no session context
 // preserves Alpha redirect behaviour exactly.
+//
+// Manifest requests (empty partID) take the manifest consistency check:
+// a direct-play session followed by an explicit transcode manifest fails
+// closed when the session policy denies transcoding.
 func (e *Engine) EnforcePart(r *http.Request, partID, sessionID string) (substituteKey string, deny bool, reason string) {
-	if e == nil || e.Store == nil || partID == "" || sessionID == "" {
+	if e == nil || e.Store == nil || sessionID == "" {
 		return "", false, ""
+	}
+	if partID == "" {
+		return e.enforceManifest(r, sessionID)
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
@@ -51,6 +59,35 @@ func (e *Engine) EnforcePart(r *http.Request, partID, sessionID string) (substit
 		return sess.SelectedPartKey, false, "substituted"
 	}
 	return "", false, ""
+}
+
+// enforceManifest guards the manifest boundary against clients that retry
+// around the negotiated decision: a session the engine direct-played,
+// followed by a manifest explicitly requesting transcode
+// (directPlay=0&directStream=0), fails closed when the session's stored
+// policy denies transcoding. Anything ambiguous allows: manifests also
+// serve legitimate Direct Stream upgrades the decision phase approved.
+func (e *Engine) enforceManifest(r *http.Request, sessionID string) (string, bool, string) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	sess, ok, err := e.Store.FindActive(ctx, sessionID)
+	if err != nil || !ok || sess.PlaybackMode != "directPlay" {
+		return "", false, ""
+	}
+	q := r.URL.Query()
+	if q.Get("directPlay") != "0" || q.Get("directStream") != "0" {
+		return "", false, ""
+	}
+	var stored struct {
+		AllowTranscode string `json:"allowTranscode"`
+	}
+	if len(sess.EffectivePolicy) > 0 {
+		_ = json.Unmarshal(sess.EffectivePolicy, &stored)
+	}
+	if !strings.EqualFold(stored.AllowTranscode, "deny") {
+		return "", false, ""
+	}
+	return "", true, "POLICY_TRANSCODE_FORBIDDEN"
 }
 
 // sameVariant reports whether a requested part belongs to the session's

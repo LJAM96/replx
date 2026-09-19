@@ -12,6 +12,7 @@ import (
 	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/cache"
 	"github.com/LJAM96/replx/internal/capture"
+	"github.com/LJAM96/replx/internal/identity"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/trace"
@@ -429,7 +430,7 @@ func TestCacheIsolation(t *testing.T) {
 		return "<MediaContainer user=\"" + r.Header.Get("X-Plex-Token") + "\"/>"
 	}))
 	defer origin.Close()
-	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: cache.NewMemory()})
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: cache.NewMemory(), Identity: identity.New(nil, nil)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,7 +566,7 @@ type stubPlayback struct {
 	statusCode int
 }
 
-func (s *stubPlayback) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, session string) bool {
+func (s *stubPlayback) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, session, identity, client string) bool {
 	if s.handled {
 		w.WriteHeader(s.statusCode)
 		return true

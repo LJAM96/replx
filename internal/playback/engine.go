@@ -41,13 +41,16 @@ func (v variantSource) toPolicy() policy.Variant {
 
 // Engine enforces playback policy at negotiation and part boundaries.
 type Engine struct {
-	DB         *pgxpool.Pool
-	Origin     string
-	Logger     *logging.Logger
-	Metrics    *metrics.Registry
-	Client     *http.Client
-	Store      SessionStore
-	LoadPolicy func(ctx context.Context) (policy.Policy, string, error)
+	DB      *pgxpool.Pool
+	Origin  string
+	Logger  *logging.Logger
+	Metrics *metrics.Registry
+	Client  *http.Client
+	Store   SessionStore
+	// LoadPolicy resolves effective policy with rejection provenance.
+	// Identity/client UUIDs activate user/device levels; nil keeps
+	// global-only resolution.
+	LoadPolicy func(ctx context.Context, identityID, clientID *string) (policy.Policy, string, error)
 }
 
 func (e *Engine) client() *http.Client {
@@ -60,8 +63,8 @@ func (e *Engine) client() *http.Client {
 // DefaultPolicyLoader resolves global-only effective policy. User and
 // device levels activate with the identity pipeline; until then absent
 // rows merge as inherit and global governs.
-func DefaultPolicyLoader(db *pgxpool.Pool) func(ctx context.Context) (policy.Policy, string, error) {
-	return func(ctx context.Context) (policy.Policy, string, error) {
+func DefaultPolicyLoader(db *pgxpool.Pool) func(ctx context.Context, identityID, clientID *string) (policy.Policy, string, error) {
+	return func(ctx context.Context, identityID, clientID *string) (policy.Policy, string, error) {
 		if db == nil {
 			return policy.Defaults(), "GLOBAL", nil
 		}
@@ -72,7 +75,7 @@ func DefaultPolicyLoader(db *pgxpool.Pool) func(ctx context.Context) (policy.Pol
 			WHERE enabled ORDER BY created_at DESC LIMIT 1`).Scan(&serverID); err != nil {
 			return policy.Defaults(), "GLOBAL", err
 		}
-		p, scope := policy.LoadEffective(cctx, db, serverID, nil, nil)
+		p, scope := policy.LoadEffective(cctx, db, serverID, identityID, clientID)
 		return p, scope, nil
 	}
 }
@@ -80,7 +83,7 @@ func DefaultPolicyLoader(db *pgxpool.Pool) func(ctx context.Context) (policy.Pol
 // HandleDecision intercepts one universal negotiation request. It reports
 // whether it wrote the response; false means proxy through untouched
 // (unparseable, unauthenticated, or engine not fully wired).
-func (e *Engine) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, sessionID string) bool {
+func (e *Engine) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, sessionID, identityID, clientUUID string) bool {
 	if e == nil || e.Store == nil {
 		return false
 	}
@@ -98,7 +101,7 @@ func (e *Engine) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, 
 	if load == nil {
 		load = DefaultPolicyLoader(e.DB)
 	}
-	pol, scope, err := load(ctx)
+	pol, scope, err := load(ctx, strOrNil(identityID), strOrNil(clientUUID))
 	if err != nil {
 		e.writeError(w, http.StatusBadGateway, "POLICY_LOAD_FAILED", "effective policy unavailable")
 		return true
@@ -189,7 +192,6 @@ func (e *Engine) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, 
 	})
 	return true
 }
-
 func indexOf(sources []variantSource, idx int) int {
 	for i, s := range sources {
 		if s.MediaIndex == idx {
@@ -197,6 +199,15 @@ func indexOf(sources []variantSource, idx int) int {
 		}
 	}
 	return -1
+}
+
+// strOrNil maps empty identity UUIDs to nil so the policy loader treats
+// unresolved callers as global-only.
+func strOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 func routingMode(p policy.Policy) string {
