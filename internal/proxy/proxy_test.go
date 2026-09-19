@@ -16,6 +16,7 @@ import (
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/playback"
+	"github.com/LJAM96/replx/internal/spike"
 	"github.com/LJAM96/replx/internal/trace"
 	"github.com/LJAM96/replx/internal/warmer"
 )
@@ -183,7 +184,7 @@ type stubSpike struct {
 	ok       bool
 }
 
-func (s stubSpike) Resolve(r *http.Request, requestID string) (string, bool) {
+func (s stubSpike) Resolve(r *http.Request, ctx spike.ResolveContext) (string, bool) {
 	return s.location, s.ok
 }
 

@@ -36,7 +36,7 @@ func TestResolveRedirects(t *testing.T) {
 	req := httptest.NewRequest("GET", "/library/parts/11/file.mkv?foo=bar", nil)
 	req.Header.Set("X-Plex-Token", "user-tok")
 	req.Header.Set("Range", "bytes=0-99")
-	loc, ok := s.Resolve(req, "req-1")
+	loc, ok := s.Resolve(req, ResolveContext{RequestID: "req-1"})
 	if !ok {
 		t.Fatal("expected resolve")
 	}
@@ -64,20 +64,20 @@ func TestResolveFailsClosed(t *testing.T) {
 	} {
 		req := httptest.NewRequest("GET", "/library/parts/1/x", nil)
 		req.Header.Set("X-Plex-Token", "t")
-		if _, ok := store.Resolve(req, "r"); ok {
+		if _, ok := store.Resolve(req, ResolveContext{RequestID: "r"}); ok {
 			t.Fatalf("%s: must not resolve", name)
 		}
 	}
 	s := stubStore("https://origin.example:32400")
 	req := httptest.NewRequest("GET", "/library/parts/1/x", nil) // no token anywhere
-	if _, ok := s.Resolve(req, "r"); ok {
+	if _, ok := s.Resolve(req, ResolveContext{RequestID: "r"}); ok {
 		t.Fatal("missing token must not resolve")
 	}
 	// Self-pointing origin is refused by the builder.
 	self := stubStore("https://plex.example.com")
 	req2 := httptest.NewRequest("GET", "/library/parts/1/x", nil)
 	req2.Header.Set("X-Plex-Token", "t")
-	if _, ok := self.Resolve(req2, "r"); ok {
+	if _, ok := self.Resolve(req2, ResolveContext{RequestID: "r"}); ok {
 		t.Fatal("loopback origin must not resolve")
 	}
 }
@@ -89,7 +89,7 @@ func TestDelegationFailureHasNoPersistentFallback(t *testing.T) {
 	}
 	req := httptest.NewRequest("GET", "/library/parts/1/x", nil)
 	req.Header.Set("X-Plex-Token", "persistent-user-token")
-	loc, ok := s.Resolve(req, "r")
+	loc, ok := s.Resolve(req, ResolveContext{RequestID: "r"})
 	if ok || loc != "" {
 		t.Fatalf("delegation failure must fail closed, got %q", loc)
 	}
@@ -117,7 +117,7 @@ func TestRingCaps(t *testing.T) {
 	for i := 0; i < maxEvents+50; i++ {
 		req := httptest.NewRequest("GET", "/library/parts/1/x", nil)
 		req.Header.Set("X-Plex-Token", "t")
-		s.Resolve(req, "r")
+		s.Resolve(req, ResolveContext{RequestID: "r"})
 	}
 	if len(s.Events()) != maxEvents {
 		t.Fatalf("ring size: %d", len(s.Events()))
@@ -137,7 +137,7 @@ func TestPartPolicyHook(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "/library/parts/11/file.mkv?session=sess-1", nil)
 	req.Header.Set("X-Plex-Token", "user-tok")
-	loc, ok := s.Resolve(req, "req-1")
+	loc, ok := s.Resolve(req, ResolveContext{RequestID: "req-1"})
 	if !ok || !strings.Contains(loc, "/library/parts/12/file.mp4") {
 		t.Fatalf("substitute: %q %v", loc, ok)
 	}
@@ -151,7 +151,7 @@ func TestPartPolicyHook(t *testing.T) {
 	}
 	req2 := httptest.NewRequest(http.MethodGet, "/library/parts/11/file.mkv", nil)
 	req2.Header.Set("X-Plex-Token", "user-tok")
-	if _, ok := s.Resolve(req2, "req-2"); ok {
+	if _, ok := s.Resolve(req2, ResolveContext{RequestID: "req-2"}); ok {
 		t.Fatal("deny must fail closed")
 	}
 }

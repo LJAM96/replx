@@ -28,6 +28,7 @@ import (
 	"github.com/LJAM96/replx/internal/policy"
 	"github.com/LJAM96/replx/internal/requestid"
 	"github.com/LJAM96/replx/internal/routing"
+	"github.com/LJAM96/replx/internal/spike"
 	"github.com/LJAM96/replx/internal/trace"
 	"github.com/LJAM96/replx/internal/warmer"
 )
@@ -60,7 +61,7 @@ var hopByHop = map[string]bool{
 // SpikeResolver maps a media request to an ADR 001 redirect target.
 // Nil disables spike routing and keeps fail-closed behaviour.
 type SpikeResolver interface {
-	Resolve(r *http.Request, requestID string) (location string, ok bool)
+	Resolve(r *http.Request, ctx spike.ResolveContext) (location string, ok bool)
 }
 
 // PlaybackEngine enforces policy at negotiation and session boundaries.
@@ -268,7 +269,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if action == gateway.ActionMediaRedirect && h.mode == "cloudflare_tunnel" {
 		if h.spike != nil {
-			if loc, ok := h.spike.Resolve(r, id); ok {
+			ctx := spike.ResolveContext{RequestID: id, SessionID: o.session, PlaybackTraceID: o.playback}
+			if loc, ok := h.spike.Resolve(r, ctx); ok {
 				h.writeMediaRedirect(w, r, id, o, start, loc)
 				return
 			}
