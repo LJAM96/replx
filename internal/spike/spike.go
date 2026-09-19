@@ -26,10 +26,14 @@ import (
 )
 
 // Event is one traced spike decision. Locations are always redacted;
-// raw tokens never enter the ring, logs or API responses.
+// raw tokens never enter the ring, logs or API responses. SessionID and
+// PlaybackTraceID join the event to its negotiation session for the
+// 0.4.0 compatibility evidence reports.
 type Event struct {
 	Timestamp        string `json:"timestamp"`
 	RequestID        string `json:"requestId"`
+	SessionID        string `json:"sessionId,omitempty"`
+	PlaybackTraceID  string `json:"playbackTraceId,omitempty"`
 	Method           string `json:"method"`
 	Path             string `json:"path"`
 	Client           string `json:"client"`
@@ -82,12 +86,20 @@ func NewPostgresStore(db *pgxpool.Pool, publicHost string, logger *logging.Logge
 	}
 }
 
+// ResolveContext carries the proxy's per-request correlation into the
+// spike resolver so every redirect joins its evidence chain.
+type ResolveContext struct {
+	RequestID       string
+	SessionID       string
+	PlaybackTraceID string
+}
+
 // Resolve maps a media request to its 307 Location. ok=false means fall
 // back to fail-closed MEDIA_ROUTE_UNAVAILABLE (or the media gateway).
 // Persistent caller tokens are never placed in the redirect: on delegation
 // failure the request fails closed.
-func (s *Store) Resolve(r *http.Request, requestID string) (string, bool) {
-	base := spikeEventBase(r, requestID)
+func (s *Store) Resolve(r *http.Request, ctx ResolveContext) (string, bool) {
+	base := spikeEventBase(r, ctx)
 	mediaOrigin, internalOrigin, ok := s.Lookup(r.Context())
 	if !ok {
 		base.Decision, base.Reason = "unavailable", "no onboarded media origin"
@@ -146,8 +158,9 @@ func (s *Store) Resolve(r *http.Request, requestID string) (string, bool) {
 	return loc, true
 }
 
-func spikeEventBase(r *http.Request, requestID string) Event {
-	return Event{RequestID: requestID, Method: r.Method, Path: logging.RedactURLString(r.URL.RequestURI()),
+func spikeEventBase(r *http.Request, ctx ResolveContext) Event {
+	return Event{RequestID: ctx.RequestID, SessionID: ctx.SessionID, PlaybackTraceID: ctx.PlaybackTraceID,
+		Method: r.Method, Path: logging.RedactURLString(r.URL.RequestURI()),
 		Client: r.Header.Get("X-Plex-Client-Identifier"), RangePresent: r.Header.Get("Range") != ""}
 }
 

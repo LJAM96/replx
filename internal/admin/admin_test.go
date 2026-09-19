@@ -246,3 +246,27 @@ func TestSyncEndpoints(t *testing.T) {
 		t.Fatalf("rate limit: %d", postRec2.Code)
 	}
 }
+
+func TestSpikeReportGates(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/spike/report?session=s", nil)
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("report must gate, got %d", rec.Code)
+	}
+	bad := httptest.NewRequest(http.MethodGet, "/api/v1/spike/report", nil)
+	bad.Header.Set("Authorization", "Bearer tok123")
+	badRec := httptest.NewRecorder()
+	m.ServeHTTP(badRec, bad)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("missing session must 400, got %d", badRec.Code)
+	}
+	empty := httptest.NewRequest(http.MethodGet, "/api/v1/spike/report?session=ghost", nil)
+	empty.Header.Set("Authorization", "Bearer tok123")
+	emptyRec := httptest.NewRecorder()
+	m.ServeHTTP(emptyRec, empty)
+	if emptyRec.Code != http.StatusOK || !strings.Contains(emptyRec.Body.String(), "spikeEvents") {
+		t.Fatalf("empty report: %d %s", emptyRec.Code, emptyRec.Body.String())
+	}
+}

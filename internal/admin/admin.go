@@ -84,6 +84,7 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 	m.mux.HandleFunc("/admin/onboarding", m.auth(m.handlePanel))
 	m.mux.HandleFunc("/api/v1/spike/events", m.auth(m.handleSpikeEvents))
 	m.mux.HandleFunc("/api/v1/spike/observations", m.auth(m.handleSpikeObservations))
+	m.mux.HandleFunc("/api/v1/spike/report", m.auth(m.handleSpikeReport))
 	m.mux.HandleFunc("/admin/spike", m.auth(m.handleSpikePanel))
 	m.mux.HandleFunc("/api/v1/policies", m.auth(m.handlePolicies))
 	m.mux.HandleFunc("/api/v1/playback/sessions", m.auth(m.handleSessions))
@@ -444,6 +445,70 @@ func (m *Mux) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 		data["warmer"] = m.warmerStats()
 	}
 	writeData(w, http.StatusOK, data)
+}
+
+// handleSpikeReport joins one playback session to its decisions and its
+// spike-ring redirects: the per-request evidence bundle for the 0.4.0
+// compatibility runs (request ID, session, client, selected mediaIndex,
+// redirect Location, follow-through observed client-side).
+func (m *Mux) handleSpikeReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
+		return
+	}
+	sessionID := r.URL.Query().Get("session")
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "INVALID_BODY", "?session=<plex-session-id> required")
+		return
+	}
+	var session any
+	var decisions []any
+	if m.svc != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id, ratingKey, mode, routing, started string
+		var ended, finalStatus *string
+		err := m.svc.DB.QueryRow(ctx, `SELECT id::text, rating_key, playback_mode, routing_mode,
+			to_char(started_at,'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+			to_char(ended_at,'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), final_status
+			FROM playback_sessions WHERE plex_session_identifier=$1
+			ORDER BY started_at DESC LIMIT 1`, sessionID).Scan(
+			&id, &ratingKey, &mode, &routing, &started, &ended, &finalStatus)
+		if err == nil {
+			session = map[string]any{"id": id, "ratingKey": ratingKey, "mode": mode,
+				"routing": routing, "startedAt": started, "endedAt": ended, "finalStatus": finalStatus}
+			rows, err := m.svc.DB.Query(ctx, `SELECT requested_media_index, selected_media_index,
+				decision, decision_reason, plex_decision_code, details,
+				to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+				FROM playback_decisions WHERE playback_session_id=$1 ORDER BY created_at`, id)
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var req, sel, code int
+					var dec, reason string
+					var details json.RawMessage
+					var at string
+					if err := rows.Scan(&req, &sel, &dec, &reason, &code, &details, &at); err != nil {
+						break
+					}
+					decisions = append(decisions, map[string]any{
+						"requestedIndex": req, "selectedIndex": sel, "decision": dec,
+						"reason": reason, "plexCode": code, "details": details, "at": at})
+				}
+			}
+		}
+	}
+	events := []spike.Event{}
+	if m.spike != nil {
+		for _, e := range m.spike.Events() {
+			if e.SessionID == sessionID {
+				events = append(events, e)
+			}
+		}
+	}
+	writeData(w, http.StatusOK, map[string]any{
+		"session": session, "decisions": decisions, "spikeEvents": events,
+	})
 }
 
 func (m *Mux) handleSpikeEvents(w http.ResponseWriter, r *http.Request) {
