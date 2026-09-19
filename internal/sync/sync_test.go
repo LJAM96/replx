@@ -84,6 +84,15 @@ func TestParseItemsPage(t *testing.T) {
 	if _, _, err := parseItemsPage([]byte(`{broken`)); err == nil {
 		t.Fatal("want parse error for garbage")
 	}
+	// totalSize is authoritative; size counts only this response.
+	totalRaw := `{"MediaContainer":{"size":1,"totalSize":84833,"offset":0,"Metadata":[]}}`
+	if _, total, err := parseItemsPage([]byte(totalRaw)); err != nil || total != 84833 {
+		t.Fatalf("totalSize must win: total=%d err=%v", total, err)
+	}
+	legacyRaw := `{"MediaContainer":{"size":2,"Metadata":[]}}`
+	if _, total, err := parseItemsPage([]byte(legacyRaw)); err != nil || total != 2 {
+		t.Fatalf("legacy size fallback: total=%d err=%v", total, err)
+	}
 }
 
 func TestSplitGUID(t *testing.T) {

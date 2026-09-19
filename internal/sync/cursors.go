@@ -6,30 +6,32 @@ import (
 	"time"
 )
 
-// loadCursor returns the persisted page start for a section (0 fresh).
-func (w *Worker) loadCursor(ctx context.Context, serverID, libraryID string) int {
+// loadCursor returns the persisted page start and sweep generation for a
+// section (zero values when fresh).
+func (w *Worker) loadCursor(ctx context.Context, serverID, libraryID string) (int, int64) {
 	var raw []byte
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := w.DB.QueryRow(cctx, `SELECT cursor FROM sync_cursors
 		WHERE server_id=$1 AND sync_type='section' AND library_id=$2`,
 		serverID, libraryID).Scan(&raw); err != nil || len(raw) == 0 {
-		return 0
+		return 0, 0
 	}
 	var c struct {
-		Start int `json:"start"`
+		Start      int   `json:"start"`
+		Generation int64 `json:"generation"`
 	}
 	if err := json.Unmarshal(raw, &c); err != nil || c.Start < 0 {
-		return 0
+		return 0, 0
 	}
-	return c.Start
+	return c.Start, c.Generation
 }
 
-// saveCursor persists the page start for a resumable section pass.
-func (w *Worker) saveCursor(ctx context.Context, serverID, libraryID string, start int) error {
+// saveCursor persists the page start and generation for a resumable pass.
+func (w *Worker) saveCursor(ctx context.Context, serverID, libraryID string, start int, gen int64) error {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	cur, _ := json.Marshal(map[string]int{"start": start})
+	cur, _ := json.Marshal(map[string]any{"start": start, "generation": gen})
 	_, err := w.DB.Exec(cctx, `INSERT INTO sync_cursors(server_id, sync_type, library_id, cursor, status)
 		VALUES($1,'section',$2,$3,'running')
 		ON CONFLICT (server_id, sync_type, library_id) DO UPDATE SET

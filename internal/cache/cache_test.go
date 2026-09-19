@@ -57,14 +57,18 @@ func TestSafeHeaders(t *testing.T) {
 func TestKeyStripsSecretsAndSorts(t *testing.T) {
 	q1, _ := url.ParseQuery("X-Plex-Token=aaa&type=2&b=1")
 	q2, _ := url.ParseQuery("b=1&type=2&X-Plex-Token=zzz")
-	a := ResponseKey("fp-user-1", "GET", "/hubs/home/recentlyAdded", q1)
-	b := ResponseKey("fp-user-1", "GET", "/hubs/home/recentlyAdded", q2)
+	a := ResponseKey("fp-user-1", "GET", "/hubs/home/recentlyAdded", q1, "application/xml")
+	b := ResponseKey("fp-user-1", "GET", "/hubs/home/recentlyAdded", q2, "application/xml")
 	if a != b {
 		t.Fatalf("token rotation and param order must not split keys:\n%s\n%s", a, b)
 	}
-	other := ResponseKey("fp-user-2", "GET", "/hubs/home/recentlyAdded", q1)
+	other := ResponseKey("fp-user-2", "GET", "/hubs/home/recentlyAdded", q1, "application/xml")
 	if a == other {
 		t.Fatal("different users must never share keys")
+	}
+	json := ResponseKey("fp-user-1", "GET", "/hubs/home/recentlyAdded", q1, "application/json")
+	if a == json {
+		t.Fatal("representations must never share keys")
 	}
 	if !strings.HasPrefix(a, "replx_edge:v1:browse:user:fp-user-1:GET:") {
 		t.Fatalf("key shape: %s", a)

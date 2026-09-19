@@ -116,15 +116,24 @@ func (w *Worker) syncSections(ctx context.Context, serverID, token string) ([]se
 	return out, nil
 }
 
-// syncSection paginates one section's items with a resumable cursor. On a
-// full sweep, items absent from the origin are deleted.
-func (w *Worker) syncSection(ctx context.Context, serverID, token string, s sectionInfo, full bool) error {
-	start := w.loadCursor(ctx, serverID, s.LibraryID)
+// syncSection paginates one section's items with a resumable cursor. The
+// cursor carries its sweep generation: a full sweep with a fresh
+// generation always restarts at zero, so resuming a cursor from a crashed
+// older sweep can never skip pages. On a full sweep, items outside the
+// current generation are deleted; light passes stamp nothing.
+func (w *Worker) syncSection(ctx context.Context, serverID, token string, s sectionInfo, full bool, gen int64) error {
+	start, savedGen := w.loadCursor(ctx, serverID, s.LibraryID)
+	trackGen := savedGen
+	if full {
+		if savedGen != gen {
+			start = 0
+		}
+		trackGen = gen
+	}
 	page := w.PageSize
 	if page <= 0 {
 		page = 100
 	}
-	var seen []string
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -140,27 +149,36 @@ func (w *Worker) syncSection(ctx context.Context, serverID, token string, s sect
 			return err
 		}
 		for _, it := range items {
-			if err := w.upsertItem(ctx, serverID, s.LibraryID, it); err != nil {
+			if err := w.upsertItem(ctx, serverID, s.LibraryID, it, genOrNil(full, gen)); err != nil {
 				return err
 			}
-			seen = append(seen, it.RatingKey)
 			if w.Metrics != nil {
 				w.Metrics.IncSyncItemsTotal()
 			}
 		}
 		start += len(items)
-		_ = w.saveCursor(ctx, serverID, s.LibraryID, start)
+		_ = w.saveCursor(ctx, serverID, s.LibraryID, start, trackGen)
 		if len(items) < page || (total >= 0 && start >= total) {
 			break
 		}
 	}
 	if full {
-		if _, err := w.DB.Exec(ctx, `DELETE FROM library_items WHERE library_id=$1 AND NOT (rating_key = ANY($2))`,
-			s.LibraryID, seen); err != nil {
+		if _, err := w.DB.Exec(ctx, `DELETE FROM library_items
+			WHERE library_id=$1 AND sweep_gen IS DISTINCT FROM $2`,
+			s.LibraryID, gen); err != nil {
 			return fmt.Errorf("sync: sweep delete: %w", err)
 		}
 	}
 	return nil
+}
+
+// genOrNil stamps full-sweep rows with the sweep generation and leaves
+// light-pass rows untouched for the next full sweep to judge.
+func genOrNil(full bool, gen int64) *int64 {
+	if !full {
+		return nil
+	}
+	return &gen
 }
 
 func nullIfEmpty(s string) any {

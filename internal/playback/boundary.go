@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,11 +38,16 @@ func PartIDFromPath(path string) string {
 // a direct-play session followed by an explicit transcode manifest fails
 // closed when the session policy denies transcoding.
 func (e *Engine) EnforcePart(r *http.Request, partID, sessionID string) (substituteKey string, deny bool, reason string) {
-	if e == nil || e.Store == nil || sessionID == "" {
+	if e == nil || e.Store == nil {
 		return "", false, ""
 	}
 	if partID == "" {
 		return e.enforceManifest(r, sessionID)
+	}
+	if sessionID == "" {
+		// No session identifier at all (decision-skipping client, lost
+		// state): reconstruct from user+client+part rather than allow.
+		return e.enforceStateless(r, partID)
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -155,6 +161,14 @@ func (e *Engine) enforceManifest(r *http.Request, sessionID string) (string, boo
 		// the engine would have tracked, so PMS itself would fail this
 		// too. Deny explicitly rather than allow an untracked transcode.
 		return "", true, DecisionRequired
+	}
+	// The manifest must stay on the negotiated variant: a client that
+	// re-requests a different mediaIndex after the decision is retrying
+	// around negotiation.
+	if mi := r.URL.Query().Get("mediaIndex"); mi != "" {
+		if n, err := strconv.Atoi(mi); err == nil && n != sess.SelectedMediaIndex {
+			return "", true, policy.OriginMismatch
+		}
 	}
 	if sess.PlaybackMode != "directPlay" {
 		return "", false, ""

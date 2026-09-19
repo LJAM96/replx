@@ -99,15 +99,18 @@ func Cacheable(method, path string) (time.Duration, bool) {
 	return ttlByPrefix[best].ttl, true
 }
 
-// ResponseKey builds replx_edge:v1:browse:user:<fingerprint>:<method>:<hash>.
+// ResponseKey builds replx_edge:v1:browse:user:<scope>:<method>:<hash>.
 // query must be the request's parsed query; secret params are stripped and
 // the remainder is sorted, so param order and token rotation never split
-// cache entries across the same user.
-func ResponseKey(userFingerprint, method, path string, query url.Values) string {
+// cache entries across the same scope. accept (XML vs JSON) joins the
+// hash: representations are not interchangeable.
+func ResponseKey(scope, method, path string, query url.Values, accept string) string {
 	var b strings.Builder
 	b.WriteString(method)
 	b.WriteByte(0)
 	b.WriteString(path)
+	b.WriteByte(0)
+	b.WriteString(accept)
 	b.WriteByte(0)
 	keys := make([]string, 0, len(query))
 	for k := range query {
@@ -129,7 +132,7 @@ func ResponseKey(userFingerprint, method, path string, query url.Values) string 
 	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return fmt.Sprintf("replx_edge:%s:browse:user:%s:%s:%s",
-		SchemaVersion, userFingerprint, strings.ToUpper(method), hex.EncodeToString(sum[:])[:16])
+		SchemaVersion, scope, strings.ToUpper(method), hex.EncodeToString(sum[:])[:16])
 }
 
 // safeHeaders is the deliberate allowlist of origin response headers

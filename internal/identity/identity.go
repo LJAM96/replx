@@ -126,9 +126,11 @@ func (r *Resolver) Resolve(ctx context.Context, fingerprint, token string, clien
 			// resolve the client independently, never inheriting a
 			// sibling device's instance.
 			out.ClientID = r.resolveClient(ctx, acct.identityID, client)
-			r.mu.Lock()
-			r.cli[cliKey] = cliEntry{clientID: out.ClientID, at: now}
-			r.mu.Unlock()
+			if out.ClientID != "" {
+				r.mu.Lock()
+				r.cli[cliKey] = cliEntry{clientID: out.ClientID, at: now}
+				r.mu.Unlock()
+			}
 		}
 		return out
 	}
@@ -148,7 +150,11 @@ func (r *Resolver) Resolve(ctx context.Context, fingerprint, token string, clien
 	if len(r.cli) >= memMax {
 		r.evictCliLocked()
 	}
-	r.cli[cliKey] = cliEntry{clientID: res.ClientID, at: now}
+	// Never cache an empty client result: a failed recording would pin
+	// the device to no-instance for five minutes. Retry next request.
+	if res.ClientID != "" {
+		r.cli[cliKey] = cliEntry{clientID: res.ClientID, at: now}
+	}
 	return res
 }
 
@@ -210,6 +216,7 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 	res := Resolved{Scope: "acct:" + strconv.FormatInt(id, 10), AccountID: id, Known: true}
 	if iid != "" {
 		res.IdentityID = iid
+		res.ClientID = r.recordClient(cctx, serverID, iid, client)
 	}
 	return res, true
 }

@@ -72,7 +72,10 @@ func (f *fakePMS) handler(w http.ResponseWriter, r *http.Request) {
 		if start < len(f.items) {
 			page = "[" + strings.Join(f.items[start:end], ",") + "]"
 		}
-		_, _ = fmt.Fprintf(w, `{"MediaContainer":{"size":%d,"Metadata":%s}}`, len(f.items), page)
+		// Plex semantics: size counts this response, totalSize the
+		// collection; offset echoes the request start.
+		_, _ = fmt.Fprintf(w, `{"MediaContainer":{"size":%d,"totalSize":%d,"offset":%d,"Metadata":%s}}`,
+			end-start, len(f.items), start, page)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -181,5 +184,83 @@ func TestLiveEventStreamDirtiesSection(t *testing.T) {
 	_ = w.subscribeOnce(ctx)
 	if !w.isDirty("22") {
 		t.Fatal("refresh-complete event must dirty section 22")
+	}
+}
+
+func TestLiveCrashResumeAndHistory(t *testing.T) {
+	ctx, db := liveDB(t)
+	seedServer(t, db)
+
+	fx := &fakePMS{
+		sections: `{"MediaContainer":{"Directory":[{"key":"22","type":"movie","title":"Movies","updatedAt":1700000000}]}}`,
+		items:    []string{liveItemA, liveItemB},
+	}
+	origin := httptest.NewServer(http.HandlerFunc(fx.handler))
+	defer origin.Close()
+
+	var reg metrics.Registry
+	newWorker := func() *Worker {
+		w := New(db, origin.URL, func(ctx context.Context) (string, bool) { return "owner-test-token", true },
+			logging.New(io.Discard), &reg)
+		w.PageSize = 1
+		return w
+	}
+	// Simulate a crashed full sweep: stale cursor mid-section, old gen.
+	var libraryID string
+	if err := db.QueryRow(ctx, `INSERT INTO libraries(server_id, plex_section_id, title, media_type)
+		VALUES((SELECT id FROM plex_servers WHERE machine_identifier='test-sync-box'),'22','Movies','movie')
+		ON CONFLICT (server_id, plex_section_id) DO UPDATE SET title='Movies' RETURNING id`).Scan(&libraryID); err != nil {
+		t.Fatal(err)
+	}
+	var serverID string
+	if err := db.QueryRow(ctx, `SELECT id FROM plex_servers WHERE machine_identifier='test-sync-box'`).Scan(&serverID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO sync_cursors(server_id, sync_type, library_id, cursor, status)
+		VALUES($1,'section',$2,'{"start":1,"generation":111}','running')
+		ON CONFLICT (server_id, sync_type, library_id) DO UPDATE SET cursor='{"start":1,"generation":111}', status='running'`,
+		serverID, libraryID); err != nil {
+		t.Fatal(err)
+	}
+	before := fx.mu.Load()
+	if err := newWorker().SyncOnce(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh generation restarts at zero: both pages fetched despite the
+	// stale start=1 cursor.
+	if got := fx.mu.Load() - before; got != 2 {
+		t.Fatalf("crashed sweep must restart at zero: page fetches=%d", got)
+	}
+	var stamped int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM library_items WHERE library_id=$1 AND sweep_gen IS NOT NULL`, libraryID).Scan(&stamped); err != nil || stamped != 2 {
+		t.Fatalf("generation stamps: %d %v", stamped, err)
+	}
+	// History preservation: attach a session to the 4K variant, drop the
+	// variant from the origin, re-sweep. The session survives with the
+	// reference nulled instead of violating.
+	var variantID string
+	if err := db.QueryRow(ctx, `SELECT v.id FROM media_variants v JOIN library_items li ON li.id=v.library_item_id
+		WHERE li.rating_key='2002' AND v.media_index=0`).Scan(&variantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO playback_sessions(server_id, plex_session_identifier, rating_key, selected_media_variant_id)
+		VALUES($1,'hist-sess','2002',$2)`, serverID, variantID); err != nil {
+		t.Fatal(err)
+	}
+	fx.items = []string{liveItemA} // 2002 gone from origin
+	if err := newWorker().SyncOnce(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	var kept int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM playback_sessions WHERE plex_session_identifier='hist-sess'`).Scan(&kept); err != nil || kept != 1 {
+		t.Fatalf("history session must survive eviction: %d %v", kept, err)
+	}
+	var nulled *string
+	if err := db.QueryRow(ctx, `SELECT selected_media_variant_id::text FROM playback_sessions WHERE plex_session_identifier='hist-sess'`).Scan(&nulled); err != nil || nulled != nil {
+		t.Fatalf("evicted reference must null, not dangle: %+v %v", nulled, err)
+	}
+	var items int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM library_items WHERE library_id=$1`, libraryID).Scan(&items); err != nil || items != 1 {
+		t.Fatalf("sweep must delete absent item: %d %v", items, err)
 	}
 }

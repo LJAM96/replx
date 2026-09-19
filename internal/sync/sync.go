@@ -145,6 +145,14 @@ func (w *Worker) SyncOnce(ctx context.Context, full bool) error {
 		return err
 	}
 	_ = w.setCursor(ctx, serverID, "libraries", nil, "complete", "")
+	// A full sweep owns a fresh generation: rows it stamps are the only
+	// ones the end-of-section delete may spare. A crashed sweep's
+	// generation never completes, so its partial stamps cannot delete
+	// rows the next sweep has not visited yet.
+	var gen int64
+	if full {
+		gen = time.Now().UnixNano()
+	}
 	for _, s := range sections {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -153,7 +161,7 @@ func (w *Worker) SyncOnce(ctx context.Context, full bool) error {
 		if !refresh {
 			continue
 		}
-		if err := w.syncSection(ctx, serverID, token, s, full); err != nil {
+		if err := w.syncSection(ctx, serverID, token, s, full, gen); err != nil {
 			w.countErr()
 			_ = w.setCursor(ctx, serverID, "section", &s.LibraryID, "error", err.Error())
 			// One bad section must not abort the sweep.

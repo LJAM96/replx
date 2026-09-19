@@ -13,6 +13,8 @@ type Session struct {
 	ID                 string
 	PlexSessionID      string
 	RatingKey          string
+	IdentityID         string
+	ClientUUID         string
 	SelectedMediaIndex int
 	SelectedPartPlexID string
 	SelectedPartKey    string
@@ -73,9 +75,10 @@ type PGStore struct {
 func (p *PGStore) Create(ctx context.Context, s Session) (Session, error) {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	err := p.DB.QueryRow(cctx, `INSERT INTO playback_sessions(server_id, plex_session_identifier, rating_key, selected_media_variant_id, selected_media_part_id, playback_mode, routing_mode, effective_policy)
-		VALUES((SELECT id FROM plex_servers WHERE enabled ORDER BY created_at DESC LIMIT 1),$1,$2,$3,$4,$5,$6,$7)
+	err := p.DB.QueryRow(cctx, `INSERT INTO playback_sessions(server_id, identity_id, client_instance_id, plex_session_identifier, rating_key, selected_media_variant_id, selected_media_part_id, playback_mode, routing_mode, effective_policy)
+		VALUES((SELECT id FROM plex_servers WHERE enabled ORDER BY created_at DESC LIMIT 1),$1,$2,$3,$4,$5,$6,$7,$8,$9)
 		RETURNING id`,
+		nullIfEmpty(s.IdentityID), nullIfEmpty(s.ClientUUID),
 		s.PlexSessionID, s.RatingKey, nullIfEmpty(s.SelectedVariantID), nullIfEmpty(s.SelectedPartID),
 		s.PlaybackMode, s.RoutingMode, s.EffectivePolicy).Scan(&s.ID)
 	if err != nil {
@@ -92,18 +95,28 @@ func (p *PGStore) FindActive(ctx context.Context, plexSessionID string) (Session
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	var s Session
-	var variantID, partID *string
+	var variantID, partID, identityID, clientID *string
 	err := p.DB.QueryRow(cctx, `SELECT ps.id, ps.plex_session_identifier, ps.rating_key,
+		COALESCE(ps.identity_id::text,''), COALESCE(ps.client_instance_id::text,''),
 		COALESCE(ps.selected_media_variant_id::text,''), COALESCE(ps.selected_media_part_id::text,''),
 		COALESCE(mp.plex_part_id,''), COALESCE(mp.plex_key,''), ps.playback_mode, ps.routing_mode,
-		COALESCE(ps.effective_policy,'{}')
+		COALESCE(ps.effective_policy,'{}'),
+		COALESCE(v.media_index,-1)
 		FROM playback_sessions ps LEFT JOIN media_parts mp ON mp.id = ps.selected_media_part_id
+		LEFT JOIN media_variants v ON v.id = ps.selected_media_variant_id
 		WHERE ps.plex_session_identifier=$1 AND ps.ended_at IS NULL
 		ORDER BY ps.started_at DESC LIMIT 1`,
-		plexSessionID).Scan(&s.ID, &s.PlexSessionID, &s.RatingKey, &variantID, &partID,
-		&s.SelectedPartPlexID, &s.SelectedPartKey, &s.PlaybackMode, &s.RoutingMode, &s.EffectivePolicy)
+		plexSessionID).Scan(&s.ID, &s.PlexSessionID, &s.RatingKey, &identityID, &clientID,
+		&variantID, &partID, &s.SelectedPartPlexID, &s.SelectedPartKey, &s.PlaybackMode,
+		&s.RoutingMode, &s.EffectivePolicy, &s.SelectedMediaIndex)
 	if err != nil {
 		return Session{}, false, nil // no session reads as absent, never as failure
+	}
+	if identityID != nil {
+		s.IdentityID = *identityID
+	}
+	if clientID != nil {
+		s.ClientUUID = *clientID
 	}
 	if variantID != nil {
 		s.SelectedVariantID = *variantID

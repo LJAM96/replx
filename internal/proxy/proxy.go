@@ -211,7 +211,7 @@ func (h *Handler) observe(r *http.Request) obs {
 		if ttl, ok := cache.Cacheable(r.Method, r.URL.Path); ok {
 			o.cacheable = true
 			o.cacheTTL = ttl
-			o.cacheKey = cache.ResponseKey(o.scope, r.Method, r.URL.Path, r.URL.Query())
+			o.cacheKey = cache.ResponseKey(o.scope, r.Method, r.URL.Path, r.URL.Query(), r.Header.Get("Accept"))
 		}
 	}
 	return o

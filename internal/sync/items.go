@@ -75,53 +75,64 @@ type itemJSON struct {
 
 type itemsPage struct {
 	MediaContainer struct {
-		Size     *int       `json:"size"`
-		Metadata []itemJSON `json:"Metadata"`
+		// Plex semantics: size is the number of items in THIS response,
+		// totalSize the total collection size. Older builds omit
+		// totalSize, in which case short-page termination applies.
+		Size      *int       `json:"size"`
+		TotalSize *int       `json:"totalSize"`
+		Metadata  []itemJSON `json:"Metadata"`
 	} `json:"MediaContainer"`
 }
 
 // parseItemsPage decodes one section page. total is the origin-reported
-// total (-1 when absent); callers fall back to short-page termination.
+// total (totalSize preferred, size as legacy fallback, -1 when absent).
 func parseItemsPage(raw []byte) ([]itemJSON, int, error) {
 	var parsed itemsPage
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, -1, fmt.Errorf("sync: items parse: %w", err)
 	}
 	total := -1
-	if parsed.MediaContainer.Size != nil {
+	if parsed.MediaContainer.TotalSize != nil {
+		total = *parsed.MediaContainer.TotalSize
+	} else if parsed.MediaContainer.Size != nil {
 		total = *parsed.MediaContainer.Size
 	}
 	return parsed.MediaContainer.Metadata, total, nil
 }
 
 // upsertItem writes one item plus GUIDs, variants, parts and streams.
-// Variant/part rows are replaced wholesale per item so index shifts and
-// removals on the origin cannot leave stale rows behind.
-func (w *Worker) upsertItem(ctx context.Context, serverID, libraryID string, it itemJSON) error {
+// gen stamps full-sweep rows (nil on light passes, leaving the stamp for
+// the next full sweep to judge). Variants and parts upsert in place by
+// their natural keys and only genuinely absent rows are deleted, so
+// playback history referencing them survives via ON DELETE SET NULL
+// instead of violating foreign keys.
+func (w *Worker) upsertItem(ctx context.Context, serverID, libraryID string, it itemJSON, gen *int64) error {
 	if it.RatingKey == "" {
 		return fmt.Errorf("sync: item without ratingKey")
 	}
+	var genParam any
+	if gen != nil {
+		genParam = *gen
+	}
 	var itemID string
-	err := w.DB.QueryRow(ctx, `INSERT INTO library_items(server_id, library_id, rating_key, item_key, item_type, title, sort_title, original_title, year, parent_rating_key, grandparent_rating_key, duration_ms, thumb, art, added_at, updated_at_origin, raw_metadata, synced_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,to_timestamp($15),to_timestamp($16),$17,now())
+	err := w.DB.QueryRow(ctx, `INSERT INTO library_items(server_id, library_id, rating_key, item_key, item_type, title, sort_title, original_title, year, parent_rating_key, grandparent_rating_key, duration_ms, thumb, art, added_at, updated_at_origin, raw_metadata, sweep_gen, synced_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,to_timestamp($15),to_timestamp($16),$17,$18,now())
 		ON CONFLICT (server_id, rating_key) DO UPDATE SET
 			library_id=EXCLUDED.library_id, item_key=EXCLUDED.item_key, item_type=EXCLUDED.item_type,
 			title=EXCLUDED.title, sort_title=EXCLUDED.sort_title, original_title=EXCLUDED.original_title,
 			year=EXCLUDED.year, parent_rating_key=EXCLUDED.parent_rating_key,
 			grandparent_rating_key=EXCLUDED.grandparent_rating_key, duration_ms=EXCLUDED.duration_ms,
 			thumb=EXCLUDED.thumb, art=EXCLUDED.art, added_at=EXCLUDED.added_at,
-			updated_at_origin=EXCLUDED.updated_at_origin, raw_metadata=EXCLUDED.raw_metadata, synced_at=now()
+			updated_at_origin=EXCLUDED.updated_at_origin, raw_metadata=EXCLUDED.raw_metadata,
+			sweep_gen=COALESCE($18, library_items.sweep_gen), synced_at=now()
 		RETURNING id`,
 		serverID, libraryID, it.RatingKey, nullIfEmpty(it.Key), it.Type, nullIfEmpty(it.Title),
 		nullIfEmpty(it.TitleSort), nullIfEmpty(it.OriginalTitle), intOrNil(it.Year),
 		nullIfEmpty(it.ParentRatingKey), nullIfEmpty(it.GrandparentRatingKey), int64OrNil(it.Duration),
 		nullIfEmpty(it.Thumb), nullIfEmpty(it.Art), epochOrNil(it.AddedAt), epochOrNil(it.UpdatedAt),
-		nil).Scan(&itemID)
+		nil, genParam).Scan(&itemID)
 	if err != nil {
 		return fmt.Errorf("sync: upsert item %s: %w", it.RatingKey, err)
-	}
-	if _, err := w.DB.Exec(ctx, `DELETE FROM item_guids WHERE item_id=$1`, itemID); err != nil {
-		return fmt.Errorf("sync: clear guids %s: %w", it.RatingKey, err)
 	}
 	for _, g := range it.Guid {
 		provider, providerID := splitGUID(g.ID)
@@ -131,13 +142,23 @@ func (w *Worker) upsertItem(ctx context.Context, serverID, libraryID string, it 
 			return fmt.Errorf("sync: guid %s: %w", it.RatingKey, err)
 		}
 	}
-	if _, err := w.DB.Exec(ctx, `DELETE FROM media_variants WHERE library_item_id=$1`, itemID); err != nil {
-		return fmt.Errorf("sync: clear variants %s: %w", it.RatingKey, err)
+	if _, err := w.DB.Exec(ctx, `DELETE FROM item_guids WHERE item_id=$1 AND NOT (guid = ANY($2))`, itemID, guidIDs(it)); err != nil {
+		return fmt.Errorf("sync: prune guids %s: %w", it.RatingKey, err)
 	}
+	seenIdx := make([]int32, 0, len(it.Media))
 	for idx, m := range it.Media {
 		var variantID string
 		err := w.DB.QueryRow(ctx, `INSERT INTO media_variants(library_item_id, plex_media_id, media_index, container, video_codec, video_profile, width, height, bitrate_kbps, video_resolution, normalized_dynamic_range, audio_codec, audio_channels, duration_ms, synced_at)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now()) RETURNING id`,
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now())
+			ON CONFLICT (library_item_id, media_index) DO UPDATE SET
+				plex_media_id=EXCLUDED.plex_media_id, container=EXCLUDED.container,
+				video_codec=EXCLUDED.video_codec, video_profile=EXCLUDED.video_profile,
+				width=EXCLUDED.width, height=EXCLUDED.height, bitrate_kbps=EXCLUDED.bitrate_kbps,
+				video_resolution=EXCLUDED.video_resolution,
+				normalized_dynamic_range=EXCLUDED.normalized_dynamic_range,
+				audio_codec=EXCLUDED.audio_codec, audio_channels=EXCLUDED.audio_channels,
+				duration_ms=EXCLUDED.duration_ms, synced_at=now()
+			RETURNING id`,
 			itemID, mediaIDString(m.ID), idx, nullIfEmpty(m.Container), nullIfEmpty(m.VideoCodec),
 			nullIfEmpty(m.VideoProfile), intOrNil(m.Width), intOrNil(m.Height), intOrNil(m.Bitrate),
 			nullIfEmpty(m.VideoResolution),
@@ -146,6 +167,8 @@ func (w *Worker) upsertItem(ctx context.Context, serverID, libraryID string, it 
 		if err != nil {
 			return fmt.Errorf("sync: variant %s/%d: %w", it.RatingKey, idx, err)
 		}
+		seenIdx = append(seenIdx, int32(idx))
+		seenPart := make([]int32, 0, len(m.Part))
 		for pidx, p := range m.Part {
 			if p.ID == nil {
 				// No origin part ID: the row cannot satisfy the unique
@@ -155,11 +178,22 @@ func (w *Worker) upsertItem(ctx context.Context, serverID, libraryID string, it 
 			}
 			var partID string
 			err := w.DB.QueryRow(ctx, `INSERT INTO media_parts(media_variant_id, plex_part_id, part_index, plex_key, container, size_bytes, duration_ms)
-				VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+				VALUES($1,$2,$3,$4,$5,$6,$7)
+				ON CONFLICT (media_variant_id, part_index) DO UPDATE SET
+					plex_part_id=EXCLUDED.plex_part_id, plex_key=EXCLUDED.plex_key,
+					container=EXCLUDED.container, size_bytes=EXCLUDED.size_bytes,
+					duration_ms=EXCLUDED.duration_ms
+				RETURNING id`,
 				variantID, partIDString(p.ID), pidx, nullIfEmpty(p.Key), nullIfEmpty(p.Container),
 				int64OrNil(p.Size), int64OrNil(p.Duration)).Scan(&partID)
 			if err != nil {
 				return fmt.Errorf("sync: part %s/%d: %w", it.RatingKey, idx, err)
+			}
+			seenPart = append(seenPart, int32(pidx))
+			// Streams carry no natural key: replace per part. They are
+			// never referenced by history, so this is safe.
+			if _, err := w.DB.Exec(ctx, `DELETE FROM media_streams WHERE media_part_id=$1`, partID); err != nil {
+				return fmt.Errorf("sync: clear streams %s: %w", it.RatingKey, err)
 			}
 			for _, st := range p.Stream {
 				if _, err := w.DB.Exec(ctx, `INSERT INTO media_streams(media_part_id, plex_stream_id, stream_type, codec, profile, language, language_code, channels, bitrate, width, height, selected, forced, default_stream)
@@ -172,8 +206,27 @@ func (w *Worker) upsertItem(ctx context.Context, serverID, libraryID string, it 
 				}
 			}
 		}
+		if _, err := w.DB.Exec(ctx, `DELETE FROM media_parts WHERE media_variant_id=$1 AND NOT (part_index = ANY($2))`,
+			variantID, seenPart); err != nil {
+			return fmt.Errorf("sync: prune parts %s/%d: %w", it.RatingKey, idx, err)
+		}
+	}
+	// Absent variants/parts are deleted; playback history referencing
+	// them survives via ON DELETE SET NULL instead of violating.
+	if _, err := w.DB.Exec(ctx, `DELETE FROM media_variants WHERE library_item_id=$1 AND NOT (media_index = ANY($2))`,
+		itemID, seenIdx); err != nil {
+		return fmt.Errorf("sync: prune variants %s: %w", it.RatingKey, err)
 	}
 	return nil
+}
+
+// guidIDs collects origin GUID strings for absent-row pruning.
+func guidIDs(it itemJSON) []string {
+	out := make([]string, 0, len(it.Guid))
+	for _, g := range it.Guid {
+		out = append(out, g.ID)
+	}
+	return out
 }
 
 // splitGUID splits "provider://id" into provider and id. Bare values yield

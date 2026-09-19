@@ -242,3 +242,40 @@ func TestManifestBoundary(t *testing.T) {
 		t.Fatalf("sessionless manifest must fail closed: %v %q", deny, reason)
 	}
 }
+
+func TestManifestMediaIndexEnforced(t *testing.T) {
+	e := &Engine{Store: NewMemoryStore()}
+	_, _ = e.Store.Create(context.Background(), Session{
+		PlexSessionID: "sess-idx", RatingKey: "999", SelectedMediaIndex: 1,
+		SelectedPartPlexID: "302", SelectedPartKey: "/library/parts/302/file.mp4",
+		PlaybackMode:    "directStream",
+		EffectivePolicy: []byte(`{"allowTranscode":"allow"}`),
+	})
+	// Same variant: passes.
+	okReq := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=sess-idx&mediaIndex=1", nil)
+	if _, deny, _ := e.EnforcePart(okReq, "", "sess-idx"); deny {
+		t.Fatal("matching manifest variant must pass")
+	}
+	// Drifted variant: the negotiated source no longer governs.
+	badReq := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=sess-idx&mediaIndex=0", nil)
+	if _, deny, reason := e.EnforcePart(badReq, "", "sess-idx"); !deny || reason != policy.OriginMismatch {
+		t.Fatalf("drifted manifest must fail closed: %v %q", deny, reason)
+	}
+}
+
+func TestSessionBindsIdentity(t *testing.T) {
+	e := &Engine{Store: NewMemoryStore()}
+	sess, err := e.Store.Create(context.Background(), Session{
+		PlexSessionID: "sess-bind", RatingKey: "7",
+		IdentityID: "ident-1", ClientUUID: "client-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := e.Store.FindActive(context.Background(), "sess-bind")
+	if err != nil || !ok || got.IdentityID != sess.IdentityID || got.ClientUUID != "client-1" {
+		t.Fatalf("binding: %+v %v %v", got, ok, err)
+	}
+}

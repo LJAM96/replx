@@ -63,7 +63,9 @@ func TestLivePurge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Sessions != 1 || res.Decisions != 2 || res.Traces != 1 || res.Audits != 1 {
+	// Exactly the expired rows go: the fresh sessionless denial is
+	// retained, the old session (and its cascaded decision) is not.
+	if res.Sessions != 1 || res.Decisions != 1 || res.Traces != 1 || res.Audits != 1 {
 		t.Fatalf("purge counts: %+v", res)
 	}
 	var n int

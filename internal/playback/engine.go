@@ -192,6 +192,7 @@ func (e *Engine) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, 
 	}
 	sess, err := e.Store.Create(ctx, Session{
 		PlexSessionID: sessionID, RatingKey: d.RatingKey,
+		IdentityID: identityID, ClientUUID: clientUUID,
 		SelectedMediaIndex: dec.SelectedIndex,
 		SelectedPartPlexID: selected.PartPlexID, SelectedPartKey: selected.PartKey,
 		SelectedVariantID: selected.VariantUUID, SelectedPartID: selected.PartUUID,

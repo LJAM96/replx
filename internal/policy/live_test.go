@@ -30,8 +30,10 @@ func TestLiveLoadEffective(t *testing.T) {
 		t.Fatal("global deny must hold")
 	}
 	// Corrupt config on an applicable level fails the load instead of
-	// silently inheriting past it.
-	if _, err := db.Exec(ctx, `UPDATE policies SET config='{"allowHDR":' WHERE server_id=$1`, serverID); err != nil {
+	// silently inheriting past it. The JSON itself must be valid jsonb
+	// (Postgres rejects malformed JSON at write time); the corruption is
+	// a Go type error the loader must surface.
+	if _, err := db.Exec(ctx, `UPDATE policies SET config='{"allowHDR":42}' WHERE server_id=$1`, serverID); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := LoadEffective(ctx, db, serverID, nil, nil); err == nil {
