@@ -141,9 +141,13 @@ func TestLiveSplitDeviceCache(t *testing.T) {
 	}
 }
 
-func TestSplitCacheRace(t *testing.T) {
-	tv := &fakeTV{id: 4242, user: "race"}
-	r, _ := liveResolver(t, tv)
+func TestMemCacheRace(t *testing.T) {
+	// Pure in-memory race: nil DB means every lookup falls back without
+	// touching storage. Concurrent identical fingerprints must share one
+	// scope deterministically, exercising the map locking for -race.
+	// (pgx.Tx is a single connection and must never be shared across
+	// goroutines; database concurrency is covered separately below.)
+	r := New(nil, nil)
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	results := make([]Resolved, 16)
@@ -159,15 +163,54 @@ func TestSplitCacheRace(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	seen := map[string]string{}
 	for _, res := range results {
-		if !res.Known {
-			t.Fatalf("all must resolve: %+v", res)
+		if res.Scope != "tok:fp-race" || res.Known {
+			t.Fatalf("fallback must be uniform: %+v", res)
 		}
-		seen[res.ClientID] = res.ClientID
 	}
-	if len(seen) != 2 {
-		t.Fatalf("two devices must hold two instances under race: %v", seen)
+}
+
+func TestLiveConcurrentResolves(t *testing.T) {
+	// Database concurrency over INDEPENDENT connections: each goroutine
+	// owns its pool, transaction and connection, seeds its own server,
+	// and rolls back before signalling done. The single-enabled-server
+	// constraint serializes the inserts safely (no shared pgx.Tx, which
+	// must never cross goroutines); rollback releases each waiter.
+	// Pre-flight in the test goroutine so helper Skip/Fatal stays legal.
+	preCtx, preTx := testdb.Begin(t)
+	_ = preTx.Rollback(preCtx)
+	tv := &fakeTV{id: 4242, user: "race"}
+	ctx := context.Background()
+	const n = 8
+	results := make([]Resolved, n)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, tx := testdb.Begin(t)
+			// Fresh transactions start empty: no DELETE needed, and
+			// none is wanted (a DELETE would lock-wait on siblings'
+			// uncommitted rows). Only the enabled-server inserts
+			// serialize, single-statement, deadlock-free.
+			machine := "test-identity-conc"
+			var sid string
+			if err := tx.QueryRow(ctx, `INSERT INTO plex_servers(name, internal_origin_url, machine_identifier, enabled)
+				VALUES('Concurrent','http://test.invalid:32400',$1,true) RETURNING id`, machine).Scan(&sid); err != nil {
+				return
+			}
+			_ = sid
+			r := New(tx, tv)
+			fp := "fp-conc-" + string(rune('a'+i))
+			results[i] = r.Resolve(ctx, fp, "tok-conc", Client{Identifier: "dev-conc"})
+			_ = tx.Rollback(ctx)
+		}(i)
+	}
+	wg.Wait()
+	for _, res := range results {
+		if !res.Known || res.ClientID == "" {
+			t.Fatalf("all must resolve with instances: %+v", res)
+		}
 	}
 }
 

@@ -69,10 +69,11 @@ func TestLiveStatelessBoundary(t *testing.T) {
 		r.Header.Set("X-Plex-Token", userToken)
 		return r
 	}
-	if _, deny, reason := e.EnforcePart(part("401"), "401", "ghost-session"); !deny || reason != DecisionRequired {
+	// index 0 is the 4K variant (part 400), index 1 is 1080p (part 401).
+	if _, deny, reason := e.EnforcePart(part("400"), "400", "ghost-session"); !deny || reason != DecisionRequired {
 		t.Fatalf("Jodie 4K part must fail closed statelessly: %v %q", deny, reason)
 	}
-	if sub, deny, _ := e.EnforcePart(part("402"), "402", "ghost-session"); deny || sub != "" {
+	if sub, deny, _ := e.EnforcePart(part("401"), "401", "ghost-session"); deny || sub != "" {
 		t.Fatalf("Jodie 1080p part must pass: %q %v", sub, deny)
 	}
 }
