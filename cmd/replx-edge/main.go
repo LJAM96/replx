@@ -241,8 +241,8 @@ func runServe() error {
 	// boundary behind the spike redirector. Sessions persist in Postgres;
 	// absent sessions preserve Alpha allow-through exactly.
 	playbackEngine := &playback.Engine{
-		DB: db.Raw(), Origin: cfg.OriginInternalURL, Logger: logger,
-		Metrics: registry, Store: &playback.PGStore{DB: db.Raw()},
+		DB: db.Raw(), Origin: cfg.OriginInternalURL, Secret: cfg.SecretKey, Logger: logger,
+		Metrics: registry, Store: &playback.PGStore{DB: db.Raw()}, Identity: idResolver,
 		LoadPolicy: playback.DefaultPolicyLoader(db.Raw()),
 	}
 	if spikeStore != nil {

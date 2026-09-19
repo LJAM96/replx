@@ -17,8 +17,20 @@ import (
 
 	"github.com/LJAM96/replx/migrations"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// DBTX is the query surface production code depends on. *pgxpool.Pool and
+// pgx.Tx both satisfy it, so live tests run inside rolled-back
+// transactions: full isolation between packages without weakening the
+// single-enabled-server constraint or any other production invariant.
+type DBTX interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
 
 // lockKey scopes the advisory lock to replx-edge migrations.
 const lockKey = "replx_edge_migrations"

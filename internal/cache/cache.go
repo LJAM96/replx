@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"net/url"
 	"sort"
 	"strings"
@@ -131,43 +132,132 @@ func ResponseKey(userFingerprint, method, path string, query url.Values) string 
 		SchemaVersion, userFingerprint, strings.ToUpper(method), hex.EncodeToString(sum[:])[:16])
 }
 
+// safeHeaders is the deliberate allowlist of origin response headers
+// preserved across a cache hit. Keys are Go-canonicalized ("ETag" arrives
+// as "Etag"): HTTP semantics are case-insensitive, so this is cosmetic.
+// Everything authentication-related, hop-by-hop, or Replx-managed is
+// dropped: Set-Cookie, Authorization, Cookie, X-Plex-Token,
+// Content-Length (recomputed) and X-Replx-* never persist, and
+// Cache-Control stays ours (TTLs govern, not origin hints).
+var safeHeaders = map[string]bool{
+	"Etag": true, "Last-Modified": true, "Content-Language": true,
+	"Content-Encoding": true,
+}
+
+// SafeHeaders extracts the allowlisted subset of an origin header set.
+func SafeHeaders(h http.Header) map[string]string {
+	out := map[string]string{}
+	for k, vv := range h {
+		canonical := http.CanonicalHeaderKey(k)
+		if !safeHeaders[canonical] || len(vv) == 0 {
+			continue
+		}
+		out[canonical] = vv[0]
+	}
+	return out
+}
+
 // Entry is one cached origin response.
 type Entry struct {
 	Status      int
 	ContentType string
+	Headers     map[string]string
 	Body        []byte
 }
 
-// Marshal encodes e as version|status|ctypeLen|ctype|body.
+// Marshal encodes e as version|status|ctypeLen|ctype|headers|body.
+// Version 0x02 carries the header allowlist; 0x01 legacy entries remain
+// decodable by Unmarshal for rolling-deploy safety.
 func (e Entry) Marshal() ([]byte, error) {
 	if len(e.Body) > MaxEntryBytes {
 		return nil, fmt.Errorf("cache: body %d exceeds %d", len(e.Body), MaxEntryBytes)
 	}
-	out := make([]byte, 0, 9+len(e.ContentType)+len(e.Body))
-	out = append(out, 0x01)
+	var hb strings.Builder
+	keys := make([]string, 0, len(e.Headers))
+	for k := range e.Headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		hb.WriteString(k)
+		hb.WriteByte(0)
+		hb.WriteString(e.Headers[k])
+		hb.WriteByte(0)
+	}
+	hraw := hb.String()
+	out := make([]byte, 0, 13+len(e.ContentType)+len(hraw)+len(e.Body))
+	out = append(out, 0x02)
 	var tmp [4]byte
 	binary.BigEndian.PutUint32(tmp[:], uint32(e.Status))
 	out = append(out, tmp[:]...)
 	binary.BigEndian.PutUint32(tmp[:], uint32(len(e.ContentType)))
 	out = append(out, tmp[:]...)
 	out = append(out, e.ContentType...)
+	binary.BigEndian.PutUint32(tmp[:], uint32(len(hraw)))
+	out = append(out, tmp[:]...)
+	out = append(out, hraw...)
 	out = append(out, e.Body...)
 	return out, nil
 }
 
-// Unmarshal decodes Marshal output.
+// Unmarshal decodes Marshal output, accepting legacy 0x01 entries
+// (status|ctype|body, no headers).
 func Unmarshal(b []byte) (Entry, error) {
 	var e Entry
-	if len(b) < 9 || b[0] != 0x01 {
-		return e, fmt.Errorf("cache: bad version or short entry")
+	if len(b) < 1 {
+		return e, fmt.Errorf("cache: empty entry")
+	}
+	switch b[0] {
+	case 0x01:
+		return unmarshalV1(b)
+	case 0x02:
+		return unmarshalV2(b)
+	default:
+		return e, fmt.Errorf("cache: bad version")
+	}
+}
+
+func unmarshalV1(b []byte) (Entry, error) {
+	var e Entry
+	if len(b) < 9 {
+		return e, fmt.Errorf("cache: truncated v1 entry")
 	}
 	e.Status = int(binary.BigEndian.Uint32(b[1:5]))
 	clen := int(binary.BigEndian.Uint32(b[5:9]))
 	if len(b) < 9+clen {
-		return e, fmt.Errorf("cache: truncated content type")
+		return e, fmt.Errorf("cache: truncated v1 content type")
 	}
 	e.ContentType = string(b[9 : 9+clen])
 	e.Body = b[9+clen:]
+	return e, nil
+}
+
+func unmarshalV2(b []byte) (Entry, error) {
+	var e Entry
+	if len(b) < 13 {
+		return e, fmt.Errorf("cache: truncated v2 entry")
+	}
+	e.Status = int(binary.BigEndian.Uint32(b[1:5]))
+	clen := int(binary.BigEndian.Uint32(b[5:9]))
+	if len(b) < 13+clen {
+		return e, fmt.Errorf("cache: truncated v2 content type")
+	}
+	e.ContentType = string(b[9 : 9+clen])
+	rest := b[9+clen:]
+	hlen := int(binary.BigEndian.Uint32(rest[:4]))
+	if len(rest) < 4+hlen {
+		return e, fmt.Errorf("cache: truncated v2 headers")
+	}
+	// Pairs are k\x00v\x00 encoded; re-filter on read so entries
+	// written by older allowlists cannot smuggle new headers in.
+	e.Headers = map[string]string{}
+	parts := strings.Split(string(rest[4:4+hlen]), "\x00")
+	for i := 0; i+1 < len(parts); i += 2 {
+		if safeHeaders[parts[i]] {
+			e.Headers[parts[i]] = parts[i+1]
+		}
+	}
+	e.Body = rest[4+hlen:]
 	return e, nil
 }
 

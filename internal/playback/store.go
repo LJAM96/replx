@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/LJAM96/replx/internal/database"
 )
 
 // Session is one negotiated playback selection.
@@ -66,7 +66,7 @@ func (m *MemoryStore) EndSession(_ context.Context, plexSessionID string) error 
 
 // PGStore is the production SessionStore.
 type PGStore struct {
-	DB *pgxpool.Pool
+	DB database.DBTX
 }
 
 // Create inserts a playback session row.

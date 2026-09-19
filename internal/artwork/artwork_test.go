@@ -8,14 +8,20 @@ import (
 	"time"
 )
 
-func TestKeySharedAcrossTokens(t *testing.T) {
+func TestKeyScopes(t *testing.T) {
 	q1, _ := url.ParseQuery("X-Plex-Token=aaa&width=480&height=720")
 	q2, _ := url.ParseQuery("width=480&height=720&X-Plex-Token=zzz")
-	if Key("/photo/:/transcode", q1) != Key("/photo/:/transcode", q2) {
-		t.Fatal("identical transforms must share one file across users")
+	// Same account, token rotation: one entry.
+	if Key("acct:7", "/photo/:/transcode", q1) != Key("acct:7", "/photo/:/transcode", q2) {
+		t.Fatal("same account must share one file across token rotation")
 	}
+	// Different accounts: isolated even for identical transforms.
+	if Key("acct:7", "/photo/:/transcode", q1) == Key("acct:9", "/photo/:/transcode", q1) {
+		t.Fatal("accounts must never share artwork entries")
+	}
+	// Different transforms: isolated.
 	q3, _ := url.ParseQuery("width=960&height=720")
-	if Key("/photo/:/transcode", q1) == Key("/photo/:/transcode", q3) {
+	if Key("acct:7", "/photo/:/transcode", q1) == Key("acct:7", "/photo/:/transcode", q3) {
 		t.Fatal("different transforms must not share")
 	}
 	if !Match("/photo/:/transcode?url=x") || Match("/library/metadata/1/thumb/2") {

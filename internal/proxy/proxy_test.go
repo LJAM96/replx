@@ -15,6 +15,7 @@ import (
 	"github.com/LJAM96/replx/internal/identity"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
+	"github.com/LJAM96/replx/internal/playback"
 	"github.com/LJAM96/replx/internal/trace"
 	"github.com/LJAM96/replx/internal/warmer"
 )
@@ -564,14 +565,18 @@ type stubPlayback struct {
 	handled    bool
 	ended      []string
 	statusCode int
+	deny       *playback.Deny
 }
 
-func (s *stubPlayback) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, session, identity, client string) bool {
+func (s *stubPlayback) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, session, identity, client string) (bool, *playback.Deny) {
+	if s.deny != nil {
+		return false, s.deny
+	}
 	if s.handled {
 		w.WriteHeader(s.statusCode)
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 func (s *stubPlayback) EndSession(r *http.Request) {
@@ -637,7 +642,7 @@ func TestNoPlaybackPreservesControl(t *testing.T) {
 	}
 }
 
-func TestArtworkSharedAcrossUsers(t *testing.T) {
+func TestArtworkAccountScoped(t *testing.T) {
 	const secret = "test-secret-key-for-beta-slice-0123456789"
 	hits := 0
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -661,19 +666,92 @@ func TestArtworkSharedAcrossUsers(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec
 	}
+	// Without an identity resolver every token stays token-scoped:
+	// distinct tokens isolate, and the second fetch re-hits origin.
 	first := get("token-a")
 	second := get("token-b")
-	if first.Header().Get(CacheHeader) != "miss" || second.Header().Get(CacheHeader) != "hit" {
-		t.Fatalf("shared artwork: %s then %s", first.Header().Get(CacheHeader), second.Header().Get(CacheHeader))
+	if first.Header().Get(CacheHeader) != "miss" || second.Header().Get(CacheHeader) != "miss" {
+		t.Fatalf("token scopes must isolate: %s then %s", first.Header().Get(CacheHeader), second.Header().Get(CacheHeader))
 	}
-	if hits != 1 || second.Body.String() != "thumb-bytes" {
-		t.Fatalf("one origin fetch must serve both users: hits=%d", hits)
+	if hits != 2 {
+		t.Fatalf("isolated scopes must refetch: hits=%d", hits)
+	}
+	// Same token repeats hit.
+	third := get("token-a")
+	if third.Header().Get(CacheHeader) != "hit" || hits != 2 {
+		t.Fatalf("repeat must hit: %s hits=%d", third.Header().Get(CacheHeader), hits)
+	}
+	if third.Body.String() != "thumb-bytes" {
+		t.Fatal("hit body wrong")
 	}
 	// Anonymous artwork bypasses: authorization to reference required.
 	anon := httptest.NewRequest(http.MethodGet, "/photo/:/transcode?width=480&height=720", nil)
 	anonRec := httptest.NewRecorder()
 	h.ServeHTTP(anonRec, anon)
 	if anonRec.Header().Get(CacheHeader) == "hit" {
-		t.Fatal("anonymous artwork must never hit shared entries")
+		t.Fatal("anonymous artwork must never hit account entries")
+	}
+}
+
+func TestDecisionDenyRenders403(t *testing.T) {
+	contacted := false
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contacted = true
+	}))
+	defer origin.Close()
+	stub := &stubPlayback{deny: &playback.Deny{Code: playback.DecisionUnsupported, Message: "unparseable"}}
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Playback: stub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/video/:/transcode/universal/decision?session=s", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || contacted {
+		t.Fatalf("deny must 403 without origin: %d contacted=%v", rec.Code, contacted)
+	}
+	if !strings.Contains(rec.Body.String(), playback.DecisionUnsupported) {
+		t.Fatalf("coded body: %s", rec.Body.String())
+	}
+}
+
+func TestCacheSkipsTruncatedBody(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	hits := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			// Die mid-stream: declare 100 bytes, deliver 7, tear down.
+			// The client sees unexpected EOF (not a clean close).
+			hj := w.(http.Hijacker)
+			conn, _, _ := hj.Hijack()
+			_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\n\r\npartial"))
+			_ = conn.Close()
+			return
+		}
+		_, _ = w.Write([]byte("complete"))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: cache.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+		req.Header.Set("X-Plex-Token", "user-a-token")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	first := get()
+	second := get()
+	if hits != 2 {
+		t.Fatalf("truncated body must never poison the cache: hits=%d", hits)
+	}
+	if first.Header().Get(CacheHeader) != "miss" || second.Header().Get(CacheHeader) != "miss" {
+		t.Fatalf("both must miss: %s %s", first.Header().Get(CacheHeader), second.Header().Get(CacheHeader))
+	}
+	if second.Body.String() != "complete" {
+		t.Fatalf("second body: %q", second.Body.String())
 	}
 }

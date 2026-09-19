@@ -24,6 +24,8 @@ import (
 	"github.com/LJAM96/replx/internal/identity"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
+	"github.com/LJAM96/replx/internal/playback"
+	"github.com/LJAM96/replx/internal/policy"
 	"github.com/LJAM96/replx/internal/requestid"
 	"github.com/LJAM96/replx/internal/routing"
 	"github.com/LJAM96/replx/internal/trace"
@@ -64,9 +66,11 @@ type SpikeResolver interface {
 // PlaybackEngine enforces policy at negotiation and session boundaries.
 // Nil preserves transparent proxy behaviour.
 type PlaybackEngine interface {
-	// HandleDecision intercepts one universal negotiation request,
-	// reporting whether it wrote the response.
-	HandleDecision(w http.ResponseWriter, r *http.Request, id, fingerprint, sessionID, identityID, clientUUID string) bool
+	// HandleDecision intercepts one universal negotiation request. It
+	// returns (handled, deny): handled means the response is written;
+	// deny non-nil means refuse with the coded 403; (false, nil) means
+	// transparent proxy (engine disabled path only).
+	HandleDecision(w http.ResponseWriter, r *http.Request, id, fingerprint, sessionID, identityID, clientUUID string) (bool, *playback.Deny)
 	// EndSession closes playback sessions on stop verbs. Best-effort:
 	// it must never break the proxied control flow.
 	EndSession(r *http.Request)
@@ -238,6 +242,9 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 	if entry.ContentType != "" {
 		w.Header().Set("Content-Type", entry.ContentType)
 	}
+	for k, v := range entry.Headers {
+		w.Header().Set(k, v)
+	}
 	w.WriteHeader(entry.Status)
 	_, _ = w.Write(entry.Body)
 	h.emit(r, id, *o, "control", entry.Status, start, map[string]any{"bodyBytes": len(entry.Body)})
@@ -284,7 +291,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.playback.EndSession(r)
 		}
 		if gateway.IsDecision(r.URL.Path) {
-			if h.playback.HandleDecision(w, r, id, o.fingerprint, o.session, o.identityID, o.clientUUID) {
+			handled, deny := h.playback.HandleDecision(w, r, id, o.fingerprint, o.session, o.identityID, o.clientUUID)
+			if deny != nil {
+				h.writePolicyDeny(w, r, id, o, start, deny)
+				return
+			}
+			if handled {
 				return
 			}
 		}
@@ -298,14 +310,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.proxy(w, r, id, o, routeClass, start)
 }
 
-// serveArtwork serves shared filesystem transcodes. Entries key on URL
-// plus transformation only, so one origin fetch serves every authorized
-// user; anonymous requests bypass (authorization to reference required).
+// serveArtwork serves account-scoped filesystem transcodes. The scope in
+// the key means one account's poster can never satisfy another account's
+// request; anonymous requests bypass (authorization to reference required).
 func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) bool {
-	if h.artwork == nil || o.fingerprint == "" || !artwork.Match(r.URL.Path) {
+	if h.artwork == nil || o.fingerprint == "" || o.scope == "" || !artwork.Match(r.URL.Path) {
 		return false
 	}
-	key := artwork.Key(r.URL.Path, r.URL.Query())
+	key := artwork.Key(o.scope, r.URL.Path, r.URL.Query())
 	if ct, body, ok := h.artwork.Get(key); ok {
 		o.cacheState = "hit"
 		if h.metrics != nil {
@@ -403,6 +415,33 @@ func (h *Handler) writeMediaUnavailable(w http.ResponseWriter, r *http.Request, 
 	h.emit(r, id, o, "media", http.StatusForbidden, start, map[string]any{"decision": decision})
 }
 
+// writePolicyDeny renders an engine fail-closed refusal: a known playback
+// decision endpoint that could not be policy-checked never degrades to
+// transparent proxy.
+func (h *Handler) writePolicyDeny(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time, deny *playback.Deny) {
+	rendered := make([]string, 0, len(deny.Rejected))
+	for _, rj := range deny.Rejected {
+		rendered = append(rendered, policy.RenderReason(rj))
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code":      deny.Code,
+			"message":   deny.Message,
+			"rejected":  rendered,
+			"requestId": id,
+		},
+	})
+	if h.metrics != nil {
+		h.metrics.ObserveHTTP("control", http.StatusForbidden, time.Since(start))
+		h.metrics.IncPlaybackDecision()
+	}
+	h.emit(r, id, o, "control", http.StatusForbidden, start,
+		map[string]any{"decision": "deny", "code": deny.Code})
+}
+
 func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs, routeClass string, start time.Time) {
 	target := *h.origin
 	target.Path = singleJoin(h.origin.Path, r.URL.Path)
@@ -453,15 +492,23 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 }
 
 // copyBody streams the origin body to the client while tee-storing
-// cacheable 200s. Bodies over MaxEntryBytes stream fully but skip the
-// store; the client never sees a truncated response either way.
+// cacheable 200s. Only cleanly completed bodies within the cap are
+// stored: a mid-stream origin failure must never persist a truncated
+// response for replay, and oversize bodies stream through uncached. The
+// client always receives whatever the origin produced either way.
 func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *http.Response) int64 {
 	if !o.cacheable || resp.StatusCode != http.StatusOK {
 		n, _ := io.Copy(w, resp.Body)
 		return n
 	}
 	var buf bytes.Buffer
-	n, _ := io.CopyN(io.MultiWriter(w, &buf), resp.Body, cache.MaxEntryBytes+1)
+	n, copyErr := io.CopyN(io.MultiWriter(w, &buf), resp.Body, cache.MaxEntryBytes+1)
+	// io.CopyN reports EOF when the body ends before the cap: that IS a
+	// clean, complete body. Any other error means the origin died
+	// mid-stream and the partial bytes must never be cached.
+	if copyErr != nil && copyErr != io.EOF {
+		return n
+	}
 	if n > cache.MaxEntryBytes {
 		rest, _ := io.Copy(w, resp.Body)
 		return n + rest
@@ -470,6 +517,7 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 	_ = h.cache.Set(r.Context(), o.cacheKey, cache.Entry{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
+		Headers:     cache.SafeHeaders(resp.Header),
 		Body:        body,
 	}, o.cacheTTL)
 	if h.warmer != nil {

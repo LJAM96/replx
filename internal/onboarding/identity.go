@@ -26,8 +26,8 @@ import (
 	"strings"
 
 	"github.com/LJAM96/replx/internal/crypto"
+	"github.com/LJAM96/replx/internal/database"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Stages of the onboarding state machine.
@@ -48,7 +48,7 @@ const (
 
 // Service orchestrates onboarding against Postgres, plex.tv and the origin.
 type Service struct {
-	DB *pgxpool.Pool
+	DB database.DBTX
 	// NewTV builds a plex.tv client bound to the installation client ID.
 	// Injected for tests (fake plex.tv); production dials plex.tv.
 	NewTV func(clientID string) TVClient
@@ -151,7 +151,7 @@ func generateIdentity() (string, ed25519.PrivateKey, error) {
 
 // setting helpers persist small onboarding state in app_settings.
 
-func getSetting(ctx context.Context, db *pgxpool.Pool, key string) (string, bool) {
+func getSetting(ctx context.Context, db database.DBTX, key string) (string, bool) {
 	var raw json.RawMessage
 	if err := db.QueryRow(ctx, "SELECT value FROM app_settings WHERE key=$1", key).Scan(&raw); err != nil {
 		return "", false
@@ -163,13 +163,13 @@ func getSetting(ctx context.Context, db *pgxpool.Pool, key string) (string, bool
 	return v, true
 }
 
-func setSetting(ctx context.Context, db *pgxpool.Pool, key, value string) error {
+func setSetting(ctx context.Context, db database.DBTX, key, value string) error {
 	raw, _ := json.Marshal(value)
 	_, err := db.Exec(ctx, `INSERT INTO app_settings(key, value, updated_at) VALUES($1, $2, now())
 		ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, key, string(raw))
 	return err
 }
 
-func delSetting(ctx context.Context, db *pgxpool.Pool, key string) {
+func delSetting(ctx context.Context, db database.DBTX, key string) {
 	_, _ = db.Exec(ctx, "DELETE FROM app_settings WHERE key=$1", key)
 }

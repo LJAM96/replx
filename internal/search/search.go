@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/LJAM96/replx/internal/database"
 )
 
 // FreshnessWindow bounds index staleness for serving candidates: twice the
@@ -31,9 +31,10 @@ type Candidate struct {
 }
 
 // Candidates returns FTS+trigram matches for query (empty when the query
-// is blank, overlong, or the index is stale). Callers fall back to PMS on
-// stale or empty.
-func Candidates(ctx context.Context, db *pgxpool.Pool, serverID, query string, limit int) ([]Candidate, bool, error) {
+// is blank, overlong, or the index is stale). Fresh means EVERY synced
+// library section has a recent completed cursor: one fresh section must
+// never vouch for a stale sibling. Callers fall back to PMS on stale.
+func Candidates(ctx context.Context, db database.DBTX, serverID, query string, limit int) ([]Candidate, bool, error) {
 	query = truncateQuery(query)
 	if db == nil || query == "" {
 		return nil, false, nil
@@ -43,11 +44,12 @@ func Candidates(ctx context.Context, db *pgxpool.Pool, serverID, query string, l
 	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	var fresh bool
-	if err := db.QueryRow(cctx, `SELECT EXISTS(SELECT 1 FROM sync_cursors
-		WHERE server_id=$1 AND sync_type='section' AND status='complete'
-		AND last_completed_at > now() - make_interval(hours => 12))`, serverID).Scan(&fresh); err != nil || !fresh {
-		return nil, false, nil
+	var stale int
+	if err := db.QueryRow(cctx, `SELECT count(*) FROM libraries l WHERE l.server_id=$1
+		AND NOT EXISTS(SELECT 1 FROM sync_cursors c WHERE c.server_id=$1 AND c.sync_type='section'
+			AND c.library_id=l.id AND c.status='complete'
+			AND c.last_completed_at > now() - make_interval(hours => 12))`, serverID).Scan(&stale); err != nil || stale > 0 {
+		return nil, false, err
 	}
 	rows, err := db.Query(cctx, `SELECT rating_key, title, item_type, year, COALESCE(thumb,'') FROM library_items
 		WHERE server_id=$1 AND (

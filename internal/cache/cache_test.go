@@ -9,7 +9,9 @@ import (
 )
 
 func TestCodecRoundTrip(t *testing.T) {
-	in := Entry{Status: 200, ContentType: "application/xml", Body: []byte("<MediaContainer/>")}
+	in := Entry{Status: 200, ContentType: "application/xml",
+		Headers: map[string]string{"Etag": `"abc"`, "Last-Modified": "Tue, 01 Jan 2030 00:00:00 GMT"},
+		Body:    []byte("<MediaContainer/>")}
 	raw, err := in.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -21,11 +23,34 @@ func TestCodecRoundTrip(t *testing.T) {
 	if out.Status != 200 || out.ContentType != "application/xml" || string(out.Body) != "<MediaContainer/>" {
 		t.Fatalf("codec: %+v", out)
 	}
+	if out.Headers["Etag"] != `"abc"` || out.Headers["Last-Modified"] == "" {
+		t.Fatalf("headers: %+v", out.Headers)
+	}
 	if _, err := Unmarshal([]byte("bogus")); err == nil {
 		t.Fatal("want error for garbage")
 	}
-	if _, err := Unmarshal(append([]byte{0x01, 0, 0, 0}, 200)); err == nil {
-		t.Fatal("want error for truncated")
+	// Legacy v1 entries (no headers) still decode for rolling deploys.
+	v1 := append([]byte{0x01, 0, 0, 0, 200, 0, 0, 0, 8}, []byte("text/xml")...)
+	v1 = append(v1, []byte("body")...)
+	legacy, err := Unmarshal(v1)
+	if err != nil || legacy.Status != 200 || legacy.ContentType != "text/xml" || string(legacy.Body) != "body" {
+		t.Fatalf("v1 legacy: %+v %v", legacy, err)
+	}
+}
+
+func TestSafeHeaders(t *testing.T) {
+	h := map[string][]string{
+		"ETag":           {`"x"`},
+		"Set-Cookie":     {"sess=1"},
+		"X-Plex-Token":   {"tok"},
+		"Authorization":  {"bearer"},
+		"Cache-Control":  {"no-store"},
+		"Content-Length": {"5"},
+		"X-Replx-Foo":    {"1"},
+	}
+	got := SafeHeaders(h)
+	if len(got) != 1 || got["Etag"] != `"x"` {
+		t.Fatalf("allowlist: %+v", got)
 	}
 }
 

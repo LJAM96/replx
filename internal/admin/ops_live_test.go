@@ -4,41 +4,24 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 
-	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/health"
 	"github.com/LJAM96/replx/internal/onboarding"
 	"github.com/LJAM96/replx/internal/spike"
+	"github.com/LJAM96/replx/internal/testdb"
 )
 
 func liveMux(t *testing.T) (*Mux, string) {
 	t.Helper()
-	url := os.Getenv("REPLX_EDGE_TEST_POSTGRES_URL")
-	if url == "" {
-		t.Skip("REPLX_EDGE_TEST_POSTGRES_URL not set; CI go job covers live admin SQL")
-	}
-	ctx := context.Background()
-	pool, err := database.Open(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	if err := pool.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	db := pool.Raw()
+	ctx, db := testdb.Begin(t)
 	_, _ = db.Exec(ctx, `DELETE FROM plex_servers WHERE machine_identifier='test-ops-box'`)
 	var serverID string
 	if err := db.QueryRow(ctx, `INSERT INTO plex_servers(name, internal_origin_url, machine_identifier, enabled)
 		VALUES('Ops Box','http://test.invalid:32400','test-ops-box',true) RETURNING id`).Scan(&serverID); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = db.Exec(context.Background(), `DELETE FROM plex_servers WHERE machine_identifier='test-ops-box'`)
-	})
 	m := NewMux(health.Checks{}, &onboarding.Service{DB: db}, "tok123", true, nil, &spike.Observations{DB: db})
 	return m, serverID
 }

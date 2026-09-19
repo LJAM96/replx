@@ -3,17 +3,23 @@ package policy
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/LJAM96/replx/internal/database"
+	"github.com/jackc/pgx/v5"
 )
 
 // LoadEffective reads enabled policies for a server and folds them to one
-// effective policy with rejection provenance. identityID and clientID are
-// the plex_identities/client_instances UUIDs (nil when unresolved, in
-// which case those levels contribute nothing). Unknown levels never
-// weaken: absent rows merge as inherit.
-func LoadEffective(ctx context.Context, db *pgxpool.Pool, serverID string, identityID, clientID *string) (Policy, string) {
+// effective policy with rejection provenance. Identity/client UUIDs
+// activate user/device levels; nil keeps those levels inherited.
+//
+// Failure semantics are the point: no row means inherit, but a database
+// error or corrupt config on an APPLICABLE level fails the whole load.
+// Callers fail playback closed on error, so a Postgres outage while a
+// restriction applies can never silently promote global policy.
+func LoadEffective(ctx context.Context, db database.DBTX, serverID string, identityID, clientID *string) (Policy, string, error) {
 	eff := Defaults()
 	scope := "GLOBAL"
 	levels := []struct {
@@ -26,19 +32,27 @@ func LoadEffective(ctx context.Context, db *pgxpool.Pool, serverID string, ident
 		{"device", clientID, "DEVICE"},
 	}
 	for _, l := range levels {
-		p, ok := loadLevel(ctx, db, serverID, l.scopeType, l.scopeID)
-		if !ok {
+		if l.scopeID == nil && l.scopeType != "global" {
+			continue // unresolved identity: level inapplicable, not failed
+		}
+		p, found, err := loadLevel(ctx, db, serverID, l.scopeType, l.scopeID)
+		if err != nil {
+			return Policy{}, "", fmt.Errorf("policy: %s level unavailable: %w", l.name, err)
+		}
+		if !found {
 			continue
 		}
 		eff = Merge(eff, p)
 		scope = l.name
 	}
-	return eff, scope
+	return eff, scope, nil
 }
 
-func loadLevel(ctx context.Context, db *pgxpool.Pool, serverID, scopeType string, scopeID *string) (Policy, bool) {
+// loadLevel reads one scope level: found=false is clean inheritance,
+// while transport and corruption errors fail loudly.
+func loadLevel(ctx context.Context, db database.DBTX, serverID, scopeType string, scopeID *string) (Policy, bool, error) {
 	if db == nil {
-		return Policy{}, false
+		return Policy{}, false, nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -53,12 +67,15 @@ func loadLevel(ctx context.Context, db *pgxpool.Pool, serverID, scopeType string
 			WHERE server_id=$1 AND scope_type=$2 AND scope_id=$3 AND enabled ORDER BY updated_at DESC LIMIT 1`,
 			serverID, scopeType, *scopeID).Scan(&raw)
 	}
-	if err != nil || len(raw) == 0 {
-		return Policy{}, false
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Policy{}, false, nil
+	}
+	if err != nil {
+		return Policy{}, false, fmt.Errorf("policy: %s query: %w", scopeType, err)
 	}
 	var p Policy
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return Policy{}, false
+		return Policy{}, false, fmt.Errorf("policy: %s config corrupt: %w", scopeType, err)
 	}
-	return p, true
+	return p, true, nil
 }

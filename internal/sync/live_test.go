@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,29 +14,18 @@ import (
 	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/LJAM96/replx/internal/testdb"
+	"github.com/jackc/pgx/v5"
 )
 
-// livePool opens the CI Postgres (skips without it) and migrates.
-func livePool(t *testing.T) *pgxpool.Pool {
+// liveDB returns a rolled-back transaction: full isolation from sibling
+// packages sharing the CI database.
+func liveDB(t *testing.T) (context.Context, pgx.Tx) {
 	t.Helper()
-	url := os.Getenv("REPLX_EDGE_TEST_POSTGRES_URL")
-	if url == "" {
-		t.Skip("REPLX_EDGE_TEST_POSTGRES_URL not set; CI go job covers live sync SQL")
-	}
-	ctx := context.Background()
-	pool, err := database.Open(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	if err := pool.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	return pool.Raw()
+	return testdb.Begin(t)
 }
 
-func seedServer(t *testing.T, db *pgxpool.Pool) {
+func seedServer(t *testing.T, db database.DBTX) {
 	t.Helper()
 	ctx := context.Background()
 	_, _ = db.Exec(ctx, `DELETE FROM plex_servers WHERE machine_identifier='test-sync-box'`)
@@ -53,9 +41,8 @@ func seedServer(t *testing.T, db *pgxpool.Pool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = db.Exec(context.Background(), `DELETE FROM plex_servers WHERE machine_identifier='test-sync-box'`)
-	})
+	// Rollback at cleanup erases everything above: no residue for
+	// sibling packages, no explicit DELETEs needed.
 }
 
 // fakePMS serves sections plus a mutable paginated item list.
@@ -106,9 +93,8 @@ const liveItemA = `{"ratingKey":"2001","key":"/library/metadata/2001","type":"mo
 const liveItemB = `{"ratingKey":"2002","key":"/library/metadata/2002","type":"movie","title":"Sync Film B","Guid":[],"Media":[{"id":22,"container":"mp4","videoCodec":"hevc","videoProfile":"main 10","width":3840,"height":2160,"bitrate":50000,"videoResolution":"2160","dynamicRange":"HDR","Part":[{"id":202,"key":"/library/parts/202/file.mp4"}]}]}`
 
 func TestLiveFullSyncAndSweep(t *testing.T) {
-	db := livePool(t)
+	ctx, db := liveDB(t)
 	seedServer(t, db)
-	ctx := context.Background()
 
 	fx := &fakePMS{
 		sections: `{"MediaContainer":{"Directory":[{"key":"22","type":"movie","title":"Movies","agent":"tv.plex.agents.movie","uuid":"sec-uuid-22","updatedAt":1700000000}]}}`,

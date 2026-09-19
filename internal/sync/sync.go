@@ -19,9 +19,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ErrInFlight reports a second concurrent SyncOnce; full sync is single
@@ -30,7 +30,7 @@ var ErrInFlight = errors.New("sync: another sync is already running")
 
 // Worker performs owner library synchronization against one origin.
 type Worker struct {
-	DB         *pgxpool.Pool
+	DB         database.DBTX
 	Origin     string
 	OwnerToken func(ctx context.Context) (string, bool)
 	Logger     *logging.Logger
@@ -53,7 +53,7 @@ type HTTPClient interface {
 
 // New builds a Worker with Production defaults: light reconciliation every
 // 15 minutes, full consistency sweep every 6 hours, 100-item pages.
-func New(db *pgxpool.Pool, origin string, owner func(ctx context.Context) (string, bool),
+func New(db database.DBTX, origin string, owner func(ctx context.Context) (string, bool),
 	logger *logging.Logger, reg *metrics.Registry) *Worker {
 	return &Worker{
 		DB: db, Origin: origin, OwnerToken: ownerTokenOrNil(owner),
@@ -194,7 +194,7 @@ func (w *Worker) clearDirty(sectionID string) {
 	delete(w.dirty, sectionID)
 }
 
-func enabledServer(ctx context.Context, db *pgxpool.Pool) (string, error) {
+func enabledServer(ctx context.Context, db database.DBTX) (string, error) {
 	var id string
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

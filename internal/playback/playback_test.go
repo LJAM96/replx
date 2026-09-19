@@ -69,7 +69,8 @@ func TestHandleDecisionSelects1080p(t *testing.T) {
 		"/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F999&mediaIndex=0&session=sess-1", nil)
 	req.Header.Set("X-Plex-Token", "user-tok")
 	rec := httptest.NewRecorder()
-	if !e.HandleDecision(rec, req, "req-1", "fp-1", "sess-1", "", "") {
+	handled, _ := e.HandleDecision(rec, req, "req-1", "fp-1", "sess-1", "", "")
+	if !handled {
 		t.Fatal("decision must be handled")
 	}
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"mediaIndex":1`) {
@@ -96,7 +97,8 @@ func TestHandleDecisionDeniesTranscode(t *testing.T) {
 		"/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F999&mediaIndex=1&session=s2", nil)
 	req.Header.Set("X-Plex-Token", "user-tok")
 	rec := httptest.NewRecorder()
-	if !e.HandleDecision(rec, req, "req-2", "fp-1", "s2", "", "") {
+	handled, _ := e.HandleDecision(rec, req, "req-2", "fp-1", "s2", "", "")
+	if !handled {
 		t.Fatal("must handle")
 	}
 	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), policy.TranscodeForbidden) {
@@ -114,7 +116,8 @@ func TestHandleDecisionNoVariant(t *testing.T) {
 		"/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F999&session=s3", nil)
 	req.Header.Set("X-Plex-Token", "user-tok")
 	rec := httptest.NewRecorder()
-	if !e.HandleDecision(rec, req, "req-3", "fp-1", "s3", "", "") {
+	handled, _ := e.HandleDecision(rec, req, "req-3", "fp-1", "s3", "", "")
+	if !handled {
 		t.Fatal("must handle")
 	}
 	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), policy.NoAllowedVariant) {
@@ -122,18 +125,19 @@ func TestHandleDecisionNoVariant(t *testing.T) {
 	}
 }
 
-func TestHandleDecisionPassthrough(t *testing.T) {
+func TestHandleDecisionFailClosed(t *testing.T) {
 	e := &Engine{Store: NewMemoryStore()}
-	// No rating key: not a negotiation the engine understands.
+	// No rating key: undecipherable decision shape fails closed, never
+	// degrades to transparent proxy.
 	req := httptest.NewRequest(http.MethodGet, "/video/:/transcode/universal/decision?session=s", nil)
-	if e.HandleDecision(httptest.NewRecorder(), req, "id", "fp", "s", "", "") {
-		t.Fatal("must pass through without rating key")
+	if handled, deny := e.HandleDecision(httptest.NewRecorder(), req, "id", "fp", "s", "", ""); handled || deny == nil || deny.Code != DecisionUnsupported {
+		t.Fatalf("unparseable decision must deny: %v %+v", handled, deny)
 	}
-	// No token: cannot forward under user context.
+	// No token: cannot act under user context.
 	req2 := httptest.NewRequest(http.MethodGet,
 		"/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F999", nil)
-	if e.HandleDecision(httptest.NewRecorder(), req2, "id", "fp", "s", "", "") {
-		t.Fatal("must pass through without token")
+	if handled, deny := e.HandleDecision(httptest.NewRecorder(), req2, "id", "fp", "s", "", ""); handled || deny == nil {
+		t.Fatalf("tokenless decision must deny: %v %+v", handled, deny)
 	}
 }
 
@@ -159,8 +163,8 @@ func TestJodieBoundary(t *testing.T) {
 		t.Fatal("selected part must pass untouched")
 	}
 	r3 := httptest.NewRequest(http.MethodGet, "/library/parts/301/file.mkv", nil)
-	if sub, deny, _ := e.EnforcePart(r3, "301", "no-such-session"); deny || sub != "" {
-		t.Fatal("absent session preserves Alpha allow")
+	if _, deny, reason := e.EnforcePart(r3, "301", "no-such-session"); !deny || reason != DecisionRequired {
+		t.Fatalf("sessionless part must fail closed: %v %q", deny, reason)
 	}
 }
 
@@ -229,11 +233,12 @@ func TestManifestBoundary(t *testing.T) {
 	if _, deny, _ := e2.EnforcePart(r2, "", "sess-m"); deny {
 		t.Fatal("direct-stream manifest must pass")
 	}
-	// No session: Alpha allow-through.
+	// No session: manifests only exist after a tracked decision, so
+	// PMS itself would fail this too. Explicit deny, never allow.
 	e3 := &Engine{Store: NewMemoryStore()}
 	r3 := httptest.NewRequest(http.MethodGet,
 		"/video/:/transcode/universal/start.mpd?session=ghost&directPlay=0&directStream=0", nil)
-	if _, deny, _ := e3.EnforcePart(r3, "", "ghost"); deny {
-		t.Fatal("absent session must allow")
+	if _, deny, reason := e3.EnforcePart(r3, "", "ghost"); !deny || reason != DecisionRequired {
+		t.Fatalf("sessionless manifest must fail closed: %v %q", deny, reason)
 	}
 }

@@ -5,43 +5,23 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/plextv"
 	"github.com/LJAM96/replx/internal/proxy"
+	"github.com/LJAM96/replx/internal/testdb"
 )
 
 // liveService wires the full flow against fakes when TEST_POSTGRES_URL is set.
 func TestLiveOnboardingFlow(t *testing.T) {
-	dbURL := os.Getenv("REPLX_EDGE_TEST_POSTGRES_URL")
-	if dbURL == "" {
-		t.Skip("REPLX_EDGE_TEST_POSTGRES_URL not set")
-	}
-	ctx := t.Context()
-	pool, err := database.Open(ctx, dbURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	if err := pool.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	// Isolate from other live tests sharing this database.
-	for _, q := range []string{
-		"TRUNCATE plex_servers, plex_identities, client_instances, app_identity CASCADE",
-		"DELETE FROM app_settings WHERE key LIKE 'onboarding.%'",
-		"DELETE FROM compatibility_profiles WHERE platform='Web' AND product='Plex Web'",
-	} {
-		if _, err := pool.Raw().Exec(ctx, q); err != nil {
-			t.Fatalf("cleanup: %v", err)
-		}
-	}
+	// Rolled-back transaction: full isolation from sibling packages
+	// sharing the CI database (replaces the old TRUNCATE approach,
+	// which destroyed other tests' rows mid-run).
+	ctx, tx := testdb.Begin(t)
 
 	const machine = "pms-machine-1"
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -115,7 +95,7 @@ func TestLiveOnboardingFlow(t *testing.T) {
 	defer tv.Close()
 
 	svc := &Service{
-		DB: pool.Raw(),
+		DB: tx,
 		NewTV: func(clientID string) TVClient {
 			return &plextv.Client{BaseURL: tv.URL, ClientIdentifier: clientID, Product: "t", Version: "t", Platform: "t"}
 		},
@@ -195,19 +175,7 @@ func TestLiveOnboardingFlow(t *testing.T) {
 }
 
 func TestLegacyFallbackLive(t *testing.T) {
-	dbURL := os.Getenv("REPLX_EDGE_TEST_POSTGRES_URL")
-	if dbURL == "" {
-		t.Skip("REPLX_EDGE_TEST_POSTGRES_URL not set")
-	}
-	ctx := t.Context()
-	pool, err := database.Open(ctx, dbURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	if err := pool.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	ctx, tx := testdb.Begin(t)
 	// Fake rejects the JWT shape: onboarding must fall back to legacy.
 	tv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -229,7 +197,7 @@ func TestLegacyFallbackLive(t *testing.T) {
 	}))
 	defer tv.Close()
 	svc := &Service{
-		DB:          pool.Raw(),
+		DB:          tx,
 		NewTV:       func(clientID string) TVClient { return &plextv.Client{BaseURL: tv.URL, ClientIdentifier: clientID} },
 		Secret:      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		PublicURL:   "https://test-public.example",
@@ -245,27 +213,7 @@ func TestLegacyFallbackLive(t *testing.T) {
 }
 
 func TestSubmitTokenLive(t *testing.T) {
-	dbURL := os.Getenv("REPLX_EDGE_TEST_POSTGRES_URL")
-	if dbURL == "" {
-		t.Skip("REPLX_EDGE_TEST_POSTGRES_URL not set")
-	}
-	ctx := t.Context()
-	pool, err := database.Open(ctx, dbURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	if err := pool.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	for _, q := range []string{
-		"TRUNCATE plex_servers, plex_identities, client_instances, app_identity CASCADE",
-		"DELETE FROM app_settings WHERE key LIKE 'onboarding.%'",
-	} {
-		if _, err := pool.Raw().Exec(ctx, q); err != nil {
-			t.Fatalf("cleanup: %v", err)
-		}
-	}
+	ctx, tx := testdb.Begin(t)
 	tv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v2/user" && r.Header.Get("X-Plex-Token") == "pasted-good-token" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 11, "username": "pasteowner"})
@@ -275,7 +223,7 @@ func TestSubmitTokenLive(t *testing.T) {
 	}))
 	defer tv.Close()
 	svc := &Service{
-		DB:          pool.Raw(),
+		DB:          tx,
 		NewTV:       func(clientID string) TVClient { return &plextv.Client{BaseURL: tv.URL, ClientIdentifier: clientID} },
 		Secret:      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		PublicURL:   "https://test-public.example",
@@ -296,9 +244,5 @@ func TestSubmitTokenLive(t *testing.T) {
 	}
 	if got := svc.Status(ctx)["authMode"]; got != "legacy" {
 		t.Fatalf("pasted tokens are always legacy (no refresh), got %v", got)
-	}
-	// Cleanup so shared-DB siblings observe a clean slate.
-	for _, k := range []string{"onboarding.owner_token", "onboarding.owner_expires", "onboarding.auth_mode", "onboarding.pin_id", "onboarding.pin_code", "onboarding.verified"} {
-		_, _ = pool.Raw().Exec(ctx, "DELETE FROM app_settings WHERE key=$1", k)
 	}
 }

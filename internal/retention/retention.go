@@ -7,10 +7,11 @@ package retention
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/logging"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Policy configures age bounds. Zero disables that class.
@@ -29,46 +30,58 @@ type Result struct {
 
 // PurgeOnce deletes expired rows. Sessions go first with decisions
 // cascading; orphan decisions (session already gone) are swept directly.
-func PurgeOnce(ctx context.Context, db *pgxpool.Pool, p Policy) (Result, error) {
+// The first database failure aborts the pass and is returned: a silent
+// purge would hide a filling disk behind a "purged" log line. Statements
+// before the failure already committed.
+func PurgeOnce(ctx context.Context, db database.DBTX, p Policy) (Result, error) {
 	var out Result
 	if db == nil {
-		return out, nil
+		return out, fmt.Errorf("retention: no database")
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	exec := func(q string, args ...any) int64 {
+	exec := func(q string, args ...any) (int64, error) {
 		var n int64
 		if err := db.QueryRow(cctx, q, args...).Scan(&n); err != nil {
-			return -1
+			return 0, err
 		}
-		return n
+		return n, nil
 	}
+	var err error
 	if p.PlaybackDays > 0 {
-		out.Decisions = exec(`WITH gone AS (
+		if out.Decisions, err = exec(`WITH gone AS (
 			DELETE FROM playback_decisions
 			WHERE created_at < now() - make_interval(days => $1) RETURNING 1
-		) SELECT count(*) FROM gone`, p.PlaybackDays)
-		out.Sessions = exec(`WITH gone AS (
+		) SELECT count(*) FROM gone`, p.PlaybackDays); err != nil {
+			return out, fmt.Errorf("retention: decisions: %w", err)
+		}
+		if out.Sessions, err = exec(`WITH gone AS (
 			DELETE FROM playback_sessions
 			WHERE ended_at IS NOT NULL AND ended_at < now() - make_interval(days => $1)
 			RETURNING 1
-		) SELECT count(*) FROM gone`, p.PlaybackDays)
+		) SELECT count(*) FROM gone`, p.PlaybackDays); err != nil {
+			return out, fmt.Errorf("retention: sessions: %w", err)
+		}
 	}
 	// Trace expiry is per-row (expires_at), independent of the policy.
-	out.Traces = exec(`WITH gone AS (
+	if out.Traces, err = exec(`WITH gone AS (
 		DELETE FROM diagnostic_traces WHERE expires_at < now() RETURNING 1
-	) SELECT count(*) FROM gone`)
+	) SELECT count(*) FROM gone`); err != nil {
+		return out, fmt.Errorf("retention: traces: %w", err)
+	}
 	if p.AuditDays > 0 {
-		out.Audits = exec(`WITH gone AS (
+		if out.Audits, err = exec(`WITH gone AS (
 			DELETE FROM audit_events
 			WHERE created_at < now() - make_interval(days => $1) RETURNING 1
-		) SELECT count(*) FROM gone`, p.AuditDays)
+		) SELECT count(*) FROM gone`, p.AuditDays); err != nil {
+			return out, fmt.Errorf("retention: audits: %w", err)
+		}
 	}
 	return out, nil
 }
 
 // Run purges daily until ctx ends.
-func Run(ctx context.Context, db *pgxpool.Pool, p Policy, logger *logging.Logger, interval time.Duration) {
+func Run(ctx context.Context, db database.DBTX, p Policy, logger *logging.Logger, interval time.Duration) {
 	if db == nil {
 		return
 	}
@@ -93,7 +106,7 @@ func Run(ctx context.Context, db *pgxpool.Pool, p Policy, logger *logging.Logger
 	}
 }
 
-func purgeAndLog(ctx context.Context, db *pgxpool.Pool, p Policy, logger *logging.Logger) {
+func purgeAndLog(ctx context.Context, db database.DBTX, p Policy, logger *logging.Logger) {
 	res, err := PurgeOnce(ctx, db, p)
 	if logger == nil {
 		return

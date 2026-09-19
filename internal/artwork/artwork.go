@@ -1,10 +1,10 @@
 // Package artwork caches Plex artwork transcodes on the filesystem.
 //
-// Entries are shared across users when URL plus transformation key match:
-// identical bytes need no per-user copies, and every stored entry was
-// requested with that user's own credential (authorization to reference).
-// Anonymous requests bypass. TTL is 7 days; the janitor bounds disk usage
-// oldest-first under the configured budget.
+// Entries are account scoped: identical transforms for different accounts
+// store separately, because an authenticated token alone never proves
+// authorization for a restricted item's artwork. Anonymous requests
+// bypass. TTL is 7 days; the janitor bounds disk usage oldest-first under
+// the configured budget.
 package artwork
 
 import (
@@ -34,10 +34,16 @@ func Match(path string) bool {
 	return strings.HasPrefix(strings.ToLower(path), "/photo/:/transcode")
 }
 
-// Key hashes path plus sorted non-secret params: identical URL plus
-// identical transformation shares one file across users.
-func Key(path string, query url.Values) string {
+// Key hashes scope plus path plus sorted non-secret params. Entries are
+// account scoped (acct:<id>) like metadata: an authenticated token alone
+// never proves authorization for a restricted item's artwork. The
+// two-layer optimization (per-user authorization key over a shared
+// content-addressed blob) is future work; disk deduplication yields to
+// correctness for Production 1.0.
+func Key(scope, path string, query url.Values) string {
 	var b strings.Builder
+	b.WriteString(scope)
+	b.WriteByte(0)
 	b.WriteString(strings.ToLower(path))
 	b.WriteByte(0)
 	keys := make([]string, 0, len(query))

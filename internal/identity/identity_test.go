@@ -3,11 +3,12 @@ package identity
 import (
 	"context"
 	"errors"
-	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 
-	"github.com/LJAM96/replx/internal/database"
+	"github.com/LJAM96/replx/internal/plextv"
+	"github.com/LJAM96/replx/internal/testdb"
 )
 
 type fakeTV struct {
@@ -15,10 +16,14 @@ type fakeTV struct {
 	id    int64
 	user  string
 	err   error
+	code  int // when set, err becomes a typed plex.tv StatusError
 }
 
 func (f *fakeTV) GetUser(ctx context.Context, token string) (int64, string, error) {
 	f.calls.Add(1)
+	if f.code != 0 {
+		return 0, "", &plextv.StatusError{StatusCode: f.code, Status: "auth failed"}
+	}
 	return f.id, f.user, f.err
 }
 
@@ -43,29 +48,13 @@ func TestMemCacheSingleLookup(t *testing.T) {
 
 func liveResolver(t *testing.T, tv Account) (*Resolver, string) {
 	t.Helper()
-	url := os.Getenv("REPLX_EDGE_TEST_POSTGRES_URL")
-	if url == "" {
-		t.Skip("REPLX_EDGE_TEST_POSTGRES_URL not set; CI go job covers live identity SQL")
-	}
-	ctx := context.Background()
-	pool, err := database.Open(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	if err := pool.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	db := pool.Raw()
+	ctx, db := testdb.Begin(t)
 	_, _ = db.Exec(ctx, `DELETE FROM plex_servers WHERE machine_identifier='test-identity-box'`)
 	var serverID string
 	if err := db.QueryRow(ctx, `INSERT INTO plex_servers(name, internal_origin_url, machine_identifier, enabled)
 		VALUES('Identity Box','http://test.invalid:32400','test-identity-box',true) RETURNING id`).Scan(&serverID); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = db.Exec(context.Background(), `DELETE FROM plex_servers WHERE machine_identifier='test-identity-box'`)
-	})
 	return New(db, tv), serverID
 }
 
@@ -96,7 +85,7 @@ func TestLiveResolveLinksAndCaches(t *testing.T) {
 }
 
 func TestLiveInvalidBackoff(t *testing.T) {
-	tv := &fakeTV{err: errors.New("401")}
+	tv := &fakeTV{code: 401}
 	r, _ := liveResolver(t, tv)
 	ctx := context.Background()
 	for i := 0; i < 2; i++ {
@@ -108,7 +97,77 @@ func TestLiveInvalidBackoff(t *testing.T) {
 		}
 	}
 	if tv.calls.Load() != 1 {
-		t.Fatalf("invalid tokens back off for an hour, calls=%d", tv.calls.Load())
+		t.Fatalf("401 earns the one-hour negative cache, calls=%d", tv.calls.Load())
+	}
+}
+
+func TestLiveTransportDegradesWithoutMark(t *testing.T) {
+	tv := &fakeTV{err: errors.New("plex.tv 500")}
+	r, _ := liveResolver(t, tv)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		r2 := New(r.DB, tv)
+		got := r2.Resolve(ctx, "fp-flaky", "tok-flaky", Client{})
+		if got.Known || !got.Degraded {
+			t.Fatalf("transport failure must degrade, not resolve: %+v", got)
+		}
+	}
+	if tv.calls.Load() != 2 {
+		t.Fatalf("degraded tokens must retry (no negative cache), calls=%d", tv.calls.Load())
+	}
+	var invalid int
+	if err := r.DB.QueryRow(ctx, `SELECT count(*) FROM plex_token_identities
+		WHERE token_fingerprint='fp-flaky' AND token_status='invalid'`).Scan(&invalid); err != nil || invalid != 0 {
+		t.Fatalf("transport failure must not mark invalid: %v %d", err, invalid)
+	}
+}
+
+func TestLiveSplitDeviceCache(t *testing.T) {
+	tv := &fakeTV{id: 4242, user: "two-devices"}
+	r, _ := liveResolver(t, tv)
+	ctx := context.Background()
+	tvClient := Client{Identifier: "apple-tv", Product: "Plex", Platform: "tvOS"}
+	phone := Client{Identifier: "iphone", Product: "Plex", Platform: "iOS"}
+	a := r.Resolve(ctx, "fp-shared", "tok-shared", tvClient)
+	b := r.Resolve(ctx, "fp-shared", "tok-shared", phone)
+	if !a.Known || !b.Known || a.Scope != b.Scope || a.IdentityID != b.IdentityID {
+		t.Fatalf("same account must share scope+identity: %+v %+v", a, b)
+	}
+	if a.ClientID == "" || b.ClientID == "" || a.ClientID == b.ClientID {
+		t.Fatalf("devices must resolve independently: %q vs %q", a.ClientID, b.ClientID)
+	}
+	if tv.calls.Load() != 1 {
+		t.Fatalf("one plex.tv lookup for both devices, calls=%d", tv.calls.Load())
+	}
+}
+
+func TestSplitCacheRace(t *testing.T) {
+	tv := &fakeTV{id: 4242, user: "race"}
+	r, _ := liveResolver(t, tv)
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	results := make([]Resolved, 16)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := "dev-a"
+			if i%2 == 1 {
+				id = "dev-b"
+			}
+			results[i] = r.Resolve(ctx, "fp-race", "tok-race", Client{Identifier: id})
+		}(i)
+	}
+	wg.Wait()
+	seen := map[string]string{}
+	for _, res := range results {
+		if !res.Known {
+			t.Fatalf("all must resolve: %+v", res)
+		}
+		seen[res.ClientID] = res.ClientID
+	}
+	if len(seen) != 2 {
+		t.Fatalf("two devices must hold two instances under race: %v", seen)
 	}
 }
 

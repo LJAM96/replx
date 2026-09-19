@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/LJAM96/replx/internal/database"
 )
 
 // Valid observation states for the compatibility matrix.
@@ -33,7 +33,7 @@ type ObservationRow struct {
 
 // Observations persists the spike matrix in compatibility_profiles.
 type Observations struct {
-	DB *pgxpool.Pool
+	DB database.DBTX
 }
 
 // Record upserts one observation. Repeated records increment the counter;

@@ -3,7 +3,15 @@
 // Resolution order per request: process-local cache, token-link table,
 // plex.tv account lookup (cold fingerprints only), fingerprint fallback.
 // plex.tv is never on the steady-state hot path: only the first sighting
-// of a token pays the lookup, and invalid tokens back off for an hour.
+// of a token pays the lookup, and only definitive 401/403 responses earn
+// the one-hour negative cache. Transport and 5xx failures degrade without
+// persisting anything: a previous link still resolves from the table, and
+// a cold token simply retries next time.
+//
+// Two caches stay separate on purpose: account identity is keyed by token
+// fingerprint, but the client instance is keyed by fingerprint PLUS client
+// identifier, so one device's client UUID (and therefore its device-level
+// policy) can never leak into another device sharing the same user token.
 //
 // Scope strings key the response cache: "acct:<accountID>" when resolved
 // (all devices of one user share entries), "tok:<fingerprint>" otherwise.
@@ -16,18 +24,20 @@ package identity
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/LJAM96/replx/internal/database"
+	"github.com/LJAM96/replx/internal/plextv"
 	"github.com/LJAM96/replx/internal/trace"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// revalidateAfter bounds plex.tv traffic for bad tokens.
+// revalidateAfter bounds plex.tv traffic for definitively bad tokens.
 const revalidateAfter = time.Hour
 
-// memTTL bounds the process-local resolution cache.
+// memTTL bounds the process-local resolution caches.
 const memTTL = 5 * time.Minute
 
 const memMax = 4096
@@ -60,27 +70,37 @@ type Resolved struct {
 	ClientID   string // client_instances UUID, "" when unrecorded
 	AccountID  int64
 	Known      bool // account proven via link table or plex.tv
+	Degraded   bool // known links keep working; cold tokens retry soon
 }
 
 // Resolver links fingerprints to identities.
 type Resolver struct {
-	DB     *pgxpool.Pool
+	DB     database.DBTX
 	TV     Account
 	mu     sync.Mutex
-	mem    map[string]memEntry
+	acct   map[string]acctEntry
+	cli    map[string]cliEntry
 	server string
 	srvAt  time.Time
 }
 
-type memEntry struct {
-	res Resolved
-	at  time.Time
+type acctEntry struct {
+	scope      string
+	identityID string
+	accountID  int64
+	known      bool
+	at         time.Time
+}
+
+type cliEntry struct {
+	clientID string
+	at       time.Time
 }
 
 // New builds a Resolver. Nil DB resolves nothing (all fingerprints stay
 // token-scoped); nil TV skips live lookup (links only).
-func New(db *pgxpool.Pool, tv Account) *Resolver {
-	return &Resolver{DB: db, TV: tv, mem: map[string]memEntry{}}
+func New(db database.DBTX, tv Account) *Resolver {
+	return &Resolver{DB: db, TV: tv, acct: map[string]acctEntry{}, cli: map[string]cliEntry{}}
 }
 
 // Resolve maps fingerprint+token+client to identity. Token is used for
@@ -89,40 +109,62 @@ func (r *Resolver) Resolve(ctx context.Context, fingerprint, token string, clien
 	if r == nil || fingerprint == "" {
 		return Resolved{Scope: "tok:" + fingerprint}
 	}
+	now := time.Now()
 	r.mu.Lock()
-	if e, ok := r.mem[fingerprint]; ok && time.Since(e.at) < memTTL {
-		r.mu.Unlock()
-		return e.res
-	}
+	acct, acctOK := r.acct[fingerprint]
+	cliKey := fingerprint + "\x00" + client.Identifier
+	cli, cliOK := r.cli[cliKey]
 	r.mu.Unlock()
-	res := r.resolveCold(ctx, fingerprint, token, client)
+	if acctOK && now.Sub(acct.at) < memTTL {
+		out := Resolved{Scope: acct.scope, IdentityID: acct.identityID, AccountID: acct.accountID, Known: acct.known}
+		if client.Identifier != "" {
+			if cliOK && now.Sub(cli.at) < memTTL {
+				out.ClientID = cli.clientID
+				return out
+			}
+			// Same account, new device (or expired device entry):
+			// resolve the client independently, never inheriting a
+			// sibling device's instance.
+			out.ClientID = r.resolveClient(ctx, acct.identityID, client)
+			r.mu.Lock()
+			r.cli[cliKey] = cliEntry{clientID: out.ClientID, at: now}
+			r.mu.Unlock()
+		}
+		return out
+	}
+	res, store := r.resolveCold(ctx, fingerprint, token, client)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.mem) >= memMax {
-		oldest := ""
-		var oldestAt time.Time
-		first := true
-		for k, e := range r.mem {
-			if first || e.at.Before(oldestAt) {
-				oldest, oldestAt, first = k, e.at, false
-			}
+	if store {
+		if len(r.acct) >= memMax {
+			r.evictAcctLocked()
 		}
-		delete(r.mem, oldest)
+		r.acct[fingerprint] = acctEntry{scope: res.Scope, identityID: res.IdentityID,
+			accountID: res.AccountID, known: res.Known, at: now}
 	}
-	r.mem[fingerprint] = memEntry{res: res, at: time.Now()}
+	if client.Identifier == "" {
+		return res
+	}
+	if len(r.cli) >= memMax {
+		r.evictCliLocked()
+	}
+	r.cli[cliKey] = cliEntry{clientID: res.ClientID, at: now}
 	return res
 }
 
-func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, client Client) Resolved {
+// resolveCold performs the slow path: link table, then plex.tv. The bool
+// reports whether the outcome may be cached: degraded failures must retry
+// soon, never sit in cache for five minutes.
+func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, client Client) (Resolved, bool) {
 	fallback := Resolved{Scope: "tok:" + fingerprint}
 	if r.DB == nil {
-		return fallback
+		return fallback, true
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	serverID := r.enabledServer(cctx)
 	if serverID == "" {
-		return fallback
+		return fallback, true
 	}
 	// Known link?
 	var identityID *string
@@ -139,34 +181,74 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 			IdentityID: *identityID, AccountID: *accountID, Known: true}
 		res.ClientID = r.recordClient(cctx, serverID, *identityID, client)
 		r.touchLink(cctx, serverID, fingerprint)
-		return res
+		return res, true
 	}
+	_ = accountID
 	if r.TV == nil || token == "" {
-		return fallback
+		return fallback, true
 	}
 	// Recently-invalid tokens skip revalidation for an hour.
 	if status == "invalid" && validated != nil &&
 		time.Since(time.Unix(int64(*validated), 0)) < revalidateAfter {
-		return fallback
+		return fallback, true
 	}
 	id, username, err := r.TV.GetUser(cctx, token)
-	if err != nil || id == 0 {
-		r.markInvalid(cctx, serverID, fingerprint)
-		return fallback
+	if err != nil {
+		if isAuthFailure(err) {
+			r.markInvalid(cctx, serverID, fingerprint)
+			return fallback, true
+		}
+		// Transport/5xx/decode: degrade without persisting anything.
+		// Established links above keep resolving; cold tokens retry.
+		return Resolved{Scope: fallback.Scope, Degraded: true}, false
+	}
+	if id == 0 {
+		return fallback, true
 	}
 	iid := r.upsertIdentity(cctx, serverID, id, username)
 	r.upsertLink(cctx, serverID, fingerprint, iid)
 	res := Resolved{Scope: "acct:" + strconv.FormatInt(id, 10), AccountID: id, Known: true}
 	if iid != "" {
 		res.IdentityID = iid
-		res.ClientID = r.recordClient(cctx, serverID, iid, client)
 	}
-	return res
+	return res, true
+}
+
+// resolveClient records (or reuses) the client instance for one device.
+// It never consults another device's cached instance.
+func (r *Resolver) resolveClient(ctx context.Context, identityID string, client Client) string {
+	if r.DB == nil || client.Identifier == "" {
+		return ""
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	serverID := r.enabledServer(cctx)
+	if serverID == "" {
+		return ""
+	}
+	return r.recordClient(cctx, serverID, identityID, client)
+}
+
+// isAuthFailure reports definitive credential rejection (401/403): the
+// only failures that earn the negative cache. Rate limits, server errors
+// and transport failures must retry soon instead.
+func isAuthFailure(err error) bool {
+	var se *plextv.StatusError
+	if errors.As(err, &se) {
+		return se.StatusCode == 401 || se.StatusCode == 403
+	}
+	return false
 }
 
 func (r *Resolver) enabledServer(ctx context.Context) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.server != "" && time.Since(r.srvAt) < time.Minute {
 		return r.server
+	}
+	// DB is always non-nil here (callers check), but stay total anyway.
+	if r.DB == nil {
+		return ""
 	}
 	var id string
 	if err := r.DB.QueryRow(ctx, `SELECT id FROM plex_servers
@@ -175,6 +257,30 @@ func (r *Resolver) enabledServer(ctx context.Context) string {
 	}
 	r.server, r.srvAt = id, time.Now()
 	return id
+}
+
+func (r *Resolver) evictAcctLocked() {
+	oldest := ""
+	var oldestAt time.Time
+	first := true
+	for k, e := range r.acct {
+		if first || e.at.Before(oldestAt) {
+			oldest, oldestAt, first = k, e.at, false
+		}
+	}
+	delete(r.acct, oldest)
+}
+
+func (r *Resolver) evictCliLocked() {
+	oldest := ""
+	var oldestAt time.Time
+	first := true
+	for k, e := range r.cli {
+		if first || e.at.Before(oldestAt) {
+			oldest, oldestAt, first = k, e.at, false
+		}
+	}
+	delete(r.cli, oldest)
 }
 
 func (r *Resolver) upsertIdentity(ctx context.Context, serverID string, accountID int64, username string) string {

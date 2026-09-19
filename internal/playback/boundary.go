@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LJAM96/replx/internal/identity"
+	"github.com/LJAM96/replx/internal/policy"
 	"github.com/LJAM96/replx/internal/trace"
 )
 
@@ -26,10 +28,10 @@ func PartIDFromPath(path string) string {
 
 // EnforcePart implements the raw-part boundary for the spike redirector.
 // It returns a substitute part key when the request targets a prohibited
-// part while the active session holds an allowed selection (Jodie rule),
-// deny=true is reserved for known-prohibited parts once identity resolution
-// lands (Gamma phase), and empty results mean allow: no session context
-// preserves Alpha redirect behaviour exactly.
+// part while the active session holds an allowed selection (Jodie rule).
+// Without session state it reconstructs policy from user, client and part
+// (stateless path below) instead of allowing: a database outage or a
+// decision-skipping client must never promote a restricted part.
 //
 // Manifest requests (empty partID) take the manifest consistency check:
 // a direct-play session followed by an explicit transcode manifest fails
@@ -41,11 +43,11 @@ func (e *Engine) EnforcePart(r *http.Request, partID, sessionID string) (substit
 	if partID == "" {
 		return e.enforceManifest(r, sessionID)
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	sess, ok, err := e.Store.FindActive(ctx, sessionID)
 	if err != nil || !ok {
-		return "", false, ""
+		return e.enforceStateless(r, partID)
 	}
 	if sess.SelectedPartPlexID != "" && partID == sess.SelectedPartPlexID {
 		return "", false, ""
@@ -61,6 +63,83 @@ func (e *Engine) EnforcePart(r *http.Request, partID, sessionID string) (substit
 	return "", false, ""
 }
 
+// Stateless decision code: the boundary cannot consult negotiation state,
+// so the client must negotiate (or re-negotiate) before media flows.
+const DecisionRequired = "POLICY_DECISION_REQUIRED"
+
+// enforceStateless reconstructs policy for a sessionless part request
+// from user, client and part. Eligible under the resolved effective
+// policy it passes with a stateless-allow trace; anything else fails
+// closed with POLICY_DECISION_REQUIRED. Database errors fail closed:
+// an outage must not promote Jodie's 4K part.
+func (e *Engine) enforceStateless(r *http.Request, partID string) (string, bool, string) {
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	token := trace.ExtractToken(r)
+	if token == "" {
+		return "", true, DecisionRequired
+	}
+	variant, ratingKey, ok := e.lookupPart(ctx, partID)
+	if !ok {
+		return "", true, DecisionRequired
+	}
+	var identityID, clientUUID string
+	if e.Identity != nil {
+		res := e.Identity.Resolve(ctx, trace.Fingerprint(e.Secret, token), token,
+			identity.FromTrace(trace.ExtractClient(r)))
+		identityID, clientUUID = res.IdentityID, res.ClientID
+	}
+	load := e.LoadPolicy
+	if load == nil {
+		load = DefaultPolicyLoader(e.DB)
+	}
+	pol, scope, err := load(ctx, strOrNil(identityID), strOrNil(clientUUID))
+	if err != nil {
+		e.logDecision("", ratingKey, "", "part_stateless_deny", map[string]any{
+			"reason": "policy unavailable",
+		})
+		return "", true, DecisionRequired
+	}
+	if _, err := policy.Evaluate(pol, scope, []policy.Variant{variant.toPolicy()}); err != nil {
+		e.logDecision("", ratingKey, "", "part_stateless_deny", map[string]any{
+			"reason": "stateless ineligible",
+		})
+		return "", true, DecisionRequired
+	}
+	e.logDecision("", ratingKey, "", "part_stateless_allow", map[string]any{
+		"index": variant.MediaIndex,
+	})
+	return "", false, ""
+}
+
+// lookupPart resolves a part to its variant plus item rating key from the
+// owner index. Absent rows read as unknown, never as permitted.
+func (e *Engine) lookupPart(ctx context.Context, partPlexID string) (variantSource, string, bool) {
+	var v variantSource
+	var ratingKey string
+	if e.DB == nil || partPlexID == "" {
+		return v, "", false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	err := e.DB.QueryRow(cctx, `SELECT v.media_index, COALESCE(v.plex_media_id,''), v.width, v.height,
+		v.bitrate_kbps, v.normalized_dynamic_range, COALESCE(v.video_codec,''), v.audio_channels,
+		v.id::text, p.id::text, COALESCE(p.plex_part_id,''), COALESCE(p.plex_key,''), li.rating_key
+		FROM media_parts p
+		JOIN media_variants v ON v.id = p.media_variant_id
+		JOIN library_items li ON li.id = v.library_item_id
+		JOIN plex_servers s ON s.id = li.server_id
+		WHERE s.enabled AND p.plex_part_id = $1`,
+		partPlexID).Scan(&v.MediaIndex, &v.PlexMediaID, &v.Width, &v.Height, &v.BitrateKbps,
+		&v.DynamicRange, &v.VideoCodec, &v.AudioChannels, &v.VariantUUID, &v.PartUUID,
+		&v.PartPlexID, &v.PartKey, &ratingKey)
+	if err != nil {
+		return variantSource{}, "", false
+	}
+	v.PartAvailable = v.PartKey != ""
+	return v, ratingKey, true
+}
+
 // enforceManifest guards the manifest boundary against clients that retry
 // around the negotiated decision: a session the engine direct-played,
 // followed by a manifest explicitly requesting transcode
@@ -71,7 +150,13 @@ func (e *Engine) enforceManifest(r *http.Request, sessionID string) (string, boo
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	sess, ok, err := e.Store.FindActive(ctx, sessionID)
-	if err != nil || !ok || sess.PlaybackMode != "directPlay" {
+	if err != nil || !ok {
+		// No negotiable session: manifests only exist after a decision
+		// the engine would have tracked, so PMS itself would fail this
+		// too. Deny explicitly rather than allow an untracked transcode.
+		return "", true, DecisionRequired
+	}
+	if sess.PlaybackMode != "directPlay" {
 		return "", false, ""
 	}
 	q := r.URL.Query()
