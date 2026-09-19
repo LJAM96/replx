@@ -20,17 +20,25 @@ func TestLiveCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Stale index: no completed sweeps, must refuse with fresh=false.
+	// Stale index: libraries exist with no completed sweeps.
+	mkLib := func(section string) {
+		t.Helper()
+		if _, err := db.Exec(ctx, `INSERT INTO libraries(server_id, plex_section_id, title, media_type)
+			VALUES($1,$2,$2,'movie')
+			ON CONFLICT (server_id, plex_section_id) DO NOTHING`, serverID, section); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkLib("22")
+	mkLib("23")
 	if _, fresh, err := Candidates(ctx, db, serverID, "lasso", 10); err != nil || fresh {
 		t.Fatalf("stale index must refuse: fresh=%v err=%v", fresh, err)
 	}
 	complete := func(section string) {
 		t.Helper()
 		var libID string
-		if err := db.QueryRow(ctx, `INSERT INTO libraries(server_id, plex_section_id, title, media_type)
-			VALUES($1,$2,$2,'movie')
-			ON CONFLICT (server_id, plex_section_id) DO UPDATE SET title=EXCLUDED.title
-			RETURNING id`, serverID, section).Scan(&libID); err != nil {
+		if err := db.QueryRow(ctx, `SELECT id FROM libraries WHERE server_id=$1 AND plex_section_id=$2`,
+			serverID, section).Scan(&libID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.Exec(ctx, `INSERT INTO sync_cursors(server_id, sync_type, library_id, status, last_completed_at)

@@ -345,7 +345,9 @@ func (r *Resolver) recordClient(ctx context.Context, serverID, identityID string
 		ON CONFLICT (server_id, plex_client_identifier) DO UPDATE SET
 			product=EXCLUDED.product, product_version=EXCLUDED.product_version,
 			platform=EXCLUDED.platform, device=EXCLUDED.device, model=EXCLUDED.model,
-			last_seen_at=now() RETURNING id`).Scan(&clientID)
+			last_seen_at=now() RETURNING id`,
+		serverID, client.Identifier, nullIfEmpty(client.Product), nullIfEmpty(client.Version),
+		nullIfEmpty(client.Platform), nullIfEmpty(client.Device), nullIfEmpty(client.Model)).Scan(&clientID)
 	if err != nil || clientID == "" || identityID == "" {
 		return clientID
 	}

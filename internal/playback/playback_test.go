@@ -293,7 +293,7 @@ func TestBindingMismatch(t *testing.T) {
 		{"identity drift", "id-1", "cl-1", "id-2", "cl-1", true},
 		{"unresolved caller vs bound", "id-1", "cl-1", "", "", true},
 		{"client drift", "id-1", "cl-1", "id-1", "cl-2", true},
-		{"client unknown, identity matches", "id-1", "cl-1", "id-1", "", false},
+		{"client unknown, identity matches", "id-1", "cl-1", "id-1", "", true},
 		{"identity bound only, matches", "id-1", "", "id-1", "cl-9", false},
 	}
 	for _, tc := range cases {
@@ -327,5 +327,20 @@ func TestBoundSessionEnforced(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/library/parts/302/file.mp4", nil)
 	if _, deny, reason := e.EnforcePart(r, "302", "sess-bound"); !deny || reason != SessionIdentityMismatch {
 		t.Fatalf("tokenless use of bound session must deny: %v %q", deny, reason)
+	}
+}
+
+func TestManifestBindingEnforced(t *testing.T) {
+	e := &Engine{Store: NewMemoryStore()}
+	_, _ = e.Store.Create(context.Background(), Session{
+		PlexSessionID: "sess-mb", RatingKey: "999", SelectedMediaIndex: 1,
+		IdentityID: "ident-1", ClientUUID: "client-1",
+		PlaybackMode: "directStream",
+	})
+	// Tokenless manifest against a bound session: binding unprovable.
+	r := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=sess-mb&mediaIndex=1", nil)
+	if _, deny, reason := e.EnforcePart(r, "", "sess-mb"); !deny || reason != SessionIdentityMismatch {
+		t.Fatalf("manifest must prove session binding: %v %q", deny, reason)
 	}
 }

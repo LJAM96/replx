@@ -45,7 +45,7 @@ func TestLiveLoadEffective(t *testing.T) {
 	}
 	var identityID string
 	if err := db.QueryRow(ctx, `INSERT INTO plex_identities(server_id, plex_account_id, username, identity_type)
-		VALUES($1,4242,'jodie','user') RETURNING id`).Scan(&identityID); err != nil {
+		VALUES($1,4242,'jodie','user') RETURNING id`, serverID).Scan(&identityID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(ctx, `INSERT INTO policies(server_id, scope_type, scope_id, name, config)

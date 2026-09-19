@@ -50,7 +50,7 @@ func TestLiveStatelessBoundary(t *testing.T) {
 	seedVariant(0, 3840, 2160, "HDR10")
 	seedVariant(1, 1920, 1080, "SDR")
 	if err := db.QueryRow(ctx, `INSERT INTO plex_identities(server_id, plex_account_id, username, identity_type)
-		VALUES($1,4242,'jodie','user') RETURNING id`).Scan(&identityID); err != nil {
+		VALUES($1,4242,'jodie','user') RETURNING id`, serverID).Scan(&identityID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(ctx, `INSERT INTO plex_token_identities(server_id, identity_id, token_fingerprint, token_status)

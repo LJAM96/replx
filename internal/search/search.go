@@ -44,12 +44,18 @@ func Candidates(ctx context.Context, db database.DBTX, serverID, query string, l
 	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	var stale int
-	if err := db.QueryRow(cctx, `SELECT count(*) FROM libraries l WHERE l.server_id=$1
-		AND NOT EXISTS(SELECT 1 FROM sync_cursors c WHERE c.server_id=$1 AND c.sync_type='section'
+	var total, stale int
+	if err := db.QueryRow(cctx, `SELECT count(*),
+		count(*) FILTER (WHERE NOT EXISTS(SELECT 1 FROM sync_cursors c WHERE c.server_id=l.server_id AND c.sync_type='section'
 			AND c.library_id=l.id AND c.status='complete'
-			AND c.last_completed_at > now() - make_interval(hours => 12))`, serverID).Scan(&stale); err != nil || stale > 0 {
+			AND c.last_completed_at > now() - make_interval(hours => 12)))
+		FROM libraries l WHERE l.server_id=$1`, serverID).Scan(&total, &stale); err != nil {
 		return nil, false, err
+	}
+	// Zero libraries means nothing has ever synced: not ready, never
+	// vacuously fresh.
+	if total == 0 || stale != 0 {
+		return nil, false, nil
 	}
 	rows, err := db.Query(cctx, `SELECT rating_key, title, item_type, year, COALESCE(thumb,'') FROM library_items
 		WHERE server_id=$1 AND (

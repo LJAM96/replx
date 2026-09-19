@@ -147,8 +147,8 @@ func TestLiveFullSyncAndSweep(t *testing.T) {
 		t.Fatalf("guids=%d", n)
 	}
 	var dr string
-	if err := db.QueryRow(ctx, `SELECT normalized_dynamic_range FROM media_variants WHERE plex_media_id='22'`).Scan(&dr); err != nil || dr != DRHDR10 {
-		t.Fatalf("4K variant DR: %q %v", dr, err)
+	if err := db.QueryRow(ctx, `SELECT normalized_dynamic_range FROM media_variants WHERE plex_media_id='22'`).Scan(&dr); err != nil || dr != DRHDROther {
+		t.Fatalf("bare HDR must stay HDR_OTHER, never assumed HDR10: %q %v", dr, err)
 	}
 	// Cursor completed and resume works: light pass must not refetch items.
 	allBefore := fx.mu.Load()

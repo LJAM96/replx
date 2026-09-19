@@ -104,10 +104,12 @@ func (e *Engine) checkSessionBinding(r *http.Request, sess Session) (bool, strin
 	return false, ""
 }
 
-// bindingMismatch is pure for unit testing: stored bindings must match
-// the current request whenever both sides are known. Unknown current
-// identity against a bound session mismatches (fail closed); unbound
-// sessions (both stored empty) never mismatch.
+// bindingMismatch is pure for unit testing: a session that names an
+// identity or client must be proven by the requester. Unknown current
+// identity against a bound session mismatches (fail closed), and so does
+// an absent current client against a bound one: the requester proves the
+// binding or media does not flow. Unbound sessions (both stored empty,
+// e.g. pre-binding history) never mismatch.
 func bindingMismatch(storedIdentity, storedClient, curIdentity, curClient string) bool {
 	if storedIdentity == "" && storedClient == "" {
 		return false
@@ -115,7 +117,7 @@ func bindingMismatch(storedIdentity, storedClient, curIdentity, curClient string
 	if storedIdentity != "" && storedIdentity != curIdentity {
 		return true
 	}
-	if storedClient != "" && curClient != "" && storedClient != curClient {
+	if storedClient != "" && storedClient != curClient {
 		return true
 	}
 	return false
@@ -213,6 +215,9 @@ func (e *Engine) enforceManifest(r *http.Request, sessionID string) (string, boo
 		// the engine would have tracked, so PMS itself would fail this
 		// too. Deny explicitly rather than allow an untracked transcode.
 		return "", true, DecisionRequired
+	}
+	if deny, reason := e.checkSessionBinding(r, sess); deny {
+		return "", true, reason
 	}
 	// The manifest must stay on the negotiated variant: a client that
 	// re-requests a different mediaIndex after the decision is retrying
