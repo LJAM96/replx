@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/cache"
 	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/gateway"
@@ -25,6 +26,7 @@ import (
 	"github.com/LJAM96/replx/internal/requestid"
 	"github.com/LJAM96/replx/internal/routing"
 	"github.com/LJAM96/replx/internal/trace"
+	"github.com/LJAM96/replx/internal/warmer"
 )
 
 // RequestIDHeader is returned on every control response. Plex clients
@@ -58,6 +60,17 @@ type SpikeResolver interface {
 	Resolve(r *http.Request, requestID string) (location string, ok bool)
 }
 
+// PlaybackEngine enforces policy at negotiation and session boundaries.
+// Nil preserves transparent proxy behaviour.
+type PlaybackEngine interface {
+	// HandleDecision intercepts one universal negotiation request,
+	// reporting whether it wrote the response.
+	HandleDecision(w http.ResponseWriter, r *http.Request, id, fingerprint, sessionID string) bool
+	// EndSession closes playback sessions on stop verbs. Best-effort:
+	// it must never break the proxied control flow.
+	EndSession(r *http.Request)
+}
+
 // Options configures the proxy handler.
 type Options struct {
 	// OriginBase is the server-to-server PMS URL, e.g. https://origin:32400.
@@ -75,6 +88,15 @@ type Options struct {
 	// Cache is the user-scoped browse response store (Zeta). Nil
 	// disables caching: every control response falls through to origin.
 	Cache cache.Store
+	// Warmer tracks freshly stored entries for background refresh. Nil
+	// disables tracking; caching still works, entries just expire cold.
+	Warmer *warmer.Warmer
+	// Playback, when non-nil, intercepts universal negotiation for policy
+	// enforcement and closes sessions on stop verbs.
+	Playback PlaybackEngine
+	// Artwork is the shared filesystem transcode cache (Eta). Nil
+	// disables it; artwork falls through to origin uncached.
+	Artwork *artwork.Store
 	// Client overrides the origin HTTP client (tests). Nil uses a default
 	// client with a 30s response-header timeout.
 	Client *http.Client
@@ -85,15 +107,18 @@ type Options struct {
 
 // Handler proxies Plex requests to the origin PMS.
 type Handler struct {
-	origin  *url.URL
-	mode    string
-	spike   SpikeResolver
-	log     *logging.Logger
-	secret  string
-	metrics *metrics.Registry
-	capture *capture.Store
-	cache   cache.Store
-	client  *http.Client
+	origin   *url.URL
+	mode     string
+	spike    SpikeResolver
+	log      *logging.Logger
+	secret   string
+	metrics  *metrics.Registry
+	capture  *capture.Store
+	cache    cache.Store
+	warmer   *warmer.Warmer
+	playback PlaybackEngine
+	artwork  *artwork.Store
+	client   *http.Client
 }
 
 // New validates options and returns a Handler.
@@ -116,7 +141,8 @@ func New(opts Options) (*Handler, error) {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
 	return &Handler{origin: base, mode: opts.IngressMode, log: opts.Logger, secret: opts.Secret,
-		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, client: client, spike: opts.Spike}, nil
+		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, warmer: opts.Warmer,
+		playback: opts.Playback, artwork: opts.Artwork, client: client, spike: opts.Spike}, nil
 }
 
 // obs is the per-request Beta observability identity: fingerprinted user,
@@ -232,10 +258,97 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.serveStreaming(w, r, id, o, start) {
 		return
 	}
+	if routeClass == "control" && h.playback != nil {
+		if gateway.IsSessionStop(r.URL.Path) {
+			h.playback.EndSession(r)
+		}
+		if gateway.IsDecision(r.URL.Path) {
+			if h.playback.HandleDecision(w, r, id, o.fingerprint, o.session) {
+				return
+			}
+		}
+	}
+	if routeClass == "control" && h.serveArtwork(w, r, id, o, start) {
+		return
+	}
 	if routeClass == "control" && h.serveCache(w, r, id, &o, start) {
 		return
 	}
 	h.proxy(w, r, id, o, routeClass, start)
+}
+
+// serveArtwork serves shared filesystem transcodes. Entries key on URL
+// plus transformation only, so one origin fetch serves every authorized
+// user; anonymous requests bypass (authorization to reference required).
+func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) bool {
+	if h.artwork == nil || o.fingerprint == "" || !artwork.Match(r.URL.Path) {
+		return false
+	}
+	key := artwork.Key(r.URL.Path, r.URL.Query())
+	if ct, body, ok := h.artwork.Get(key); ok {
+		o.cacheState = "hit"
+		if h.metrics != nil {
+			h.metrics.IncCacheHit()
+			h.metrics.ObserveHTTP("control", http.StatusOK, time.Since(start))
+		}
+		w.Header().Set(RequestIDHeader, id)
+		w.Header().Set(CacheHeader, "hit")
+		if ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+		h.emit(r, id, o, "control", http.StatusOK, start, map[string]any{"bodyBytes": len(body), "artwork": true})
+		return true
+	}
+	target := *h.origin
+	target.Path = singleJoin(h.origin.Path, r.URL.Path)
+	target.RawPath = ""
+	target.RawQuery = r.URL.RawQuery
+	out, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), nil)
+	if err != nil {
+		return false
+	}
+	copyHeaders(out.Header, r.Header)
+	out.Header.Set(RequestIDHeader, id)
+	if host := clientIP(r); host != "" {
+		prior := out.Header.Get("X-Forwarded-For")
+		if prior != "" {
+			host = prior + ", " + host
+		}
+		out.Header.Set("X-Forwarded-For", host)
+	}
+	out.Host = h.origin.Host
+	originStart := time.Now()
+	resp, err := h.client.Do(out) //nolint:gosec // target is admin-configured origin only
+	if h.metrics != nil {
+		h.metrics.ObserveOrigin(time.Since(originStart), err != nil)
+	}
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, artwork.MaxBodyBytes+1))
+	if err != nil || int64(len(body)) > artwork.MaxBodyBytes {
+		// Oversize or unreadable: decline the artwork fast path so the
+		// normal proxy streams it uncached. Nothing written yet.
+		return false
+	}
+	if resp.StatusCode == http.StatusOK {
+		_ = h.artwork.Set(key, resp.Header.Get("Content-Type"), body)
+	}
+	o.cacheState = "miss"
+	if h.metrics != nil {
+		h.metrics.IncCacheMiss()
+		h.metrics.ObserveHTTP("control", resp.StatusCode, time.Since(start))
+	}
+	copyHeaders(w.Header(), resp.Header)
+	w.Header().Set(RequestIDHeader, id)
+	w.Header().Set(CacheHeader, "miss")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+	h.emit(r, id, o, "control", resp.StatusCode, start, map[string]any{"bodyBytes": len(body), "artwork": true})
+	return true
 }
 
 func (h *Handler) writeMediaRedirect(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time, location string) {
@@ -338,6 +451,16 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 		ContentType: resp.Header.Get("Content-Type"),
 		Body:        body,
 	}, o.cacheTTL)
+	if h.warmer != nil {
+		h.warmer.Track(o.cacheKey, warmer.Snapshot{
+			Method:      r.Method,
+			Path:        r.URL.Path,
+			RawQuery:    r.URL.RawQuery,
+			Accept:      r.Header.Get("Accept"),
+			Fingerprint: o.fingerprint,
+			TTL:         o.cacheTTL,
+		})
+	}
 	return n
 }
 

@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,8 @@ import (
 	"github.com/LJAM96/replx/internal/health"
 	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/spike"
+	syncpkg "github.com/LJAM96/replx/internal/sync"
+	"github.com/LJAM96/replx/internal/warmer"
 )
 
 func TestSetupGate(t *testing.T) {
@@ -154,5 +158,91 @@ func TestCacheStats(t *testing.T) {
 	m.ServeHTTP(anonRec, anon)
 	if anonRec.Code != http.StatusUnauthorized {
 		t.Fatalf("cache stats must gate, got %d", anonRec.Code)
+	}
+}
+
+func TestCacheStatsWarmerBlock(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	m.SetMetrics(&metrics.Registry{})
+	m.SetWarmer(func() warmer.Stats { return warmer.Stats{Tracked: 3, Refreshed: 9, OwnerWarming: true} })
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/cache/stats", nil)
+	req.Header.Set("Authorization", "Bearer tok123")
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, `"tracked":3`) || !strings.Contains(body, `"warmed":0`) {
+		t.Fatalf("cache stats warmer: %d %s", rec.Code, body)
+	}
+}
+
+func TestValidatePolicy(t *testing.T) {
+	if _, err := validatePolicy("global", "", "g", json.RawMessage(`{"allowTranscode":"deny"}`)); err != nil {
+		t.Fatalf("valid global: %v", err)
+	}
+	if _, err := validatePolicy("user", "some-uuid", "u", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("valid user: %v", err)
+	}
+	for _, tc := range []struct {
+		name, scope, id, pname, cfg string
+	}{
+		{"bad-scope", "tenant", "", "x", `{}`},
+		{"global-with-id", "global", "uuid", "x", `{}`},
+		{"user-no-id", "user", "", "x", `{}`},
+		{"no-name", "global", "", "", `{}`},
+		{"bad-json", "global", "", "x", `{oops`},
+		{"bad-tristate", "global", "", "x", `{"allowHDR":"maybe"}`},
+		{"bad-routing", "global", "", "x", `{"routingMode":"teleport"}`},
+	} {
+		if _, err := validatePolicy(tc.scope, tc.id, tc.pname, json.RawMessage(tc.cfg)); err == nil {
+			t.Errorf("%s must fail validation", tc.name)
+		}
+	}
+}
+
+type stubSync struct {
+	status []syncpkg.CursorStatus
+	err    error
+	calls  int
+}
+
+func (s *stubSync) Status(ctx context.Context) ([]syncpkg.CursorStatus, error) {
+	return s.status, s.err
+}
+
+func (s *stubSync) SyncOnce(ctx context.Context, full bool) error {
+	s.calls++
+	return s.err
+}
+
+func TestSyncEndpoints(t *testing.T) {
+	ctx := context.Background()
+	_ = ctx
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	m.SetSync(nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sync/status", nil)
+	req.Header.Set("Authorization", "Bearer tok123")
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"disabled":true`) {
+		t.Fatalf("disabled sync: %d %s", rec.Code, rec.Body.String())
+	}
+
+	stub := &stubSync{status: []syncpkg.CursorStatus{{SyncType: "libraries", Status: "complete"}}}
+	m2 := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	m2.SetSync(stub)
+	post := httptest.NewRequest(http.MethodPost, "/api/v1/sync/full", nil)
+	post.Header.Set("Authorization", "Bearer tok123")
+	postRec := httptest.NewRecorder()
+	m2.ServeHTTP(postRec, post)
+	if postRec.Code != http.StatusOK || stub.calls != 1 {
+		t.Fatalf("sync full: %d calls=%d %s", postRec.Code, stub.calls, postRec.Body.String())
+	}
+	// Immediate repeat trips the 5-minute rate limit.
+	post2 := httptest.NewRequest(http.MethodPost, "/api/v1/sync/full", nil)
+	post2.Header.Set("Authorization", "Bearer tok123")
+	postRec2 := httptest.NewRecorder()
+	m2.ServeHTTP(postRec2, post2)
+	if postRec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate limit: %d", postRec2.Code)
 	}
 }

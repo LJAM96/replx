@@ -13,12 +13,14 @@ package spike
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/LJAM96/replx/internal/delegation"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/routing"
+	"github.com/LJAM96/replx/internal/trace"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -46,10 +48,14 @@ type Store struct {
 	// FetchTransient mints a delegation token under the caller's token.
 	// Only transient tokens ever enter a redirect Location.
 	FetchTransient func(ctx context.Context, internalOrigin, userToken string) (string, error)
-	PublicHost     string
-	Logger         *logging.Logger
-	mu             sync.Mutex
-	events         []Event
+	// PartPolicy enforces the Epsilon part boundary: substitute returns
+	// an allowed part key replacing the requested path, deny fails
+	// closed. Nil preserves pure ADR 001 redirect behaviour.
+	PartPolicy func(r *http.Request, partID, sessionID string) (substituteKey string, deny bool, reason string)
+	PublicHost string
+	Logger     *logging.Logger
+	mu         sync.Mutex
+	events     []Event
 }
 
 // NewPostgresStore builds a Store reading the onboarded server row.
@@ -93,6 +99,27 @@ func (s *Store) Resolve(r *http.Request, requestID string) (string, bool) {
 		s.record(base)
 		return "", false
 	}
+	uri := r.URL.RequestURI()
+	if s.PartPolicy != nil {
+		if partID := partIDFromPath(r.URL.Path); partID != "" {
+			substitute, deny, reason := s.PartPolicy(r, partID, trace.ExtractSession(r))
+			if deny {
+				base.Decision, base.Reason = "unavailable", reason
+				if reason == "" {
+					base.Reason = "part boundary denied"
+				}
+				s.record(base)
+				return "", false
+			}
+			if substitute != "" {
+				uri = substitute
+				if q := r.URL.RawQuery; q != "" && !strings.Contains(substitute, "?") {
+					uri += "?" + q
+				}
+				base.Decision = "substituted"
+			}
+		}
+	}
 	transient, err := s.FetchTransient(r.Context(), internalOrigin, userToken)
 	userToken = ""
 	if err != nil {
@@ -100,14 +127,17 @@ func (s *Store) Resolve(r *http.Request, requestID string) (string, bool) {
 		s.record(base)
 		return "", false
 	}
-	loc, err := routing.BuildDirectOriginURL(mediaOrigin, r.URL.RequestURI(), transient, s.PublicHost)
+	loc, err := routing.BuildDirectOriginURL(mediaOrigin, uri, transient, s.PublicHost)
 	transient = ""
 	if err != nil {
 		base.Decision, base.Reason = "unavailable", err.Error()
 		s.record(base)
 		return "", false
 	}
-	base.Decision, base.RedactedLocation = "redirected", routing.RedactedLocation(loc)
+	if base.Decision == "" {
+		base.Decision = "redirected"
+	}
+	base.RedactedLocation = routing.RedactedLocation(loc)
 	s.record(base)
 	return loc, true
 }
@@ -143,6 +173,17 @@ func (s *Store) record(e Event) {
 		s.Logger.Log(logging.Entry{Level: "info", Component: "routing.spike",
 			RequestID: e.RequestID, Method: e.Method, Path: e.Path, Fields: fields})
 	}
+}
+
+// partIDFromPath extracts the origin part ID from /library/parts/<id>/....
+func partIDFromPath(path string) string {
+	segs := strings.Split(strings.ToLower(path), "/")
+	for i := 0; i+2 < len(segs); i++ {
+		if segs[i] == "library" && segs[i+1] == "parts" && segs[i+2] != "" {
+			return segs[i+2]
+		}
+	}
+	return ""
 }
 
 // ExtractToken returns the user-scoped token the client presented: header

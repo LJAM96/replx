@@ -28,19 +28,25 @@ import (
 	"time"
 
 	"github.com/LJAM96/replx/internal/admin"
+	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/cache"
 	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/config"
+	"github.com/LJAM96/replx/internal/crypto"
 	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/health"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/onboarding"
+	"github.com/LJAM96/replx/internal/playback"
 	"github.com/LJAM96/replx/internal/plextv"
 	"github.com/LJAM96/replx/internal/pms"
 	"github.com/LJAM96/replx/internal/proxy"
+	"github.com/LJAM96/replx/internal/retention"
 	"github.com/LJAM96/replx/internal/spike"
+	syncpkg "github.com/LJAM96/replx/internal/sync"
 	"github.com/LJAM96/replx/internal/valkey"
+	"github.com/LJAM96/replx/internal/warmer"
 )
 
 var version = "dev"
@@ -172,6 +178,59 @@ func runServe() error {
 		logger.Log(logging.Entry{Level: "warn", Component: "cache",
 			Fields: map[string]any{"event": "cache_degraded", "reason": "valkey unreachable; browse falls through to origin"}})
 	}
+	cacheStore := cache.NewValkeyStore(cacheClient)
+	// Owner warmer: refreshes due owner-scoped entries ahead of TTL
+	// expiry. The provider decrypts the stored PMS token per cycle; no
+	// owner material is retained between cycles.
+	ownerPMSToken := func(ctx context.Context) (string, bool) {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		var serverID string
+		if err := db.Raw().QueryRow(cctx, `SELECT id FROM plex_servers
+			WHERE enabled ORDER BY created_at DESC LIMIT 1`).Scan(&serverID); err != nil {
+			return "", false
+		}
+		var ct []byte
+		if err := db.Raw().QueryRow(cctx, `SELECT pms_access_token_ciphertext
+			FROM plex_owner_credentials WHERE server_id=$1`, serverID).Scan(&ct); err != nil {
+			return "", false
+		}
+		pt, err := crypto.Decrypt(cfg.SecretKey, onboarding.PurposePMSToken, ct)
+		if err != nil {
+			return "", false
+		}
+		return string(pt), true
+	}
+	warm := warmer.New(cacheStore, cfg.OriginInternalURL, cfg.SecretKey, ownerPMSToken, logger, registry)
+	go warm.Run(ctx, 15*time.Second)
+	// Eta artwork: shared filesystem transcode cache with oldest-first
+	// janitor. Directory failure degrades to uncached artwork, never to
+	// failed startup.
+	var artworkStore *artwork.Store
+	if art, err := artwork.New(cfg.ArtworkDir, cfg.ArtworkMaxGB); err != nil {
+		logger.Log(logging.Entry{Level: "warn", Component: "cache",
+			Fields: map[string]any{"event": "artwork_degraded", "error": err.Error()}})
+	} else {
+		artworkStore = art
+		go art.Run(ctx, 30*time.Minute)
+	}
+	// Gamma index: owner library sync plus the PMS event consumer. Both
+	// run behind the single-replica worker loops; absence of credentials
+	// (pre-onboarding) idles them without failing startup.
+	syncWorker := syncpkg.New(db.Raw(), cfg.OriginInternalURL, ownerPMSToken, logger, registry)
+	go syncWorker.Run(ctx)
+	go syncWorker.Subscribe(ctx)
+	// Epsilon enforcement: negotiation interception plus the raw-part
+	// boundary behind the spike redirector. Sessions persist in Postgres;
+	// absent sessions preserve Alpha allow-through exactly.
+	playbackEngine := &playback.Engine{
+		DB: db.Raw(), Origin: cfg.OriginInternalURL, Logger: logger,
+		Metrics: registry, Store: &playback.PGStore{DB: db.Raw()},
+		LoadPolicy: playback.DefaultPolicyLoader(db.Raw()),
+	}
+	if spikeStore != nil {
+		spikeStore.PartPolicy = playbackEngine.EnforcePart
+	}
 	proxyHandler, err := proxy.New(proxy.Options{
 		OriginBase:  cfg.OriginInternalURL,
 		IngressMode: cfg.IngressMode,
@@ -179,7 +238,10 @@ func runServe() error {
 		Secret:      cfg.SecretKey,
 		Metrics:     registry,
 		Capture:     captureStore,
-		Cache:       cache.NewValkeyStore(cacheClient),
+		Cache:       cacheStore,
+		Warmer:      warm,
+		Playback:    playbackEngine,
+		Artwork:     artworkStore,
 		Spike:       spikeOpt,
 	})
 	if err != nil {
@@ -227,6 +289,13 @@ func runServe() error {
 	}, onboard, setupToken, true, spikeStore, &spikeObs)
 	adminMux.SetMetrics(registry)
 	adminMux.SetCapture(captureStore)
+	adminMux.SetWarmer(warm.Stats)
+	adminMux.SetSync(syncWorker)
+	// Retention janitor: daily purge of playback, trace and audit history.
+	// First pass runs minutes after startup to reclaim long-down backlog.
+	go retention.Run(ctx, db.Raw(), retention.Policy{
+		PlaybackDays: cfg.PlaybackRetentionDays, AuditDays: cfg.AuditRetentionDays,
+	}, logger, 24*time.Hour)
 	fmt.Fprintf(os.Stdout, "replx-edge onboarding panel: http://127.0.0.1:%d/admin/onboarding | spike matrix: http://127.0.0.1:%d/admin/spike\n",
 		cfg.AdminPort, cfg.AdminPort)
 	adminSrv := &http.Server{

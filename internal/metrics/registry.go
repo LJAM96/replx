@@ -17,18 +17,23 @@ import (
 
 // Registry is a concurrency-safe live counter set. Zero value is usable.
 type Registry struct {
-	mu            sync.Mutex
-	reqTotal      map[string]int64
-	reqDurSum     map[string]float64
-	reqDurCount   map[string]int64
-	originTotal   int64
-	originErr     int64
-	originDurSum  float64
-	originDurCnt  int64
-	mediaRedirect int64
-	mediaFailure  map[string]int64
-	cacheHits     int64
-	cacheMisses   int64
+	mu                sync.Mutex
+	reqTotal          map[string]int64
+	reqDurSum         map[string]float64
+	reqDurCount       map[string]int64
+	originTotal       int64
+	originErr         int64
+	originDurSum      float64
+	originDurCnt      int64
+	mediaRedirect     int64
+	mediaFailure      map[string]int64
+	cacheHits         int64
+	cacheMisses       int64
+	cacheWarmed       int64
+	cacheWarmErr      int64
+	syncItems         int64
+	syncErrors        int64
+	playbackDecisions int64
 }
 
 // ObserveHTTP records one control-plane response by route class and status.
@@ -97,16 +102,57 @@ func (r *Registry) IncCacheMiss() {
 	r.cacheMisses++
 }
 
+// IncCacheWarmed counts one background refresh stored by the owner warmer.
+func (r *Registry) IncCacheWarmed() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cacheWarmed++
+}
+
+// IncCacheWarmError counts one failed background refresh. Failures never
+// evict or poison the hot key they attempted.
+func (r *Registry) IncCacheWarmError() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cacheWarmErr++
+}
+
+// IncSyncItemsTotal counts owner-indexed library items.
+func (r *Registry) IncSyncItemsTotal() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.syncItems++
+}
+
+// IncSyncErrorsTotal counts failed sync operations (sections or items).
+func (r *Registry) IncSyncErrorsTotal() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.syncErrors++
+}
+
+// IncPlaybackDecision counts one intercepted negotiation outcome.
+func (r *Registry) IncPlaybackDecision() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.playbackDecisions++
+}
+
 // Snapshot returns a point-in-time copy for tests and diagnostics.
 type Snapshot struct {
-	ReqTotal      map[string]int64
-	ReqDurCount   map[string]int64
-	OriginTotal   int64
-	OriginErrors  int64
-	MediaRedirect int64
-	MediaFailure  map[string]int64
-	CacheHits     int64
-	CacheMisses   int64
+	ReqTotal          map[string]int64
+	ReqDurCount       map[string]int64
+	OriginTotal       int64
+	OriginErrors      int64
+	MediaRedirect     int64
+	MediaFailure      map[string]int64
+	CacheHits         int64
+	CacheMisses       int64
+	CacheWarmed       int64
+	CacheWarmErr      int64
+	SyncItems         int64
+	SyncErrors        int64
+	PlaybackDecisions int64
 }
 
 // Snapshot copies current counters.
@@ -114,14 +160,19 @@ func (r *Registry) Snapshot() Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := Snapshot{
-		ReqTotal:      map[string]int64{},
-		ReqDurCount:   map[string]int64{},
-		MediaFailure:  map[string]int64{},
-		OriginTotal:   r.originTotal,
-		OriginErrors:  r.originErr,
-		MediaRedirect: r.mediaRedirect,
-		CacheHits:     r.cacheHits,
-		CacheMisses:   r.cacheMisses,
+		ReqTotal:          map[string]int64{},
+		ReqDurCount:       map[string]int64{},
+		MediaFailure:      map[string]int64{},
+		OriginTotal:       r.originTotal,
+		OriginErrors:      r.originErr,
+		MediaRedirect:     r.mediaRedirect,
+		CacheHits:         r.cacheHits,
+		CacheMisses:       r.cacheMisses,
+		CacheWarmed:       r.cacheWarmed,
+		CacheWarmErr:      r.cacheWarmErr,
+		SyncItems:         r.syncItems,
+		SyncErrors:        r.syncErrors,
+		PlaybackDecisions: r.playbackDecisions,
 	}
 	for k, v := range r.reqTotal {
 		out.ReqTotal[k] = v
@@ -189,10 +240,20 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	}
 	write(MediaRouteFailuresTotal, "Fail-closed media responses by decision.", "counter", failSamples)
 
-	fmt.Fprintf(w, "# HELP %s User-scoped cache hits (Zeta; zero until the cache lands).\n# TYPE %s counter\n%s %d\n",
+	fmt.Fprintf(w, "# HELP %s User-scoped cache hits.\n# TYPE %s counter\n%s %d\n",
 		CacheHitsTotal, CacheHitsTotal, CacheHitsTotal, r.cacheHits)
-	fmt.Fprintf(w, "# HELP %s User-scoped cache misses (Zeta; zero until the cache lands).\n# TYPE %s counter\n%s %d\n",
+	fmt.Fprintf(w, "# HELP %s User-scoped cache misses.\n# TYPE %s counter\n%s %d\n",
 		CacheMissesTotal, CacheMissesTotal, CacheMissesTotal, r.cacheMisses)
+	fmt.Fprintf(w, "# HELP %s Background refreshes stored by the owner warmer.\n# TYPE %s counter\n%s %d\n",
+		CacheWarmedTotal, CacheWarmedTotal, CacheWarmedTotal, r.cacheWarmed)
+	fmt.Fprintf(w, "# HELP %s Failed background refreshes (hot keys untouched).\n# TYPE %s counter\n%s %d\n",
+		CacheWarmErrorsTotal, CacheWarmErrorsTotal, CacheWarmErrorsTotal, r.cacheWarmErr)
+	fmt.Fprintf(w, "# HELP %s Owner-indexed library items.\n# TYPE %s counter\n%s %d\n",
+		SyncItemsTotal, SyncItemsTotal, SyncItemsTotal, r.syncItems)
+	fmt.Fprintf(w, "# HELP %s Failed sync operations.\n# TYPE %s counter\n%s %d\n",
+		SyncErrorsTotal, SyncErrorsTotal, SyncErrorsTotal, r.syncErrors)
+	fmt.Fprintf(w, "# HELP %s Intercepted negotiation outcomes.\n# TYPE %s counter\n%s %d\n",
+		PlaybackDecisionsTotal, PlaybackDecisionsTotal, PlaybackDecisionsTotal, r.playbackDecisions)
 }
 
 func splitRouteStatus(k string) (route, status string, ok bool) {

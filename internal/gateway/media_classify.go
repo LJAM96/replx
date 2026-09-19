@@ -103,6 +103,21 @@ func IsBulkMediaRoute(path string) bool {
 	return Classify(path) == ActionMediaRedirect
 }
 
+// IsDecision reports playback negotiation endpoints: the small requests
+// the policy engine inspects and rewrites. Distinct from session control
+// (stop/statistics) and from bulk media.
+func IsDecision(path string) bool {
+	return isDecisionOrControl(strings.ToLower(path))
+}
+
+// IsSessionStop reports transcode session termination verbs used to close
+// playback sessions.
+func IsSessionStop(path string) bool {
+	p := strings.ToLower(path)
+	return strings.Contains(p, "/transcode/stop") ||
+		strings.Contains(p, "/transcode/universal/stop")
+}
+
 // IsDeniedUnknownMedia reports unrecognised paths under a media namespace:
 // fail closed in tunnel mode, never proxied as control.
 func IsDeniedUnknownMedia(path string) bool {

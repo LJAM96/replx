@@ -42,7 +42,8 @@ func TestPrometheusExposition(t *testing.T) {
 		HTTPRequestsTotal, HTTPRequestDurationSeconds,
 		OriginRequestsTotal, OriginRequestDurationSeconds, OriginErrorsTotal,
 		MediaOriginRedirectsTotal, MediaRouteFailuresTotal,
-		CacheHitsTotal, CacheMissesTotal,
+		CacheHitsTotal, CacheMissesTotal, CacheWarmedTotal, CacheWarmErrorsTotal,
+		SyncItemsTotal, SyncErrorsTotal, PlaybackDecisionsTotal,
 	} {
 		if !strings.Contains(out, name) {
 			t.Errorf("exposition missing %s", name)

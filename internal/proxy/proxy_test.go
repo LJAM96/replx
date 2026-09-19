@@ -9,11 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/cache"
 	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/trace"
+	"github.com/LJAM96/replx/internal/warmer"
 )
 
 func TestPassthroughPreservesSemantics(t *testing.T) {
@@ -533,5 +535,144 @@ func TestCacheAnonymousBypass(t *testing.T) {
 	}
 	if hits != 2 {
 		t.Fatalf("anonymous must always reach origin, hits=%d", hits)
+	}
+}
+
+func TestWarmerTracksStoredEntry(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte("<ok/>"))
+	}))
+	defer origin.Close()
+	mem := cache.NewMemory()
+	wm := warmer.New(mem, origin.URL, secret, nil, nil, nil)
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: mem, Warmer: wm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+	req.Header.Set("X-Plex-Token", "user-a-token")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if st := wm.Stats(); st.Tracked != 1 {
+		t.Fatalf("stored entry must track, stats=%+v", st)
+	}
+}
+
+type stubPlayback struct {
+	handled    bool
+	ended      []string
+	statusCode int
+}
+
+func (s *stubPlayback) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, session string) bool {
+	if s.handled {
+		w.WriteHeader(s.statusCode)
+		return true
+	}
+	return false
+}
+
+func (s *stubPlayback) EndSession(r *http.Request) {
+	s.ended = append(s.ended, r.URL.Path)
+}
+
+func TestDecisionHookIntercepts(t *testing.T) {
+	contacted := false
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contacted = true
+	}))
+	defer origin.Close()
+	stub := &stubPlayback{handled: true, statusCode: http.StatusForbidden}
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Playback: stub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F1", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || contacted {
+		t.Fatalf("engine must answer without origin: %d contacted=%v", rec.Code, contacted)
+	}
+}
+
+func TestDecisionHookPassthrough(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+	stub := &stubPlayback{}
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Playback: stub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F1", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("passthrough: %d", rec.Code)
+	}
+	stop := httptest.NewRequest(http.MethodGet, "/video/:/transcode/universal/stop?session=abc", nil)
+	h.ServeHTTP(httptest.NewRecorder(), stop)
+	if len(stub.ended) != 1 {
+		t.Fatalf("stop must close session: %+v", stub.ended)
+	}
+}
+
+func TestNoPlaybackPreservesControl(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F1", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("nil engine must proxy decisions: %d", rec.Code)
+	}
+}
+
+func TestArtworkSharedAcrossUsers(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	hits := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write([]byte("thumb-bytes"))
+	}))
+	defer origin.Close()
+	art, err := artwork.New(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Artwork: art})
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/photo/:/transcode?width=480&height=720&url=%2Flibrary%2Fmetadata%2F1%2Fthumb", nil)
+		req.Header.Set("X-Plex-Token", token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	first := get("token-a")
+	second := get("token-b")
+	if first.Header().Get(CacheHeader) != "miss" || second.Header().Get(CacheHeader) != "hit" {
+		t.Fatalf("shared artwork: %s then %s", first.Header().Get(CacheHeader), second.Header().Get(CacheHeader))
+	}
+	if hits != 1 || second.Body.String() != "thumb-bytes" {
+		t.Fatalf("one origin fetch must serve both users: hits=%d", hits)
+	}
+	// Anonymous artwork bypasses: authorization to reference required.
+	anon := httptest.NewRequest(http.MethodGet, "/photo/:/transcode?width=480&height=720", nil)
+	anonRec := httptest.NewRecorder()
+	h.ServeHTTP(anonRec, anon)
+	if anonRec.Header().Get(CacheHeader) == "hit" {
+		t.Fatal("anonymous artwork must never hit shared entries")
 	}
 }

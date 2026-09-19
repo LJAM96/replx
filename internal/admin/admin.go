@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LJAM96/replx/internal/capture"
@@ -26,6 +27,8 @@ import (
 	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/onboarding"
 	"github.com/LJAM96/replx/internal/spike"
+	syncpkg "github.com/LJAM96/replx/internal/sync"
+	"github.com/LJAM96/replx/internal/warmer"
 )
 
 // NewSetupToken generates a per-process bootstrap token.
@@ -39,15 +42,26 @@ func NewSetupToken() (string, error) {
 
 // Mux serves admin routes.
 type Mux struct {
-	mux         *http.ServeMux
-	svc         *onboarding.Service
-	spike       *spike.Store
-	spikeObs    *spike.Observations
-	setupToken  string
-	requireAuth bool
-	sessions    *sessionStore
-	registry    *metrics.Registry
-	cap         *capture.Store
+	mux          *http.ServeMux
+	svc          *onboarding.Service
+	spike        *spike.Store
+	spikeObs     *spike.Observations
+	setupToken   string
+	requireAuth  bool
+	sessions     *sessionStore
+	registry     *metrics.Registry
+	cap          *capture.Store
+	warmerStats  func() warmer.Stats
+	syncWorker   syncpkgWorker
+	syncMu       sync.Mutex
+	lastSyncFull time.Time
+}
+
+// syncpkgWorker is the sync surface admin needs (narrower than *sync.Worker
+// for tests).
+type syncpkgWorker interface {
+	Status(ctx context.Context) ([]syncpkg.CursorStatus, error)
+	SyncOnce(ctx context.Context, full bool) error
 }
 
 type ctxKey struct{}
@@ -71,6 +85,9 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 	m.mux.HandleFunc("/api/v1/spike/events", m.auth(m.handleSpikeEvents))
 	m.mux.HandleFunc("/api/v1/spike/observations", m.auth(m.handleSpikeObservations))
 	m.mux.HandleFunc("/admin/spike", m.auth(m.handleSpikePanel))
+	m.mux.HandleFunc("/api/v1/policies", m.auth(m.handlePolicies))
+	m.mux.HandleFunc("/api/v1/playback/sessions", m.auth(m.handleSessions))
+	m.mux.HandleFunc("/api/v1/compat/status", m.auth(m.handleCompat))
 	return m
 }
 
@@ -103,6 +120,12 @@ func (m *Mux) SetCapture(store *capture.Store) {
 	m.mux.HandleFunc("/api/v1/diagnostics/capture", m.auth(m.handleCapture))
 }
 
+// SetWarmer attaches the owner-warmer snapshot for cache stats. Nil-safe:
+// stats omit the warmer block until wired.
+func (m *Mux) SetWarmer(stats func() warmer.Stats) {
+	m.warmerStats = stats
+}
+
 func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) { m.mux.ServeHTTP(w, r) }
 
 // sessionOf returns the request's bootstrap session, if any.
@@ -130,7 +153,7 @@ func (m *Mux) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(m.setupToken)) == 1 {
-			next(w, r) // API-style auth: no CSRF exposure.
+			next(w, withSubject(r, "setup-token")) // API-style auth: no CSRF exposure.
 			return
 		}
 		sess, ok := m.sessionOf(r)
@@ -149,7 +172,7 @@ func (m *Mux) auth(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
-		next(w, withSession(r, sess))
+		next(w, withSubject(withSession(r, sess), "browser-session"))
 	}
 }
 
@@ -405,16 +428,22 @@ func (m *Mux) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
 		return
 	}
-	var hits, misses int64
+	var hits, misses, warmed, warmErr int64
 	if m.registry != nil {
 		s := m.registry.Snapshot()
-		hits, misses = s.CacheHits, s.CacheMisses
+		hits, misses, warmed, warmErr = s.CacheHits, s.CacheMisses, s.CacheWarmed, s.CacheWarmErr
 	}
-	writeData(w, http.StatusOK, map[string]any{
-		"hits":   hits,
-		"misses": misses,
-		"policy": "GET /hubs/* 2m, /library/collections/* 5m, /library/metadata/* 5m, /library/sections* 5m, /identity 5m; timeline/decisions/media/artwork never; TTL-only invalidation until Gamma events",
-	})
+	data := map[string]any{
+		"hits":     hits,
+		"misses":   misses,
+		"warmed":   warmed,
+		"warmErrs": warmErr,
+		"policy":   "GET /library/sections 5m, /library/sections/* 60s, /library/metadata/* 5m, /library/collections/* 2m, /identity 5m, /hubs/* 30s (CW 15s); timeline/decisions/media never; artwork via filesystem 7d (/photo/:/transcode, shared, auth-required); TTL-only invalidation until Gamma events",
+	}
+	if m.warmerStats != nil {
+		data["warmer"] = m.warmerStats()
+	}
+	writeData(w, http.StatusOK, data)
 }
 
 func (m *Mux) handleSpikeEvents(w http.ResponseWriter, r *http.Request) {

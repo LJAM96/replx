@@ -36,17 +36,40 @@ var secretParams = map[string]bool{
 	"x-plex-token": true, "token": true, "authtoken": true,
 }
 
-// ttlByPrefix maps cacheable path prefixes to TTLs. Longest-prefix match
-// is unnecessary: prefixes are disjoint by construction.
+// ttlByPrefix maps cacheable path prefixes to TTLs. Lookup uses longest
+// prefix match so /library/sections (list, 5m) and /library/sections/
+// (browse pages, 60s) coexist.
+//
+// Hub TTLs exceed the spec table minimums (home 10s, CW 5s, RA 15s) on
+// purpose: the owner warmer renews hot entries at TTL/2, which bounds
+// staleness without churning the origin on every poll. There is no stale
+// serving: expiry is a hard miss.
 var ttlByPrefix = []struct {
 	prefix string
 	ttl    time.Duration
 }{
-	{"/hubs/", 2 * time.Minute},
-	{"/library/collections/", 5 * time.Minute},
+	{"/library/sections/", 60 * time.Second},
+	{"/library/collections/", 2 * time.Minute},
 	{"/library/metadata/", 5 * time.Minute},
 	{"/library/sections", 5 * time.Minute},
 	{"/identity", 5 * time.Minute},
+	{"/hubs/", 30 * time.Second},
+}
+
+// hubTTL refines /hubs/ by feed: Continue Watching and Recently Added
+// change faster than structural hubs.
+func hubTTL(path string) (time.Duration, bool) {
+	p := strings.ToLower(path)
+	if !strings.HasPrefix(p, "/hubs/") {
+		return 0, false
+	}
+	if strings.Contains(p, "continuewatching") {
+		return 15 * time.Second, true
+	}
+	if strings.Contains(p, "recentlyadded") {
+		return 30 * time.Second, true
+	}
+	return 30 * time.Second, true
 }
 
 // Cacheable reports whether a method+path pair is safe to cache and its
@@ -57,12 +80,22 @@ func Cacheable(method, path string) (time.Duration, bool) {
 		return 0, false
 	}
 	p := strings.ToLower(path)
-	for _, e := range ttlByPrefix {
-		if strings.HasPrefix(p, e.prefix) {
-			return e.ttl, true
+	if ttl, ok := hubTTL(p); ok {
+		return ttl, true
+	}
+	best := -1
+	for i, e := range ttlByPrefix {
+		if e.prefix == "/hubs/" {
+			continue // handled above with feed granularity
+		}
+		if strings.HasPrefix(p, e.prefix) && (best < 0 || len(e.prefix) > len(ttlByPrefix[best].prefix)) {
+			best = i
 		}
 	}
-	return 0, false
+	if best < 0 {
+		return 0, false
+	}
+	return ttlByPrefix[best].ttl, true
 }
 
 // ResponseKey builds replx_edge:v1:browse:user:<fingerprint>:<method>:<hash>.

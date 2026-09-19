@@ -3,6 +3,7 @@ package spike
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -120,5 +121,37 @@ func TestRingCaps(t *testing.T) {
 	}
 	if len(s.Events()) != maxEvents {
 		t.Fatalf("ring size: %d", len(s.Events()))
+	}
+}
+
+func TestPartPolicyHook(t *testing.T) {
+	s := stubStore("https://origin.example:32400")
+	s.FetchTransient = func(ctx context.Context, internalOrigin, userToken string) (string, error) {
+		return "transient-tok", nil
+	}
+	s.PartPolicy = func(r *http.Request, partID, sessionID string) (string, bool, string) {
+		if partID == "11" && sessionID == "sess-1" {
+			return "/library/parts/12/file.mp4", false, "substituted"
+		}
+		return "", false, ""
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/parts/11/file.mkv?session=sess-1", nil)
+	req.Header.Set("X-Plex-Token", "user-tok")
+	loc, ok := s.Resolve(req, "req-1")
+	if !ok || !strings.Contains(loc, "/library/parts/12/file.mp4") {
+		t.Fatalf("substitute: %q %v", loc, ok)
+	}
+	events := s.Events()
+	if len(events) == 0 || events[len(events)-1].Decision != "substituted" {
+		t.Fatalf("trace decision: %+v", events)
+	}
+	// Deny fails closed.
+	s.PartPolicy = func(r *http.Request, partID, sessionID string) (string, bool, string) {
+		return "", true, "policy-part-denied"
+	}
+	req2 := httptest.NewRequest(http.MethodGet, "/library/parts/11/file.mkv", nil)
+	req2.Header.Set("X-Plex-Token", "user-tok")
+	if _, ok := s.Resolve(req2, "req-2"); ok {
+		t.Fatal("deny must fail closed")
 	}
 }

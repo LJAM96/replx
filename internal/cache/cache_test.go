@@ -47,17 +47,21 @@ func TestKeyStripsSecretsAndSorts(t *testing.T) {
 }
 
 func TestPolicy(t *testing.T) {
-	allow := []string{
-		"/hubs/home/recentlyAdded",
-		"/library/collections/4317478/children",
-		"/library/metadata/4573984",
-		"/library/sections",
-		"/library/sections/22/all",
-		"/identity",
+	allow := map[string]time.Duration{
+		"/hubs/home/recentlyAdded":              30 * time.Second,
+		"/hubs/home/continueWatching":           15 * time.Second,
+		"/hubs/promoted":                        30 * time.Second,
+		"/hubs/continueWatching/items":          15 * time.Second,
+		"/library/collections/4317478/children": 2 * time.Minute,
+		"/library/metadata/4573984":             5 * time.Minute,
+		"/library/sections":                     5 * time.Minute,
+		"/library/sections/22/all":              60 * time.Second,
+		"/identity":                             5 * time.Minute,
 	}
-	for _, p := range allow {
-		if _, ok := Cacheable("GET", p); !ok {
-			t.Errorf("%s must be cacheable", p)
+	for p, want := range allow {
+		got, ok := Cacheable("GET", p)
+		if !ok || got != want {
+			t.Errorf("%s: want %v ok, got %v %v", p, want, got, ok)
 		}
 	}
 	deny := []string{

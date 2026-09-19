@@ -48,6 +48,15 @@ type Config struct {
 	// SpikeRouting enables the P0 307 media spike. Default off: media
 	// fails closed in tunnel mode until the matrix validates a client.
 	SpikeRouting bool
+	// ArtworkDir is the filesystem artwork cache. ArtworkMaxGB bounds it;
+	// the janitor deletes oldest files first.
+	ArtworkDir   string
+	ArtworkMaxGB int
+	// Retention bounds for high-volume records (days). The janitor
+	// enforces them daily; zero disables a class.
+	TraceRetentionDays    int
+	PlaybackRetentionDays int
+	AuditRetentionDays    int
 }
 
 func getenv(key, def string) string {
@@ -55,6 +64,21 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// intEnv reads an integer env with a fallback default. Unparseable values
+// fall back silently: retention bounds are safe tunables, not fail-fast
+// startup checks.
+func intEnv(key string, def int) int {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 // Load reads configuration from the environment. TUNNEL_TOKEN may be
@@ -77,6 +101,18 @@ func Load() (Config, error) {
 		ValkeyAddr:        getenv("REPLX_EDGE_VALKEY_ADDR", getenv("VALKEY_ADDR", "valkey:6379")),
 		PlexTVBase:        getenv("REPLX_EDGE_PLEXTV_URL", "https://plex.tv"),
 		SpikeRouting:      strings.EqualFold(getenv("REPLX_EDGE_SPIKE_ROUTING", "false"), "true"),
+		ArtworkDir:        getenv("REPLX_EDGE_ARTWORK_DIR", "/data/artwork"),
+	}
+	artGB, err := strconv.Atoi(getenv("REPLX_EDGE_ARTWORK_MAX_GB", "50"))
+	if err != nil || artGB <= 0 || artGB > 10000 {
+		return Config{}, fmt.Errorf("invalid REPLX_EDGE_ARTWORK_MAX_GB")
+	}
+	cfg.ArtworkMaxGB = artGB
+	cfg.TraceRetentionDays = intEnv("REPLX_EDGE_TRACE_RETENTION_DAYS", 7)
+	cfg.PlaybackRetentionDays = intEnv("REPLX_EDGE_PLAYBACK_RETENTION_DAYS", 30)
+	cfg.AuditRetentionDays = intEnv("REPLX_EDGE_AUDIT_RETENTION_DAYS", 180)
+	if cfg.TraceRetentionDays < 0 || cfg.PlaybackRetentionDays < 0 || cfg.AuditRetentionDays < 0 {
+		return Config{}, fmt.Errorf("retention days must not be negative")
 	}
 	adminPort, err := strconv.Atoi(getenv("REPLX_EDGE_ADMIN_PORT", "8080"))
 	if err != nil || adminPort <= 0 || adminPort > 65535 {
