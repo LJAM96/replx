@@ -47,6 +47,7 @@ type Mux struct {
 	spike        *spike.Store
 	spikeObs     *spike.Observations
 	setupToken   string
+	setupIssued  time.Time
 	requireAuth  bool
 	sessions     *sessionStore
 	registry     *metrics.Registry
@@ -55,6 +56,10 @@ type Mux struct {
 	syncWorker   syncpkgWorker
 	syncMu       sync.Mutex
 	lastSyncFull time.Time
+	lastSyncJob  string
+	checks       health.Checks
+	rateMu       sync.Mutex
+	rate         map[string][]time.Time
 }
 
 // syncpkgWorker is the sync surface admin needs (narrower than *sync.Worker
@@ -71,7 +76,7 @@ type ctxKey struct{}
 // (CSRF-checked on mutation). spikeStore may be nil (spike disabled):
 // the events endpoint then reports disabled instead of failing.
 func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, requireAuth bool, spikeStore *spike.Store, spikeObs *spike.Observations) *Mux {
-	m := &Mux{mux: http.NewServeMux(), svc: svc, spike: spikeStore, spikeObs: spikeObs, setupToken: setupToken, requireAuth: requireAuth, sessions: newSessionStore()}
+	m := &Mux{mux: http.NewServeMux(), svc: svc, spike: spikeStore, spikeObs: spikeObs, setupToken: setupToken, setupIssued: time.Now(), requireAuth: requireAuth, sessions: newSessionStore()}
 	m.mux.Handle("/health/", health.AdminMux(checks))
 	m.mux.HandleFunc("/admin/login", m.handleLogin)
 	m.mux.HandleFunc("/admin/logout", m.handleLogout)
@@ -89,6 +94,7 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 	m.mux.HandleFunc("/api/v1/policies", m.auth(m.handlePolicies))
 	m.mux.HandleFunc("/api/v1/playback/sessions", m.auth(m.handleSessions))
 	m.mux.HandleFunc("/api/v1/compat/status", m.auth(m.handleCompat))
+	m.registerMissing(checks)
 	return m
 }
 
@@ -146,6 +152,17 @@ func csrfToken(r *http.Request) string {
 	return ""
 }
 
+func (m *Mux) setupTokenValid(got string) bool {
+	if subtle.ConstantTimeCompare([]byte(got), []byte(m.setupToken)) != 1 {
+		return false
+	}
+	// Single-use setup URL valid 15 minutes from process start.
+	if time.Since(m.setupIssued) > 15*time.Minute {
+		return false
+	}
+	return true
+}
+
 func (m *Mux) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !m.requireAuth {
@@ -153,13 +170,13 @@ func (m *Mux) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(m.setupToken)) == 1 {
+		if got != "" && m.setupTokenValid(got) {
 			next(w, withSubject(r, "setup-token")) // API-style auth: no CSRF exposure.
 			return
 		}
 		sess, ok := m.sessionOf(r)
 		if !ok {
-			writeError(w, http.StatusUnauthorized, "SETUP_TOKEN_REQUIRED", "provide the per-process setup token as Authorization: Bearer, or sign in at /admin/login")
+			writeError(w, http.StatusUnauthorized, "SETUP_TOKEN_REQUIRED", "provide the per-process setup token as Authorization: Bearer (valid 15m from startup), or sign in at /admin/login")
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
@@ -173,7 +190,11 @@ func (m *Mux) auth(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
-		next(w, withSubject(withSession(r, sess), "browser-session"))
+		subj := "browser-session"
+		if sess.subject != "" {
+			subj = sess.subject
+		}
+		next(w, withSubject(withSession(r, sess), subj))
 	}
 }
 
@@ -190,18 +211,39 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 <h1>Replx Edge admin sign in</h1>
 <form method="post"><label>Setup token <input type="password" name="token" size="52"></label>
 <button type="submit">Sign in</button></form>
-<p>The token is printed once in the server log at startup and rotates on restart.</p>
+<form method="post"><label>Username <input name="username"></label> <label>Password <input type="password" name="password"></label>
+<button type="submit">Sign in</button></form>
+<p>The setup token is printed once in the server log at startup, valid 15 minutes. After <code>POST /api/v1/setup</code> creates the admin, sign in with username + password.</p>
 </body></html>`)
 	case http.MethodPost:
 		if err := r.ParseForm(); err != nil {
 			writeError(w, http.StatusBadRequest, "INVALID_BODY", "unparseable form")
 			return
 		}
-		if subtle.ConstantTimeCompare([]byte(r.FormValue("token")), []byte(m.setupToken)) != 1 {
-			writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "wrong setup token")
+		if tok := r.FormValue("token"); tok != "" {
+			if !m.setupTokenValid(tok) {
+				writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "wrong or expired setup token (valid 15m from startup)")
+				return
+			}
+			id, _, err := m.sessions.createWithSubject("setup-token")
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "SESSION_FAILED", "could not create session")
+				return
+			}
+			setSessionCookie(w, id)
+			http.Redirect(w, r, "/admin/onboarding", http.StatusSeeOther)
 			return
 		}
-		id, _, err := m.sessions.create()
+		username, password := r.FormValue("username"), r.FormValue("password")
+		if username == "" || password == "" {
+			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "username and password, or setup token, required")
+			return
+		}
+		if !m.verifyAdmin(r.Context(), username, password) {
+			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "wrong username or password")
+			return
+		}
+		id, _, err := m.sessions.createWithSubject(username)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "SESSION_FAILED", "could not create session")
 			return
@@ -214,11 +256,28 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Mux) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "POST or GET")
+		return
+	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		m.sessions.revoke(c.Value)
 	}
 	clearSessionCookie(w)
 	http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
+}
+
+func (m *Mux) verifyAdmin(ctx context.Context, username, password string) bool {
+	if m.svc == nil {
+		return false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var hash string
+	if err := m.svc.DB.QueryRow(cctx, `SELECT password_hash FROM admin_users WHERE username=$1`, username).Scan(&hash); err != nil {
+		return false
+	}
+	return verifyPassword(hash, password)
 }
 
 func writeData(w http.ResponseWriter, status int, data any) {
@@ -439,7 +498,7 @@ func (m *Mux) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 		"misses":   misses,
 		"warmed":   warmed,
 		"warmErrs": warmErr,
-		"policy":   "GET /library/sections 5m, /library/sections/* 60s, /library/metadata/* 5m, /library/collections/* 2m, /identity 5m, /hubs/* 30s (CW 15s); timeline/decisions/media never; artwork via filesystem 7d (/photo/:/transcode, shared, auth-required); TTL-only invalidation until Gamma events",
+		"policy":   "GET /library/sections 5m, /library/sections/* 60s, /library/metadata/* 5m, /library/collections/* 2m, /identity 5m, /hubs/* 10s (CW 5s, RA 15s, search 30s); timeline/decisions/media never; artwork via filesystem 7d (/photo/:/transcode); stampede single-flight 2s; CW invalidated on timeline/scrobble",
 	}
 	if m.warmerStats != nil {
 		data["warmer"] = m.warmerStats()
@@ -560,6 +619,7 @@ func (m *Mux) handleCapture(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "CAPTURE_FAILED", err.Error())
 			return
 		}
+		m.auditEvent(r.Context(), subjectOf(r), "trace.create", "capture", body.ClientID+"/"+body.RatingKey, map[string]any{"minutes": body.Minutes, "reason": body.Reason})
 		writeData(w, http.StatusCreated, map[string]any{"target": t})
 	case http.MethodDelete:
 		var body struct {

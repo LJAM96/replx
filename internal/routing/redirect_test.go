@@ -29,3 +29,17 @@ func TestBuildRejectsLoopback(t *testing.T) {
 		t.Fatal("expected https requirement")
 	}
 }
+
+func TestBuildRejectsForeignAuthority(t *testing.T) {
+	paths := []string{
+		"//other.example/video/:/transcode/universal/start.m3u8?session=s",
+		"https://other.example/library/parts/1/file.mkv",
+		"http://other.example/library/parts/1/file.mkv",
+	}
+	for _, p := range paths {
+		loc, err := BuildDirectOriginURL("https://trusted.example", p, "transient-secret", "edge.example")
+		if err == nil {
+			t.Errorf("%q must be rejected, built %s", p, RedactedLocation(loc))
+		}
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"github.com/LJAM96/replx/internal/delegation"
 	"github.com/LJAM96/replx/internal/gateway"
 	"github.com/LJAM96/replx/internal/logging"
+	"github.com/LJAM96/replx/internal/playback"
 	"github.com/LJAM96/replx/internal/routing"
 	"github.com/LJAM96/replx/internal/trace"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -84,6 +85,16 @@ func NewPostgresStore(db *pgxpool.Pool, publicHost string, logger *logging.Logge
 		PublicHost:     publicHost,
 		Logger:         logger,
 	}
+}
+
+// BoundaryPolicy exposes the playback part/manifest boundary hook so the
+// proxy can enforce media authorization before transport selection in
+// every ingress mode, including direct mode where no spike redirect runs.
+func (s *Store) BoundaryPolicy() func(r *http.Request, partID, sessionID string) (string, bool, string) {
+	if s == nil {
+		return nil
+	}
+	return s.PartPolicy
 }
 
 // ResolveContext carries the proxy's per-request correlation into the
@@ -193,27 +204,15 @@ func (s *Store) record(e Event) {
 }
 
 // partIDFromPath extracts the origin part ID from /library/parts/<id>/....
+// It delegates to the playback boundary's parser so classification,
+// enforcement and redirect construction agree on one implementation.
 func partIDFromPath(path string) string {
-	segs := strings.Split(strings.ToLower(path), "/")
-	for i := 0; i+2 < len(segs); i++ {
-		if segs[i] == "library" && segs[i+1] == "parts" && segs[i+2] != "" {
-			return segs[i+2]
-		}
-	}
-	return ""
+	return playback.PartIDFromPath(path)
 }
 
 // ExtractToken returns the user-scoped token the client presented: header
-// first, then query. Empty when the client sent none.
+// first, then query. Empty when the client sent none. It delegates to the
+// trace package so authentication agrees on one implementation.
 func ExtractToken(r *http.Request) string {
-	if t := r.Header.Get("X-Plex-Token"); t != "" {
-		return t
-	}
-	q := r.URL.Query()
-	for _, k := range []string{"X-Plex-Token", "token", "authToken"} {
-		if t := q.Get(k); t != "" {
-			return t
-		}
-	}
-	return ""
+	return trace.ExtractToken(r)
 }

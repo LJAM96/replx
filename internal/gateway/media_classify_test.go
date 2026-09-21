@@ -46,6 +46,26 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestSessionsDenyAndPlayQueue(t *testing.T) {
+	if Classify("/status/sessions") != ActionDenySessions {
+		t.Error("/status/sessions must deny")
+	}
+	if !IsSessionsDeny("/status/sessions?X-Plex-Token=x") {
+		t.Error("IsSessionsDeny")
+	}
+	for _, p := range []string{"/playqueues", "/playqueues/123", "/:/playqueue?uri=x"} {
+		if Classify(p) != ActionPlayQueueObserve {
+			t.Errorf("%s must observe, got %v", p, Classify(p))
+		}
+	}
+	// Generic media extensions on unknown routes fail closed as media.
+	for _, p := range []string{"/unknown/route/file.mkv", "/future/video.mp4"} {
+		if Classify(p) != ActionMediaRedirect {
+			t.Errorf("%s must redirect, got %v", p, Classify(p))
+		}
+	}
+}
+
 // TestDocumentedUniversalEndpoints pins the complete currently documented
 // PMS universal transcode surface for both media types, so future
 // classifier edits cannot silently block (or proxy) a known endpoint.

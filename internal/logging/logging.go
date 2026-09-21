@@ -15,18 +15,34 @@ import (
 
 // RedactedHeaders are header names whose values are always REDACTED.
 var RedactedHeaders = map[string]bool{
-	"X-Plex-Token":  true,
-	"Authorization": true,
-	"Cookie":        true,
-	"Set-Cookie":    true,
+	"X-Plex-Token":          true,
+	"Authorization":         true,
+	"Cookie":                true,
+	"Set-Cookie":            true,
+	"X-Owner-JWT":           true,
+	"X-PMS-Token":           true,
+	"X-Tunnel-Token":        true,
+	"X-Replx-Edge-Secret":   true,
+	"Replx-Edge-Secret-Key": true,
 }
 
 // RedactedQueryParams are query keys whose values are always REDACTED.
 var RedactedQueryParams = map[string]bool{
-	"X-Plex-Token": true,
-	"Token":        true,
-	"AuthToken":    true,
-	"authtoken":    true,
+	"X-Plex-Token":  true,
+	"X-Plex-Token ": true,
+	"Token":         true,
+	"token":         true,
+	"AuthToken":     true,
+	"authtoken":     true,
+	"authToken":     true,
+	"ownerJWT":      true,
+	"owner_jwt":     true,
+	"pmsToken":      true,
+	"pms_token":     true,
+	"tunnelToken":   true,
+	"tunnel_token":  true,
+	"secretKey":     true,
+	"secret_key":    true,
 }
 
 // RedactHeaders returns a copy of h with sensitive values replaced.

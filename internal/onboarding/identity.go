@@ -59,6 +59,10 @@ type Service struct {
 	Secret      string
 	PublicURL   string
 	InternalURL string
+	// Log, when non-nil, receives loud operational events (legacy
+	// fallback, revocation, Custom URL configuration). Never receives
+	// tokens.
+	Log func(level, component, msg string, fields map[string]any)
 }
 
 // AppIdentity is the stable installation identity.

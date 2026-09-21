@@ -16,7 +16,10 @@ import (
 
 // BuildDirectOriginURL translates a validated replx-edge part path to a
 // client reachable origin URL. originBase must be https and must not point
-// back at the replx-edge Cloudflare hostname.
+// back at the replx-edge Cloudflare hostname. partPath must be an
+// origin-relative path: any reference carrying its own authority (absolute
+// URL or scheme-relative //host/...) is rejected so a public request can
+// never redirect a delegated token to another host.
 func BuildDirectOriginURL(originBase, partPath, token, replxPublicHost string) (string, error) {
 	if !strings.HasPrefix(partPath, "/") {
 		return "", fmt.Errorf("part path must be absolute")
@@ -41,7 +44,13 @@ func BuildDirectOriginURL(originBase, partPath, token, replxPublicHost string) (
 	if err != nil {
 		return "", fmt.Errorf("invalid part path: %w", err)
 	}
+	if ref.IsAbs() || ref.Host != "" || ref.Opaque != "" {
+		return "", fmt.Errorf("part path must be origin-relative, without authority")
+	}
 	target := base.ResolveReference(ref)
+	if !strings.EqualFold(target.Hostname(), base.Hostname()) || !strings.EqualFold(target.Scheme, base.Scheme) {
+		return "", fmt.Errorf("redirect target escaped the configured origin")
+	}
 	q := target.Query()
 	q.Set("X-Plex-Token", token)
 	target.RawQuery = q.Encode()

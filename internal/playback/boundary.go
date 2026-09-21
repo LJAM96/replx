@@ -69,7 +69,10 @@ func (e *Engine) EnforcePart(r *http.Request, partID, sessionID string) (substit
 	if sess.SelectedPartKey != "" {
 		return sess.SelectedPartKey, false, "substituted"
 	}
-	return "", false, ""
+	// The session names no usable selection (live negotiation predating
+	// persisted selection columns, or evicted index rows): an arbitrary
+	// part must never be permitted. Fail closed and force re-negotiation.
+	return "", true, DecisionRequired
 }
 
 // SessionIdentityMismatch is denied when the request's identity or client
@@ -201,11 +204,19 @@ func (e *Engine) lookupPart(ctx context.Context, partPlexID string) (variantSour
 }
 
 // enforceManifest guards the manifest boundary against clients that retry
-// around the negotiated decision: a session the engine direct-played,
-// followed by a manifest explicitly requesting transcode
-// (directPlay=0&directStream=0), fails closed when the session's stored
-// policy denies transcoding. Anything ambiguous allows: manifests also
-// serve legitimate Direct Stream upgrades the decision phase approved.
+// around the negotiated decision. Every source-defining parameter is bound
+// to the recorded selection:
+//   - the manifest's title (path/key rating key) must equal the negotiated
+//     rating key;
+//   - an explicit transcode request (directPlay=0&directStream=0) fails
+//     closed in every session mode when the stored policy denies
+//     transcoding;
+//   - the media variant must equal the negotiated index; a missing
+//     mediaIndex defaults to the PMS default of 0, and a stored index
+//     below 0 (unreconstructable selection) denies.
+//
+// Anything else fails closed: manifests only exist after a decision the
+// engine tracked.
 func (e *Engine) enforceManifest(r *http.Request, sessionID string) (string, bool, string) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
@@ -219,55 +230,80 @@ func (e *Engine) enforceManifest(r *http.Request, sessionID string) (string, boo
 	if deny, reason := e.checkSessionBinding(r, sess); deny {
 		return "", true, reason
 	}
+	// The manifest must target the negotiated title: a session negotiated
+	// for one rating key must never authorize another title's manifest.
+	if reqRating := trace.ExtractRatingKey(r); reqRating != "" && reqRating != sess.RatingKey {
+		return "", true, policy.OriginMismatch
+	}
+	// An explicit transcode retry fails closed under a transcode-denying
+	// policy in every session mode: a directStream session is not a
+	// license to transcode.
+	q := r.URL.Query()
+	if q.Get("directPlay") == "0" && q.Get("directStream") == "0" {
+		var stored struct {
+			AllowTranscode string `json:"allowTranscode"`
+		}
+		if len(sess.EffectivePolicy) > 0 {
+			_ = json.Unmarshal(sess.EffectivePolicy, &stored)
+		}
+		if strings.EqualFold(stored.AllowTranscode, "deny") {
+			return "", true, "POLICY_TRANSCODE_FORBIDDEN"
+		}
+	}
 	// The manifest must stay on the negotiated variant: a client that
 	// re-requests a different mediaIndex after the decision is retrying
-	// around negotiation. Malformed values fail closed too: a
-	// policy-critical value that cannot be parsed cannot be proven safe.
-	if mi := r.URL.Query().Get("mediaIndex"); mi != "" {
-		n, err := strconv.Atoi(mi)
-		if err != nil || n != sess.SelectedMediaIndex {
+	// around negotiation. A missing mediaIndex defaults to the PMS
+	// default of 0; malformed values fail closed too: a policy-critical
+	// value that cannot be parsed cannot be proven safe.
+	if sess.SelectedMediaIndex < 0 {
+		return "", true, DecisionRequired
+	}
+	n := 0
+	if mi := q.Get("mediaIndex"); mi != "" {
+		var err error
+		n, err = strconv.Atoi(mi)
+		if err != nil || n < 0 {
 			return "", true, policy.OriginMismatch
 		}
 	}
-	if sess.PlaybackMode != "directPlay" {
-		return "", false, ""
+	if n != sess.SelectedMediaIndex {
+		return "", true, policy.OriginMismatch
 	}
-	q := r.URL.Query()
-	if q.Get("directPlay") != "0" || q.Get("directStream") != "0" {
-		return "", false, ""
-	}
-	var stored struct {
-		AllowTranscode string `json:"allowTranscode"`
-	}
-	if len(sess.EffectivePolicy) > 0 {
-		_ = json.Unmarshal(sess.EffectivePolicy, &stored)
-	}
-	if !strings.EqualFold(stored.AllowTranscode, "deny") {
-		return "", false, ""
-	}
-	return "", true, "POLICY_TRANSCODE_FORBIDDEN"
+	return "", false, ""
 }
 
 // sameVariant reports whether a requested part belongs to the session's
 // selected variant (multi-part playback), via the owner index. Unknown
 // parts read as different: substitution, not silent permission.
+// Live-negotiated sessions carry no index UUIDs, so they compare the
+// recorded media index and title instead.
 func (e *Engine) sameVariant(ctx context.Context, sess Session, partPlexID string) bool {
-	if e.DB == nil || partPlexID == "" || sess.SelectedVariantID == "" {
+	if e.DB == nil || partPlexID == "" {
 		return false
 	}
-	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	var variantID string
-	err := e.DB.QueryRow(cctx, `SELECT v.id::text FROM media_parts p
+	if sess.SelectedVariantID != "" {
+		cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		var variantID string
+		err := e.DB.QueryRow(cctx, `SELECT v.id::text FROM media_parts p
 		JOIN media_variants v ON v.id = p.media_variant_id
 		JOIN library_items li ON li.id = v.library_item_id
 		JOIN plex_servers s ON s.id = li.server_id
 		WHERE s.enabled AND p.plex_part_id = $1 AND li.rating_key = $2`,
-		partPlexID, sess.RatingKey).Scan(&variantID)
-	if err != nil {
+			partPlexID, sess.RatingKey).Scan(&variantID)
+		if err != nil {
+			return false
+		}
+		return variantID == sess.SelectedVariantID
+	}
+	if sess.SelectedMediaIndex < 0 || sess.RatingKey == "" {
 		return false
 	}
-	return variantID == sess.SelectedVariantID
+	v, ratingKey, ok := e.lookupPart(ctx, partPlexID)
+	if !ok {
+		return false
+	}
+	return ratingKey == sess.RatingKey && v.MediaIndex == sess.SelectedMediaIndex
 }
 
 // EndSession closes open playback sessions for a Plex session ID.

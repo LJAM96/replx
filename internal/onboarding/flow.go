@@ -68,6 +68,7 @@ func (s *Service) IssuePIN(ctx context.Context) (PINIssue, error) {
 			return PINIssue{}, fmt.Errorf("onboarding: PIN: %w", err)
 		}
 		mode = authModeLegacy
+		s.logLoud("warn", "onboarding", "plex rejected JWT PIN shape; falling back to legacy PIN (no refresh, re-onboarding required on 401)", map[string]any{"mode": mode})
 		if pin, err = tv.CreatePIN(ctx); err != nil {
 			return PINIssue{}, fmt.Errorf("onboarding: PIN: %w", err)
 		}
@@ -158,6 +159,7 @@ func (s *Service) pollByMode(ctx context.Context, tv TVClient, pinID int64, mode
 		if !plextv.IsClientError(err) {
 			return "", fmt.Errorf("onboarding: poll: %w", err)
 		}
+		s.logLoud("warn", "onboarding", "plex rejected JWT poll shape; downgrading to legacy PIN (no refresh)", map[string]any{"mode": authModeLegacy})
 		_ = setSetting(ctx, s.DB, setAuthMode, authModeLegacy)
 	}
 	token, err := tv.PollPIN(ctx, pinID)
@@ -529,6 +531,23 @@ func (s *Service) degraded(serverID string, err error) (bool, error) {
 	_, _ = s.DB.Exec(context.Background(), `UPDATE plex_owner_credentials SET status='auth_degraded',
 		last_error=$1 WHERE server_id=$2`, err.Error(), serverID)
 	return false, fmt.Errorf("onboarding: refresh degraded: %w", err)
+}
+
+// MarkInvalid marks owner credentials invalid after a definitive 401 and
+// requires repair: it never hammers plex.tv/PMS with a revoked credential.
+// Client pass-through with user tokens may continue; owner sync pauses.
+func (s *Service) MarkInvalid(ctx context.Context, cause error) {
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_, _ = s.DB.Exec(cctx, `UPDATE plex_owner_credentials SET status='invalid',
+		last_error=$1 WHERE server_id IN (SELECT id FROM plex_servers WHERE enabled)`, cause.Error())
+	s.logLoud("error", "onboarding", "owner credentials invalid; repair onboarding (no retry hammer)", map[string]any{"error": cause.Error()})
+}
+
+func (s *Service) logLoud(level, component, msg string, fields map[string]any) {
+	if s.Log != nil {
+		s.Log(level, component, msg, fields)
+	}
 }
 
 func publicHost(publicURL string) string {

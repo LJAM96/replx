@@ -70,17 +70,18 @@ func TestKeyStripsSecretsAndSorts(t *testing.T) {
 	if a == json {
 		t.Fatal("representations must never share keys")
 	}
-	if !strings.HasPrefix(a, "replx_edge:v1:browse:user:fp-user-1:GET:") {
+	if !strings.HasPrefix(a, "replx_edge:v1:default:browse:fp-user-1:xml:") {
 		t.Fatalf("key shape: %s", a)
 	}
 }
 
 func TestPolicy(t *testing.T) {
 	allow := map[string]time.Duration{
-		"/hubs/home/recentlyAdded":              30 * time.Second,
-		"/hubs/home/continueWatching":           15 * time.Second,
-		"/hubs/promoted":                        30 * time.Second,
-		"/hubs/continueWatching/items":          15 * time.Second,
+		"/hubs/home/recentlyAdded":              15 * time.Second,
+		"/hubs/home/continueWatching":           5 * time.Second,
+		"/hubs/promoted":                        10 * time.Second,
+		"/hubs/continueWatching/items":          5 * time.Second,
+		"/hubs/search":                          30 * time.Second,
 		"/library/collections/4317478/children": 2 * time.Minute,
 		"/library/metadata/4573984":             5 * time.Minute,
 		"/library/sections":                     5 * time.Minute,

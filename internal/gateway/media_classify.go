@@ -20,6 +20,15 @@ const (
 	// namespace. Uncertainty is not control: in tunnel mode it fails
 	// closed rather than risking bulk bytes through Cloudflare.
 	ActionDenyUnknownMedia
+	// ActionDenySessions is GET /status/sessions on the public control
+	// listener. It is owner-admin only via the private admin API and is
+	// never proxied to PMS with another user's context.
+	ActionDenySessions
+	// ActionPlayQueueObserve is play queue creation: observed for
+	// correlation (rating key, media index, session) but never rewritten
+	// in 1.0. Enforcement stays at the universal decision and the raw
+	// part or manifest boundary.
+	ActionPlayQueueObserve
 )
 
 // Classify returns the routing action for a path.
@@ -34,6 +43,10 @@ const (
 func Classify(path string) MediaRouteAction {
 	p := strings.ToLower(path)
 	switch {
+	case IsSessionsDeny(p):
+		return ActionDenySessions
+	case IsPlayQueue(p):
+		return ActionPlayQueueObserve
 	case strings.HasPrefix(p, "/library/parts/"):
 		return ActionMediaRedirect
 	case isDecisionOrControl(p):
@@ -46,6 +59,11 @@ func Classify(path string) MediaRouteAction {
 		return ActionControl
 	case inTranscodeNamespace(p):
 		return ActionDenyUnknownMedia
+	case isMediaExtension(p):
+		// Unknown route carrying a media file extension: treat as bulk
+		// media so tunnel mode fails closed instead of silently proxying
+		// video through the Cloudflare control hostname.
+		return ActionMediaRedirect
 	default:
 		return ActionControl
 	}
@@ -96,6 +114,43 @@ func isSessionControl(p string) bool {
 	return strings.Contains(p, "/transcode/stop") ||
 		strings.Contains(p, "/transcode/universal/stop") ||
 		strings.Contains(p, "/transcode/statistics")
+}
+
+// IsSessionsDeny reports GET /status/sessions on the public control
+// listener: owner-admin only via the private admin API, never proxied.
+func IsSessionsDeny(path string) bool {
+	p := strings.ToLower(path)
+	return strings.HasPrefix(p, "/status/sessions")
+}
+
+// IsPlayQueue reports play queue creation routes: observed for correlation
+// only, never rewritten in 1.0.
+func IsPlayQueue(path string) bool {
+	p := strings.ToLower(path)
+	return strings.Contains(p, "/playqueues") || strings.Contains(p, "/playqueue")
+}
+
+// isMediaExtension matches generic media file extensions on otherwise
+// unknown routes so they fail closed as bulk media in tunnel mode.
+func isMediaExtension(p string) bool {
+	for _, ext := range []string{".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m4s", ".mpd", ".m3u8"} {
+		if strings.Contains(p, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsManifest reports initial HLS/DASH manifest or playlist requests: the
+// entry points whose relative segments then resolve against the redirected
+// origin host. Segment requests are not manifests.
+func IsManifest(path string) bool {
+	return isManifest(strings.ToLower(path))
+}
+
+// IsSegment reports follow-on media segment requests.
+func IsSegment(path string) bool {
+	return isSegment(strings.ToLower(path))
 }
 
 // IsBulkMediaRoute reports whether path carries bulk media bytes.

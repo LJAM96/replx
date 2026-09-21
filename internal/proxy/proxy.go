@@ -9,17 +9,20 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/cache"
 	"github.com/LJAM96/replx/internal/capture"
+	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/gateway"
 	"github.com/LJAM96/replx/internal/identity"
 	"github.com/LJAM96/replx/internal/logging"
@@ -28,6 +31,7 @@ import (
 	"github.com/LJAM96/replx/internal/policy"
 	"github.com/LJAM96/replx/internal/requestid"
 	"github.com/LJAM96/replx/internal/routing"
+	"github.com/LJAM96/replx/internal/search"
 	"github.com/LJAM96/replx/internal/spike"
 	"github.com/LJAM96/replx/internal/trace"
 	"github.com/LJAM96/replx/internal/warmer"
@@ -112,23 +116,46 @@ type Options struct {
 	// Spike, when non-nil, upgrades fail-closed media to 307 redirects
 	// where it resolves. Resolution failures still fail closed.
 	Spike SpikeResolver
+	// PartPolicy enforces the playback part/manifest boundary. It runs
+	// before transport selection in every ingress mode: tunnel mode
+	// consults it inside the spike resolver, and direct mode consults it
+	// here so a negotiation-skipping client cannot pull a prohibited part
+	// through Replx itself. Nil preserves transparent proxy behaviour.
+	PartPolicy func(r *http.Request, partID, sessionID string) (substituteKey string, deny bool, reason string)
+	// MediaFallbackURL is the optional DNS-only media gateway base URL
+	// (e.g. https://media.example.com). When set and spike resolution
+	// fails in tunnel mode, media 307-redirects there instead of 403.
+	// Empty disables the fallback: requests fail with MEDIA_ROUTE_UNAVAILABLE.
+	MediaFallbackURL string
+	// SearchDB enables local title search (/hubs/search) with PMS fallback.
+	// Nil disables local search: requests fall through to origin.
+	SearchDB database.DBTX
 }
 
 // Handler proxies Plex requests to the origin PMS.
 type Handler struct {
-	origin   *url.URL
-	mode     string
-	spike    SpikeResolver
-	log      *logging.Logger
-	secret   string
-	metrics  *metrics.Registry
-	capture  *capture.Store
-	cache    cache.Store
-	warmer   *warmer.Warmer
-	playback PlaybackEngine
-	artwork  *artwork.Store
-	identity *identity.Resolver
-	client   *http.Client
+	origin        *url.URL
+	mode          string
+	spike         SpikeResolver
+	log           *logging.Logger
+	secret        string
+	metrics       *metrics.Registry
+	capture       *capture.Store
+	cache         cache.Store
+	warmer        *warmer.Warmer
+	playback      PlaybackEngine
+	artwork       *artwork.Store
+	identity      *identity.Resolver
+	client        *http.Client
+	mediaFallback *url.URL
+	searchDB      database.DBTX
+	// partPolicy is the playback boundary hook; see Options.PartPolicy.
+	partPolicy func(r *http.Request, partID, sessionID string) (string, bool, string)
+	// flightMu guards in-flight cacheable origin fetches for stampede
+	// control: one request refreshes an expired object while concurrent
+	// requests for the same key wait bounded for the cache to populate.
+	flightMu sync.Mutex
+	flight   map[string]struct{}
 }
 
 // New validates options and returns a Handler.
@@ -150,10 +177,22 @@ func New(opts Options) (*Handler, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
+	var fallback *url.URL
+	if opts.MediaFallbackURL != "" {
+		fb, err := url.Parse(opts.MediaFallbackURL)
+		if err != nil || fb.Scheme == "" || fb.Host == "" {
+			return nil, fmt.Errorf("proxy: invalid media fallback URL")
+		}
+		if fb.Scheme != "https" {
+			return nil, fmt.Errorf("proxy: media fallback URL must be https")
+		}
+		fallback = fb
+	}
 	return &Handler{origin: base, mode: opts.IngressMode, log: opts.Logger, secret: opts.Secret,
 		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, warmer: opts.Warmer,
 		playback: opts.Playback, artwork: opts.Artwork, identity: opts.Identity,
-		client: client, spike: opts.Spike}, nil
+		client: client, spike: opts.Spike, mediaFallback: fallback, searchDB: opts.SearchDB,
+		partPolicy: opts.PartPolicy}, nil
 }
 
 // obs is the per-request Beta observability identity: fingerprinted user,
@@ -191,7 +230,9 @@ func (h *Handler) observe(r *http.Request) obs {
 		o.scope = "tok:" + o.fingerprint
 		if h.identity != nil {
 			res := h.identity.Resolve(r.Context(), o.fingerprint, token, identity.FromTrace(o.client))
-			if res.Scope != "" {
+			if res.IdentityID != "" {
+				o.scope = cache.UserScope(res.IdentityID)
+			} else if res.Scope != "" {
 				o.scope = res.Scope
 			}
 			o.identityID, o.clientUUID = res.IdentityID, res.ClientID
@@ -240,6 +281,10 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 	}
 	w.Header().Set(RequestIDHeader, id)
 	w.Header().Set(CacheHeader, "hit")
+	// Cloudflare edge cache stays disabled for Plex API routes in 1.0:
+	// Replx Edge owns cache correctness (user-scoped TTLs above).
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
 	if entry.ContentType != "" {
 		w.Header().Set("Content-Type", entry.ContentType)
 	}
@@ -261,10 +306,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(trace.PlaybackTraceHeader, o.playback)
 	}
 
+	// A request target carrying its own authority (absolute URL or
+	// scheme-relative //host/...) must never become an origin fetch or a
+	// redirect target. Reject before classification.
+	if r.URL.Host != "" || strings.HasPrefix(r.URL.Path, "//") {
+		h.writeInvalidPath(w, r, id, o, start)
+		return
+	}
+
 	routeClass := "control"
 	action := gateway.Classify(r.URL.Path)
-	if action == gateway.ActionMediaRedirect {
+	switch action {
+	case gateway.ActionMediaRedirect:
 		routeClass = "media"
+	case gateway.ActionDenySessions:
+		h.writeSessionsDeny(w, r, id, o, start)
+		return
+	case gateway.ActionPlayQueueObserve:
+		// Observe for correlation; enforcement stays at the decision and
+		// part boundaries. Never rewrite queue items in 1.0.
+		h.emit(r, id, o, "control", 0, start, map[string]any{
+			"playQueue": "observed",
+			"uri":       logging.RedactURLString(r.URL.RequestURI()),
+		})
+		// Fall through to control proxy below.
+	case gateway.ActionDenyUnknownMedia:
+		if h.mode == "cloudflare_tunnel" {
+			// Unknown semantics under a media namespace: deny in tunnel mode
+			// (no Cloudflare bytes), pass through in direct mode where no
+			// tunnel invariant is at risk.
+			h.writeMediaUnavailable(w, r, id, o, start, "denied-unknown-transcode")
+			return
+		}
 	}
 
 	if action == gateway.ActionMediaRedirect && h.mode == "cloudflare_tunnel" {
@@ -275,15 +348,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if h.mediaFallback != nil {
+			h.writeMediaGatewayRedirect(w, r, id, o, start)
+			return
+		}
 		h.writeMediaUnavailable(w, r, id, o, start, "unavailable")
 		return
 	}
-	if action == gateway.ActionDenyUnknownMedia && h.mode == "cloudflare_tunnel" {
-		// Unknown semantics under a media namespace: deny in tunnel mode
-		// (no Cloudflare bytes), pass through in direct mode where no
-		// tunnel invariant is at risk.
-		h.writeMediaUnavailable(w, r, id, o, start, "denied-unknown-transcode")
-		return
+	// Media authorization precedes transport selection in direct mode as
+	// well: a client that skips negotiation must not pull a prohibited
+	// part or trigger a forbidden transcode through Replx itself.
+	// Segments stay proxied: their PMS transcode keys only exist after a
+	// policy-checked negotiation, and they carry no stable session binding.
+	if action == gateway.ActionMediaRedirect && h.mode == "direct" {
+		if pol := h.boundaryPolicy(); pol != nil {
+			partID := playback.PartIDFromPath(r.URL.Path)
+			if partID != "" || gateway.IsManifest(r.URL.Path) {
+				sub, deny, reason := pol(r, partID, o.session)
+				if deny {
+					h.writePartDeny(w, r, id, o, start, reason)
+					return
+				}
+				if sub != "" {
+					r = substitutePartRequest(r, sub)
+				}
+			}
+		}
 	}
 	if h.serveStreaming(w, r, id, o, start) {
 		return
@@ -306,10 +396,103 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if routeClass == "control" && h.serveArtwork(w, r, id, o, start) {
 		return
 	}
+	if routeClass == "control" && h.serveSearch(w, r, id, o, start) {
+		return
+	}
 	if routeClass == "control" && h.serveCache(w, r, id, &o, start) {
 		return
 	}
+	// Stampede control: one request refreshes an expired object while
+	// concurrent requests for the same key wait bounded for the cache to
+	// populate, then serve the fresh entry instead of churning origin.
+	if o.cacheable && h.cache != nil {
+		if h.waitForFlight(r.Context(), o.cacheKey) {
+			if h.serveCache(w, r, id, &o, start) {
+				return
+			}
+		}
+		h.beginFlight(o.cacheKey)
+		defer h.endFlight(o.cacheKey)
+		// CW/state invalidation: timeline/scrobble/unscrobble writes
+		// invalidate cached Continue Watching via best-effort delete on
+		// the way through (TTL remains the correctness backstop).
+		defer h.invalidateOnStateWrite(r, o)
+	}
 	h.proxy(w, r, id, o, routeClass, start)
+}
+
+// waitForFlight reports whether another request is already refreshing key.
+// When true the caller should re-check the cache after a bounded wait.
+func (h *Handler) waitForFlight(ctx context.Context, key string) bool {
+	h.flightMu.Lock()
+	if h.flight == nil {
+		h.flight = map[string]struct{}{}
+	}
+	_, inflight := h.flight[key]
+	h.flightMu.Unlock()
+	if !inflight {
+		return false
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(50 * time.Millisecond):
+		}
+		if h.cache == nil {
+			return false
+		}
+		if _, ok, _ := h.cache.Get(ctx, key); ok {
+			return true
+		}
+		h.flightMu.Lock()
+		_, still := h.flight[key]
+		h.flightMu.Unlock()
+		if !still {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) beginFlight(key string) {
+	h.flightMu.Lock()
+	defer h.flightMu.Unlock()
+	if h.flight == nil {
+		h.flight = map[string]struct{}{}
+	}
+	h.flight[key] = struct{}{}
+}
+
+func (h *Handler) endFlight(key string) {
+	h.flightMu.Lock()
+	defer h.flightMu.Unlock()
+	delete(h.flight, key)
+}
+
+// invalidateOnStateWrite clears Continue Watching cache after timeline or
+// scrobble state changes. Best-effort: ValkeyStore.Del errors read as misses
+// and TTLs remain the backstop. Scope-aware: only the writer's scope is cleared.
+func (h *Handler) invalidateOnStateWrite(r *http.Request, o obs) {
+	p := strings.ToLower(r.URL.Path)
+	isStateWrite := strings.Contains(p, "/:/timeline") ||
+		strings.Contains(p, "/:/scrobble") ||
+		strings.Contains(p, "/:/unscrobble")
+	if !isStateWrite || h.cache == nil || o.scope == "" {
+		return
+	}
+	// We cannot enumerate keys from Store; clear the two canonical CW keys
+	// (xml + json) that serveCache would have used for this scope.
+	for _, accept := range []string{"application/xml", "application/json"} {
+		q, _ := url.ParseQuery("")
+		key := cache.ResponseKey(o.scope, "GET", "/hubs/home/continueWatching", q, accept)
+		if vs, ok := h.cache.(*cache.ValkeyStore); ok {
+			_ = vs.Delete(r.Context(), key)
+		} else if m, ok := h.cache.(*cache.Memory); ok {
+			_ = m.Delete(r.Context(), key)
+		}
+	}
 }
 
 // serveArtwork serves account-scoped filesystem transcodes. The scope in
@@ -386,6 +569,65 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 	return true
 }
 
+// serveSearch serves local title candidates for /hubs/search when the owner
+// index is fresh. JSON clients receive a reconstructed MediaContainer;
+// XML and uncertain visibility fall back to PMS (return false). Cast,
+// director, collection and label queries always fall back: the local index
+// covers title/sort_title/original_title only.
+func (h *Handler) serveSearch(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) bool {
+	if h.searchDB == nil || o.fingerprint == "" {
+		return false
+	}
+	p := strings.ToLower(r.URL.Path)
+	if !strings.Contains(p, "/hubs/search") {
+		return false
+	}
+	q := r.URL.Query().Get("query")
+	if q == "" {
+		q = r.URL.Query().Get("q")
+	}
+	if strings.TrimSpace(q) == "" {
+		return false
+	}
+	accept := r.Header.Get("Accept")
+	if !strings.Contains(strings.ToLower(accept), "json") && accept != "" && !strings.Contains(strings.ToLower(r.URL.RawQuery), "json") {
+		// XML reconstruction is not implemented; fall through to PMS.
+		// Still counts as local-search attempt in logs for observability.
+		return false
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	var serverID string
+	if err := h.searchDB.QueryRow(ctx, `SELECT id FROM plex_servers WHERE enabled ORDER BY created_at DESC LIMIT 1`).Scan(&serverID); err != nil {
+		return false
+	}
+	cands, fresh, err := search.Candidates(ctx, h.searchDB, serverID, q, 25)
+	if err != nil || !fresh || len(cands) == 0 {
+		return false
+	}
+	type hubItem struct {
+		RatingKey string `json:"ratingKey"`
+		Title     string `json:"title"`
+		Type      string `json:"type,omitempty"`
+		Year      *int   `json:"year,omitempty"`
+		Thumb     string `json:"thumb,omitempty"`
+	}
+	items := make([]hubItem, 0, len(cands))
+	for _, c := range cands {
+		items = append(items, hubItem{RatingKey: c.RatingKey, Title: c.Title, Type: c.ItemType, Year: c.Year, Thumb: c.Thumb})
+	}
+	body, _ := json.Marshal(map[string]any{"MediaContainer": map[string]any{"size": len(items), "Metadata": items}})
+	w.Header().Set(RequestIDHeader, id)
+	w.Header().Set(CacheHeader, "miss")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	h.emit(r, id, o, "control", http.StatusOK, start, map[string]any{"search": "local", "candidates": len(items)})
+	return true
+}
+
 func (h *Handler) writeMediaRedirect(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time, location string) {
 	routing.WriteMediaRedirect(w, location)
 	if h.metrics != nil {
@@ -397,6 +639,119 @@ func (h *Handler) writeMediaRedirect(w http.ResponseWriter, r *http.Request, id 
 		"location": routing.RedactedLocation(location),
 		"range":    r.Header.Get("Range") != "",
 	})
+}
+
+func (h *Handler) writeMediaGatewayRedirect(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) {
+	target := *h.mediaFallback
+	target.Path = singleJoin(h.mediaFallback.Path, r.URL.Path)
+	target.RawQuery = r.URL.RawQuery
+	routing.WriteMediaRedirect(w, target.String())
+	if h.metrics != nil {
+		h.metrics.ObserveHTTP("media", http.StatusTemporaryRedirect, time.Since(start))
+		h.metrics.IncMediaGatewayRoute()
+	}
+	h.emit(r, id, o, "media", http.StatusTemporaryRedirect, start, map[string]any{
+		"decision": "media-gateway",
+		"location": routing.RedactedLocation(target.String()),
+		"range":    r.Header.Get("Range") != "",
+	})
+}
+
+// writeSessionsDeny refuses public /status/sessions with an explainable
+// 403. Companion control across Replx Edge is unsupported in 1.0;
+// operators use GET /api/v1/sessions on the private admin listener.
+func (h *Handler) writeSessionsDeny(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code":      "SESSIONS_OWNER_ADMIN_ONLY",
+			"message":   "GET /status/sessions is owner-admin only via the private admin API (GET /api/v1/sessions); companion control across Replx Edge is unsupported in 1.0",
+			"requestId": id,
+		},
+	})
+	if h.metrics != nil {
+		h.metrics.ObserveHTTP("control", http.StatusForbidden, time.Since(start))
+	}
+	h.emit(r, id, o, "control", http.StatusForbidden, start, map[string]any{"decision": "sessions-deny"})
+}
+
+// writeInvalidPath rejects request targets carrying their own authority.
+// Such references must never become origin fetches or redirect targets.
+func (h *Handler) writeInvalidPath(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code":      "INVALID_PATH",
+			"message":   "request target must be an origin-relative path",
+			"requestId": id,
+		},
+	})
+	if h.metrics != nil {
+		h.metrics.ObserveHTTP("control", http.StatusBadRequest, time.Since(start))
+	}
+	h.emit(r, id, o, "control", http.StatusBadRequest, start, map[string]any{"decision": "invalid-path"})
+}
+
+// writePartDeny renders a playback-boundary refusal in direct mode: the
+// negotiated selection forbids this part or manifest.
+func (h *Handler) writePartDeny(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time, reason string) {
+	code := reason
+	if code == "" {
+		code = playback.DecisionRequired
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code":      code,
+			"message":   "playback policy forbids this media request",
+			"requestId": id,
+		},
+	})
+	if h.metrics != nil {
+		h.metrics.ObserveHTTP("media", http.StatusForbidden, time.Since(start))
+		h.metrics.IncPolicyRejection()
+	}
+	h.emit(r, id, o, "media", http.StatusForbidden, start, map[string]any{"decision": "part-deny", "code": code})
+}
+
+// boundaryPolicy returns the playback boundary hook: the explicitly wired
+// PartPolicy first, else the spike store's hook (tunnel wiring) so media
+// authorization runs before transport selection in every ingress mode.
+func (h *Handler) boundaryPolicy() func(r *http.Request, partID, sessionID string) (string, bool, string) {
+	if h.partPolicy != nil {
+		return h.partPolicy
+	}
+	if bp, ok := h.spike.(interface {
+		BoundaryPolicy() func(*http.Request, string, string) (string, bool, string)
+	}); ok && bp != nil {
+		return bp.BoundaryPolicy()
+	}
+	return nil
+}
+
+// substitutePartRequest rewrites a prohibited part request to the session's
+// selected allowed part. The substitute is a part key path; the original
+// query is preserved unless the substitute carries its own.
+func substitutePartRequest(r *http.Request, substitute string) *http.Request {
+	path, query := substitute, r.URL.RawQuery
+	if i := strings.Index(substitute, "?"); i >= 0 {
+		path, query = substitute[:i], substitute[i+1:]
+	}
+	if !strings.HasPrefix(path, "/") {
+		return r
+	}
+	r2 := r.Clone(r.Context())
+	u2 := *r2.URL
+	u2.Path, u2.RawPath, u2.RawQuery = path, "", query
+	r2.URL = &u2
+	r2.RequestURI = ""
+	return r2
 }
 
 func (h *Handler) writeMediaUnavailable(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time, decision string) {
@@ -439,6 +794,7 @@ func (h *Handler) writePolicyDeny(w http.ResponseWriter, r *http.Request, id str
 	if h.metrics != nil {
 		h.metrics.ObserveHTTP("control", http.StatusForbidden, time.Since(start))
 		h.metrics.IncPlaybackDecision()
+		h.metrics.IncPolicyRejection()
 	}
 	h.emit(r, id, o, "control", http.StatusForbidden, start,
 		map[string]any{"decision": "deny", "code": deny.Code})
@@ -480,10 +836,23 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	}
 	defer resp.Body.Close()
 
+	// Response-side media guard: in tunnel mode a control-classified route
+	// that returns bulk media bytes must fail closed BEFORE streaming.
+	// This covers unknown large-body media the path classifier could not
+	// predict. Artwork (image/*) and small XML/JSON stay control.
+	if h.mode == "cloudflare_tunnel" && routeClass == "control" && isBulkMediaResponse(resp.Header) {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		h.writeMediaUnavailable(w, r, id, o, start, "response-media-guard")
+		return
+	}
+
 	copyHeaders(w.Header(), resp.Header)
 	w.Header().Set(RequestIDHeader, id)
 	if routeClass == "control" {
 		w.Header().Set(CacheHeader, o.cacheState)
+		// Disable Cloudflare edge caching for Plex API routes.
+		w.Header().Set("CDN-Cache-Control", "no-store")
+		w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
 	}
 	w.WriteHeader(resp.StatusCode)
 	n := h.copyBody(w, r, o, resp)
@@ -663,6 +1032,26 @@ func textprotoCanonical(k string) string {
 		}
 	}
 	return k
+}
+
+// isBulkMediaResponse reports origin responses carrying bulk media bytes:
+// video/*, audio/* (artwork image/* stays control), HLS/DASH manifests.
+// Checked BEFORE streaming in tunnel mode so unknown large-body media
+// fails closed with MEDIA_ROUTE_UNAVAILABLE instead of traversing Cloudflare.
+func isBulkMediaResponse(h http.Header) bool {
+	ct := strings.ToLower(strings.TrimSpace(strings.SplitN(h.Get("Content-Type"), ";", 2)[0]))
+	switch {
+	case strings.HasPrefix(ct, "video/"):
+		return true
+	case strings.HasPrefix(ct, "audio/"):
+		return true
+	case ct == "application/vnd.apple.mpegurl" || ct == "application/x-mpegurl":
+		return true
+	case ct == "application/dash+xml":
+		return true
+	default:
+		return false
+	}
 }
 
 func singleJoin(a, b string) string {

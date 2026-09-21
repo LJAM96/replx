@@ -8,6 +8,7 @@ package retention
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/LJAM96/replx/internal/database"
@@ -18,6 +19,9 @@ import (
 type Policy struct {
 	PlaybackDays int
 	AuditDays    int
+	// BatchSize bounds each DELETE batch to avoid long locks.
+	// Zero defaults to 1000.
+	BatchSize int
 }
 
 // Result counts one purge pass.
@@ -28,11 +32,48 @@ type Result struct {
 	Audits    int64 `json:"audits"`
 }
 
-// PurgeOnce deletes expired rows. Sessions go first with decisions
-// cascading; orphan decisions (session already gone) are swept directly.
-// The first database failure aborts the pass and is returned: a silent
-// purge would hide a filling disk behind a "purged" log line. Statements
-// before the failure already committed.
+func batchSize(p Policy) int {
+	if p.BatchSize > 0 {
+		return p.BatchSize
+	}
+	return 1000
+}
+
+// purgeBatched deletes matching rows in LIMIT-bounded batches until none
+// remain or the context expires. days < 0 means the predicate takes no arg.
+func purgeBatched(ctx context.Context, db database.DBTX, table, where string, days, batch int) (int64, error) {
+	var total int64
+	lim := strconv.Itoa(batch)
+	for {
+		var n int64
+		var err error
+		if days < 0 {
+			q := `WITH gone AS (DELETE FROM ` + table + ` WHERE ` + where + ` LIMIT ` + lim + ` RETURNING 1) SELECT count(*) FROM gone`
+			err = db.QueryRow(ctx, q).Scan(&n)
+		} else {
+			q := `WITH gone AS (DELETE FROM ` + table + ` WHERE ` + where + ` LIMIT ` + lim + ` RETURNING 1) SELECT count(*) FROM gone`
+			err = db.QueryRow(ctx, q, days).Scan(&n)
+		}
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < int64(batch) {
+			return total, nil
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		default:
+		}
+	}
+}
+
+// PurgeOnce deletes expired rows in bounded batches. Sessions go first with
+// decisions cascading; orphan decisions (session already gone) are swept
+// directly. The first database failure aborts the pass and is returned: a
+// silent purge would hide a filling disk behind a "purged" log line.
+// Statements before the failure already committed.
 func PurgeOnce(ctx context.Context, db database.DBTX, p Policy) (Result, error) {
 	var out Result
 	if db == nil {
@@ -40,40 +81,22 @@ func PurgeOnce(ctx context.Context, db database.DBTX, p Policy) (Result, error) 
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	exec := func(q string, args ...any) (int64, error) {
-		var n int64
-		if err := db.QueryRow(cctx, q, args...).Scan(&n); err != nil {
-			return 0, err
-		}
-		return n, nil
-	}
+	batch := batchSize(p)
 	var err error
 	if p.PlaybackDays > 0 {
-		if out.Decisions, err = exec(`WITH gone AS (
-			DELETE FROM playback_decisions
-			WHERE created_at < now() - make_interval(days => $1) RETURNING 1
-		) SELECT count(*) FROM gone`, p.PlaybackDays); err != nil {
+		if out.Decisions, err = purgeBatched(cctx, db, `playback_decisions`, `created_at < now() - make_interval(days => $1)`, p.PlaybackDays, batch); err != nil {
 			return out, fmt.Errorf("retention: decisions: %w", err)
 		}
-		if out.Sessions, err = exec(`WITH gone AS (
-			DELETE FROM playback_sessions
-			WHERE ended_at IS NOT NULL AND ended_at < now() - make_interval(days => $1)
-			RETURNING 1
-		) SELECT count(*) FROM gone`, p.PlaybackDays); err != nil {
+		if out.Sessions, err = purgeBatched(cctx, db, `playback_sessions`, `ended_at IS NOT NULL AND ended_at < now() - make_interval(days => $1)`, p.PlaybackDays, batch); err != nil {
 			return out, fmt.Errorf("retention: sessions: %w", err)
 		}
 	}
 	// Trace expiry is per-row (expires_at), independent of the policy.
-	if out.Traces, err = exec(`WITH gone AS (
-		DELETE FROM diagnostic_traces WHERE expires_at < now() RETURNING 1
-	) SELECT count(*) FROM gone`); err != nil {
+	if out.Traces, err = purgeBatched(cctx, db, `diagnostic_traces`, `expires_at < now()`, -1, batch); err != nil {
 		return out, fmt.Errorf("retention: traces: %w", err)
 	}
 	if p.AuditDays > 0 {
-		if out.Audits, err = exec(`WITH gone AS (
-			DELETE FROM audit_events
-			WHERE created_at < now() - make_interval(days => $1) RETURNING 1
-		) SELECT count(*) FROM gone`, p.AuditDays); err != nil {
+		if out.Audits, err = purgeBatched(cctx, db, `audit_events`, `created_at < now() - make_interval(days => $1)`, p.AuditDays, batch); err != nil {
 			return out, fmt.Errorf("retention: audits: %w", err)
 		}
 	}

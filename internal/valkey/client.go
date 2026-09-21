@@ -144,6 +144,29 @@ func (c *Client) Del(key string) error {
 	return nil
 }
 
+// SetNX stores val only when key is absent with a TTL (refresh lock
+// primitive for stampede control). Reports true when the lock was acquired.
+func (c *Client) SetNX(key string, val []byte, ttl time.Duration) (bool, error) {
+	secs := int64(ttl / time.Second)
+	if secs <= 0 {
+		secs = 5
+	}
+	reply, err := c.roundTrip("SET", key, string(val), "EX", strconv.FormatInt(secs, 10), "NX")
+	if err != nil {
+		if strings.Contains(err.Error(), "nil") {
+			return false, nil
+		}
+		return false, err
+	}
+	if reply == nil {
+		return false, nil
+	}
+	if s, ok := reply.(string); ok && s == "OK" {
+		return true, nil
+	}
+	return false, nil
+}
+
 type respError string
 
 // readReply parses one RESP2 reply: +simple, -error, :integer, $bulk

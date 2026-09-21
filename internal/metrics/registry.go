@@ -26,6 +26,7 @@ type Registry struct {
 	originDurSum      float64
 	originDurCnt      int64
 	mediaRedirect     int64
+	mediaGateway      int64
 	mediaFailure      map[string]int64
 	cacheHits         int64
 	cacheMisses       int64
@@ -34,6 +35,10 @@ type Registry struct {
 	syncItems         int64
 	syncErrors        int64
 	playbackDecisions int64
+	policyRejections  int64
+	eventstream       int64
+	diagnosticsActive int64
+	activeSessions    int64
 }
 
 // ObserveHTTP records one control-plane response by route class and status.
@@ -138,21 +143,61 @@ func (r *Registry) IncPlaybackDecision() {
 	r.playbackDecisions++
 }
 
+// IncMediaGatewayRoute counts one route to the optional DNS-only media gateway.
+func (r *Registry) IncMediaGatewayRoute() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mediaGateway++
+}
+
+// IncPolicyRejection counts one hard policy rejection by reason.
+func (r *Registry) IncPolicyRejection() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.policyRejections++
+}
+
+// SetEventstreamConnected tracks PMS event stream state (1 connected, 0 down).
+func (r *Registry) SetEventstreamConnected(v int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.eventstream = v
+}
+
+// SetDiagnosticsActive tracks active targeted protocol captures.
+func (r *Registry) SetDiagnosticsActive(v int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.diagnosticsActive = v
+}
+
+// SetActivePlaybackSessions tracks open playback sessions (gauge).
+func (r *Registry) SetActivePlaybackSessions(v int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.activeSessions = v
+}
+
 // Snapshot returns a point-in-time copy for tests and diagnostics.
 type Snapshot struct {
-	ReqTotal          map[string]int64
-	ReqDurCount       map[string]int64
-	OriginTotal       int64
-	OriginErrors      int64
-	MediaRedirect     int64
-	MediaFailure      map[string]int64
-	CacheHits         int64
-	CacheMisses       int64
-	CacheWarmed       int64
-	CacheWarmErr      int64
-	SyncItems         int64
-	SyncErrors        int64
-	PlaybackDecisions int64
+	ReqTotal             map[string]int64
+	ReqDurCount          map[string]int64
+	OriginTotal          int64
+	OriginErrors         int64
+	MediaRedirect        int64
+	MediaGateway         int64
+	MediaFailure         map[string]int64
+	CacheHits            int64
+	CacheMisses          int64
+	CacheWarmed          int64
+	CacheWarmErr         int64
+	SyncItems            int64
+	SyncErrors           int64
+	PlaybackDecisions    int64
+	PolicyRejections     int64
+	EventstreamConnected int64
+	DiagnosticsActive    int64
+	ActiveSessions       int64
 }
 
 // Snapshot copies current counters.
@@ -160,19 +205,24 @@ func (r *Registry) Snapshot() Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := Snapshot{
-		ReqTotal:          map[string]int64{},
-		ReqDurCount:       map[string]int64{},
-		MediaFailure:      map[string]int64{},
-		OriginTotal:       r.originTotal,
-		OriginErrors:      r.originErr,
-		MediaRedirect:     r.mediaRedirect,
-		CacheHits:         r.cacheHits,
-		CacheMisses:       r.cacheMisses,
-		CacheWarmed:       r.cacheWarmed,
-		CacheWarmErr:      r.cacheWarmErr,
-		SyncItems:         r.syncItems,
-		SyncErrors:        r.syncErrors,
-		PlaybackDecisions: r.playbackDecisions,
+		ReqTotal:             map[string]int64{},
+		ReqDurCount:          map[string]int64{},
+		MediaFailure:         map[string]int64{},
+		OriginTotal:          r.originTotal,
+		OriginErrors:         r.originErr,
+		MediaRedirect:        r.mediaRedirect,
+		MediaGateway:         r.mediaGateway,
+		CacheHits:            r.cacheHits,
+		CacheMisses:          r.cacheMisses,
+		CacheWarmed:          r.cacheWarmed,
+		CacheWarmErr:         r.cacheWarmErr,
+		SyncItems:            r.syncItems,
+		SyncErrors:           r.syncErrors,
+		PlaybackDecisions:    r.playbackDecisions,
+		PolicyRejections:     r.policyRejections,
+		EventstreamConnected: r.eventstream,
+		DiagnosticsActive:    r.diagnosticsActive,
+		ActiveSessions:       r.activeSessions,
 	}
 	for k, v := range r.reqTotal {
 		out.ReqTotal[k] = v
@@ -254,6 +304,22 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 		SyncErrorsTotal, SyncErrorsTotal, SyncErrorsTotal, r.syncErrors)
 	fmt.Fprintf(w, "# HELP %s Intercepted negotiation outcomes.\n# TYPE %s counter\n%s %d\n",
 		PlaybackDecisionsTotal, PlaybackDecisionsTotal, PlaybackDecisionsTotal, r.playbackDecisions)
+	fmt.Fprintf(w, "# HELP %s Hard policy rejections.\n# TYPE %s counter\n%s %d\n",
+		PolicyRejectionsTotal, PolicyRejectionsTotal, PolicyRejectionsTotal, r.policyRejections)
+	fmt.Fprintf(w, "# HELP %s Routes to the optional media gateway.\n# TYPE %s counter\n%s %d\n",
+		MediaGatewayRoutesTotal, MediaGatewayRoutesTotal, MediaGatewayRoutesTotal, r.mediaGateway)
+	fmt.Fprintf(w, "# HELP %s PMS event stream connected (1) or down (0).\n# TYPE %s gauge\n%s %d\n",
+		EventstreamConnected, EventstreamConnected, EventstreamConnected, r.eventstream)
+	fmt.Fprintf(w, "# HELP %s Active targeted protocol captures.\n# TYPE %s gauge\n%s %d\n",
+		DiagnosticsActive, DiagnosticsActive, DiagnosticsActive, r.diagnosticsActive)
+	fmt.Fprintf(w, "# HELP %s Open playback sessions.\n# TYPE %s gauge\n%s %d\n",
+		ActivePlaybackSessions, ActivePlaybackSessions, ActivePlaybackSessions, r.activeSessions)
+	// Cache size gauges are best-effort: Valkey INFO is not scraped here,
+	// so expose zero with documentation until Kappa wires size probing.
+	fmt.Fprintf(w, "# HELP %s Cached entries (wired in Kappa).\n# TYPE %s gauge\n%s 0\n",
+		CacheEntries, CacheEntries, CacheEntries)
+	fmt.Fprintf(w, "# HELP %s Cached bytes (wired in Kappa).\n# TYPE %s gauge\n%s 0\n",
+		CacheBytes, CacheBytes, CacheBytes)
 }
 
 func splitRouteStatus(k string) (route, status string, ok bool) {

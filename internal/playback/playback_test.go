@@ -226,10 +226,10 @@ func TestManifestBoundary(t *testing.T) {
 	if _, deny, reason := e.EnforcePart(r, "", "sess-m"); !deny || reason != policy.TranscodeForbidden {
 		t.Fatalf("transcode retry must fail closed: %v %q", deny, reason)
 	}
-	// Direct-stream manifest on the same session: legitimate upgrade path.
+	// Direct-stream manifest on the same variant: legitimate path.
 	e2 := newEngine()
 	r2 := httptest.NewRequest(http.MethodGet,
-		"/video/:/transcode/universal/start.mpd?session=sess-m&directPlay=0&directStream=1", nil)
+		"/video/:/transcode/universal/start.mpd?session=sess-m&mediaIndex=1&directPlay=0&directStream=1", nil)
 	if _, deny, _ := e2.EnforcePart(r2, "", "sess-m"); deny {
 		t.Fatal("direct-stream manifest must pass")
 	}
@@ -342,5 +342,39 @@ func TestManifestBindingEnforced(t *testing.T) {
 		"/video/:/transcode/universal/start.mpd?session=sess-mb&mediaIndex=1", nil)
 	if _, deny, reason := e.EnforcePart(r, "", "sess-mb"); !deny || reason != SessionIdentityMismatch {
 		t.Fatalf("manifest must prove session binding: %v %q", deny, reason)
+	}
+}
+
+func TestManifestTitleBinding(t *testing.T) {
+	e := &Engine{Store: NewMemoryStore()}
+	_, _ = e.Store.Create(context.Background(), Session{
+		PlexSessionID: "sess-title", RatingKey: "999", SelectedMediaIndex: 0,
+		PlaybackMode: "directStream", EffectivePolicy: []byte(`{}`),
+	})
+	// Manifest targeting another title with a matching index must deny:
+	// the session authorizes title 999, not title 777.
+	r := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=sess-title&mediaIndex=0&path=%2Flibrary%2Fmetadata%2F777", nil)
+	if _, deny, reason := e.EnforcePart(r, "", "sess-title"); !deny || reason != policy.OriginMismatch {
+		t.Fatalf("cross-title manifest must fail closed: %v %q", deny, reason)
+	}
+	// Same title passes.
+	okReq := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=sess-title&mediaIndex=0&path=%2Flibrary%2Fmetadata%2F999", nil)
+	if _, deny, _ := e.EnforcePart(okReq, "", "sess-title"); deny {
+		t.Fatal("same-title manifest must pass")
+	}
+}
+
+func TestDirectStreamExplicitTranscodeDenied(t *testing.T) {
+	e := &Engine{Store: NewMemoryStore()}
+	_, _ = e.Store.Create(context.Background(), Session{
+		PlexSessionID: "sess-ds", RatingKey: "999", SelectedMediaIndex: 0,
+		PlaybackMode: "directStream", EffectivePolicy: []byte(`{"allowTranscode":"deny"}`),
+	})
+	r := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/start.mpd?session=sess-ds&mediaIndex=0&directPlay=0&directStream=0", nil)
+	if _, deny, reason := e.EnforcePart(r, "", "sess-ds"); !deny || reason != policy.TranscodeForbidden {
+		t.Fatalf("transcode retry from directStream session must fail closed: %v %q", deny, reason)
 	}
 }
