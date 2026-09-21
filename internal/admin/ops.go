@@ -32,14 +32,23 @@ func subjectOf(r *http.Request) string {
 // auditEvent records an admin mutation. Best-effort: audit failure never
 // blocks the operation it describes, but it is logged via the error.
 func (m *Mux) auditEvent(ctx context.Context, subject, action, objType, objID string, after any) {
+	m.auditEventWithBefore(ctx, subject, action, objType, objID, nil, after)
+}
+
+// auditEventWithBefore records before/after state where appropriate.
+func (m *Mux) auditEventWithBefore(ctx context.Context, subject, action, objType, objID string, before, after any) {
 	if m.svc == nil {
 		return
 	}
-	raw, _ := json.Marshal(after)
+	rawAfter, _ := json.Marshal(after)
+	var rawBefore []byte
+	if before != nil {
+		rawBefore, _ = json.Marshal(before)
+	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	_, _ = m.svc.DB.Exec(cctx, `INSERT INTO audit_events(admin_subject, action, object_type, object_id, after_state)
-		VALUES($1,$2,$3,$4,$5)`, subject, action, objType, objID, raw)
+	_, _ = m.svc.DB.Exec(cctx, `INSERT INTO audit_events(admin_subject, action, object_type, object_id, before_state, after_state)
+		VALUES($1,$2,$3,$4,$5,$6)`, subject, action, objType, objID, rawBefore, rawAfter)
 }
 
 func parseLimit(r *http.Request, def, max int) int {
@@ -93,22 +102,35 @@ func (m *Mux) handleSyncFull(w http.ResponseWriter, r *http.Request) {
 	m.syncMu.Lock()
 	sinceLast := time.Since(m.lastSyncFull)
 	if sinceLast < 5*time.Minute {
+		jobID := m.lastSyncJob
 		m.syncMu.Unlock()
-		writeError(w, http.StatusTooManyRequests, "SYNC_RATE_LIMITED", "full sync at most every 5 minutes")
+		if jobID == "" {
+			jobID = "sync-full-current"
+		}
+		// Idempotent while queued/running: 429 with current job ID.
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "SYNC_RATE_LIMITED", "message": "full sync at most every 5 minutes"}, "data": map[string]any{"jobId": jobID, "status": "in-flight"}})
 		return
 	}
+	jobID := time.Now().UTC().Format("20060102T150405Z")
 	m.lastSyncFull = time.Now()
+	m.lastSyncJob = jobID
 	m.syncMu.Unlock()
 	if err := m.syncWorker.SyncOnce(r.Context(), true); err != nil {
 		if errors.Is(err, syncpkg.ErrInFlight) {
-			writeError(w, http.StatusConflict, "SYNC_IN_FLIGHT", "another sync is already running")
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "SYNC_IN_FLIGHT", "message": "another sync is already running"}, "data": map[string]any{"jobId": jobID, "status": "in-flight"}})
 			return
 		}
 		writeError(w, http.StatusBadGateway, "SYNC_FAILED", err.Error())
 		return
 	}
-	m.auditEvent(r.Context(), subjectOf(r), "sync.full", "sync", "full", map[string]any{"result": "complete"})
-	writeData(w, http.StatusOK, map[string]any{"completed": true})
+	m.auditEvent(r.Context(), subjectOf(r), "sync.full", "sync", "full", map[string]any{"result": "complete", "jobId": jobID})
+	writeData(w, http.StatusOK, map[string]any{"completed": true, "jobId": jobID})
 }
 
 // validatePolicy checks scope rules and config shape before storage.
@@ -154,8 +176,9 @@ func (m *Mux) handlePolicies(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
+		limit, offset := parseCursor(r, 50, 200)
 		rows, err := m.svc.DB.Query(r.Context(), `SELECT scope_type, COALESCE(scope_id::text,''), name, config, enabled FROM policies
-			ORDER BY scope_type, name LIMIT $1`, parseLimit(r, 50, 200))
+			ORDER BY scope_type, name LIMIT $1 OFFSET $2`, limit+1, offset)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "POLICIES_FAILED", err.Error())
 			return
@@ -177,10 +200,16 @@ func (m *Mux) handlePolicies(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, rr)
 		}
+		var next *int
+		if len(out) > limit {
+			out = out[:limit]
+			n := offset + limit
+			next = &n
+		}
 		if out == nil {
 			out = []row{}
 		}
-		writeData(w, http.StatusOK, map[string]any{"policies": out})
+		writePage(w, map[string]any{"policies": out}, next)
 	case http.MethodPut:
 		var body struct {
 			ScopeType string          `json:"scopeType"`
@@ -201,12 +230,14 @@ func (m *Mux) handlePolicies(w http.ResponseWriter, r *http.Request) {
 		if body.Enabled != nil {
 			enabled = *body.Enabled
 		}
+		var before json.RawMessage
+		_ = m.svc.DB.QueryRow(r.Context(), `SELECT config FROM policies WHERE scope_type=$1 AND COALESCE(scope_id::text,'')=$2 LIMIT 1`, body.ScopeType, body.ScopeID).Scan(&before)
 		if err := m.storePolicy(r.Context(), body.ScopeType, body.ScopeID, body.Name, body.Config, enabled); err != nil {
 			writeError(w, http.StatusBadGateway, "POLICY_STORE_FAILED", err.Error())
 			return
 		}
-		m.auditEvent(r.Context(), subjectOf(r), "policy.put", "policy", body.ScopeType+"/"+body.Name,
-			map[string]any{"scopeType": body.ScopeType, "scopeId": body.ScopeID, "enabled": enabled})
+		m.auditEventWithBefore(r.Context(), subjectOf(r), "policy.put", "policy", body.ScopeType+"/"+body.Name,
+			before, map[string]any{"scopeType": body.ScopeType, "scopeId": body.ScopeID, "enabled": enabled})
 		writeData(w, http.StatusOK, map[string]any{"stored": true})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET or PUT")
@@ -272,6 +303,7 @@ func (m *Mux) handleSessions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "SESSIONS_DISABLED", "no database wired")
 		return
 	}
+	limit, offset := parseCursor(r, 50, 200)
 	before := r.URL.Query().Get("before")
 	rows, err := m.svc.DB.Query(r.Context(), `SELECT ps.id::text, ps.plex_session_identifier, ps.rating_key,
 		ps.playback_mode, ps.routing_mode, to_char(ps.started_at,'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
@@ -280,7 +312,7 @@ func (m *Mux) handleSessions(w http.ResponseWriter, r *http.Request) {
 			FROM playback_decisions WHERE playback_session_id=ps.id ORDER BY created_at DESC LIMIT 1) d)
 		FROM playback_sessions ps
 		WHERE ($1='' OR ps.started_at < $1::timestamptz)
-		ORDER BY ps.started_at DESC LIMIT $2`, before, parseLimit(r, 20, 100))
+		ORDER BY ps.started_at DESC LIMIT $2 OFFSET $3`, before, limit+1, offset)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "SESSIONS_FAILED", err.Error())
 		return
@@ -307,10 +339,16 @@ func (m *Mux) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, rr)
 	}
+	var next *int
+	if len(out) > limit {
+		out = out[:limit]
+		n := offset + limit
+		next = &n
+	}
 	if out == nil {
 		out = []row{}
 	}
-	writeData(w, http.StatusOK, map[string]any{"sessions": out})
+	writePage(w, map[string]any{"sessions": out}, next)
 }
 
 // handleCompat exposes the compatibility matrix (spike-backed until

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/LJAM96/replx/internal/sync"
 	"github.com/LJAM96/replx/internal/trace"
 )
 
@@ -113,21 +114,35 @@ func modeOf(d decisionResponse) string {
 }
 
 // liveMedia mirrors the origin Media array for the no-index fallback path.
+// Dynamic range signals are gathered from every level PMS may surface
+// them at (media attributes and stream display titles) and normalized
+// through the same vocabulary the owner index uses, so live negotiation
+// enforces identical restrictions.
 type liveMedia struct {
-	ID              *int64 `json:"id"`
-	Container       string `json:"container"`
-	VideoCodec      string `json:"videoCodec"`
-	VideoProfile    string `json:"videoProfile"`
-	Width           *int   `json:"width"`
-	Height          *int   `json:"height"`
-	Bitrate         *int   `json:"bitrate"`
-	VideoResolution string `json:"videoResolution"`
-	DynamicRange    string `json:"dynamicRange"`
-	AudioCodec      string `json:"audioCodec"`
-	AudioChannels   *int   `json:"audioChannels"`
-	Part            []struct {
-		ID  *int64 `json:"id"`
-		Key string `json:"key"`
+	ID                   *int64 `json:"id"`
+	Container            string `json:"container"`
+	VideoCodec           string `json:"videoCodec"`
+	VideoProfile         string `json:"videoProfile"`
+	Width                *int   `json:"width"`
+	Height               *int   `json:"height"`
+	Bitrate              *int   `json:"bitrate"`
+	VideoResolution      string `json:"videoResolution"`
+	DynamicRange         string `json:"dynamicRange"`
+	HDRFormat            string `json:"hdrFormat"`
+	HDR                  string `json:"hdr"`
+	DisplayTitle         string `json:"displayTitle"`
+	ExtendedDisplayTitle string `json:"extendedDisplayTitle"`
+	AudioCodec           string `json:"audioCodec"`
+	AudioChannels        *int   `json:"audioChannels"`
+	Part                 []struct {
+		ID     *int64 `json:"id"`
+		Key    string `json:"key"`
+		Stream []struct {
+			Codec                string `json:"codec"`
+			Profile              string `json:"profile"`
+			DisplayTitle         string `json:"displayTitle"`
+			ExtendedDisplayTitle string `json:"extendedDisplayTitle"`
+		} `json:"Stream"`
 	} `json:"Part"`
 }
 
@@ -151,12 +166,19 @@ func parseLiveVariants(raw []byte) ([]variantSource, error) {
 	var out []variantSource
 	for idx, m := range env.MediaContainer.Metadata[0].Media {
 		partOK, partKey, partPlexID := false, "", ""
+		var streamText strings.Builder
 		for _, p := range m.Part {
 			if p.Key != "" {
 				partOK, partKey = true, p.Key
 				if p.ID != nil {
 					partPlexID = strconv.FormatInt(*p.ID, 10)
 				}
+			}
+			for _, st := range p.Stream {
+				streamText.WriteString(" " + st.DisplayTitle + " " + st.ExtendedDisplayTitle +
+					" " + st.Codec + " " + st.Profile)
+			}
+			if partOK {
 				break
 			}
 		}
@@ -164,20 +186,18 @@ func parseLiveVariants(raw []byte) ([]variantSource, error) {
 		if m.ID != nil {
 			id = strconv.FormatInt(*m.ID, 10)
 		}
+		// One normalized representation for sync and live playback:
+		// media-level signals plus concatenated stream evidence.
+		dr := sync.NormalizeDynamicRange(
+			strings.TrimSpace(m.DynamicRange+" "+m.HDRFormat+" "+m.HDR+" "+m.DisplayTitle+" "+m.ExtendedDisplayTitle+streamText.String()),
+			"", m.VideoCodec, m.VideoProfile)
 		out = append(out, variantSource{
 			MediaIndex: idx, PlexMediaID: id,
 			Width: m.Width, Height: m.Height, BitrateKbps: m.Bitrate,
-			DynamicRange: orUnknown(m.DynamicRange), VideoCodec: m.VideoCodec,
+			DynamicRange: dr, VideoCodec: m.VideoCodec,
 			AudioChannels: m.AudioChannels, PartAvailable: partOK,
 			PartKey: partKey, PartPlexID: partPlexID,
 		})
 	}
 	return out, nil
-}
-
-func orUnknown(s string) string {
-	if strings.TrimSpace(s) == "" {
-		return "UNKNOWN"
-	}
-	return s
 }

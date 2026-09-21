@@ -39,12 +39,7 @@ var secretParams = map[string]bool{
 
 // ttlByPrefix maps cacheable path prefixes to TTLs. Lookup uses longest
 // prefix match so /library/sections (list, 5m) and /library/sections/
-// (browse pages, 60s) coexist.
-//
-// Hub TTLs exceed the spec table minimums (home 10s, CW 5s, RA 15s) on
-// purpose: the owner warmer renews hot entries at TTL/2, which bounds
-// staleness without churning the origin on every poll. There is no stale
-// serving: expiry is a hard miss.
+// (browse pages, 60s) coexist. Values match docs/cache_and_sync_specification.md.
 var ttlByPrefix = []struct {
 	prefix string
 	ttl    time.Duration
@@ -54,23 +49,28 @@ var ttlByPrefix = []struct {
 	{"/library/metadata/", 5 * time.Minute},
 	{"/library/sections", 5 * time.Minute},
 	{"/identity", 5 * time.Minute},
-	{"/hubs/", 30 * time.Second},
+	{"/hubs/", 10 * time.Second},
 }
 
 // hubTTL refines /hubs/ by feed: Continue Watching and Recently Added
-// change faster than structural hubs.
+// change faster than structural hubs. Values match the spec table; the
+// owner warmer renews hot entries at TTL/2. There is no stale serving:
+// expiry is a hard miss.
 func hubTTL(path string) (time.Duration, bool) {
 	p := strings.ToLower(path)
 	if !strings.HasPrefix(p, "/hubs/") {
 		return 0, false
 	}
 	if strings.Contains(p, "continuewatching") {
-		return 15 * time.Second, true
+		return 5 * time.Second, true
 	}
 	if strings.Contains(p, "recentlyadded") {
+		return 15 * time.Second, true
+	}
+	if strings.Contains(p, "/search") {
 		return 30 * time.Second, true
 	}
-	return 30 * time.Second, true
+	return 10 * time.Second, true
 }
 
 // Cacheable reports whether a method+path pair is safe to cache and its
@@ -99,18 +99,21 @@ func Cacheable(method, path string) (time.Duration, bool) {
 	return ttlByPrefix[best].ttl, true
 }
 
-// ResponseKey builds replx_edge:v1:browse:user:<scope>:<method>:<hash>.
-// query must be the request's parsed query; secret params are stripped and
-// the remainder is sorted, so param order and token rotation never split
-// cache entries across the same scope. accept (XML vs JSON) joins the
-// hash: representations are not interchangeable.
+// ResponseKey builds the canonical user-scoped key:
+//
+//	replx_edge:{schema}:{server}:{class}:{scope}:{representation}:{hash}
+//
+// Server is "default" in single-origin 1.0 (schema keys stay server-scoped
+// for future multi-server). Class is "browse". Scope is user:{uuid} when
+// resolved, else the caller-provided tok:/acct: fallback (never shared
+// across users). Representation normalizes Accept to json/xml. The hash
+// covers method, path and sorted non-secret query params, so param order
+// and token rotation never split entries.
 func ResponseKey(scope, method, path string, query url.Values, accept string) string {
 	var b strings.Builder
-	b.WriteString(method)
+	b.WriteString(strings.ToUpper(method))
 	b.WriteByte(0)
 	b.WriteString(path)
-	b.WriteByte(0)
-	b.WriteString(accept)
 	b.WriteByte(0)
 	keys := make([]string, 0, len(query))
 	for k := range query {
@@ -131,8 +134,23 @@ func ResponseKey(scope, method, path string, query url.Values, accept string) st
 		}
 	}
 	sum := sha256.Sum256([]byte(b.String()))
-	return fmt.Sprintf("replx_edge:%s:browse:user:%s:%s:%s",
-		SchemaVersion, scope, strings.ToUpper(method), hex.EncodeToString(sum[:])[:16])
+	rep := normalizeRepresentation(accept)
+	return fmt.Sprintf("replx_edge:%s:%s:%s:%s:%s:%s",
+		SchemaVersion, "default", "browse", scope, rep, hex.EncodeToString(sum[:])[:16])
+}
+
+func normalizeRepresentation(accept string) string {
+	a := strings.ToLower(accept)
+	switch {
+	case strings.Contains(a, "json"):
+		return "json"
+	case strings.Contains(a, "xml"):
+		return "xml"
+	case a == "":
+		return "default"
+	default:
+		return "default"
+	}
 }
 
 // safeHeaders is the deliberate allowlist of origin response headers
@@ -309,6 +327,17 @@ func (m *Memory) Set(_ context.Context, key string, e Entry, ttl time.Duration) 
 	return nil
 }
 
+// Delete removes key. Missing keys are not an error.
+func (m *Memory) Delete(_ context.Context, key string) error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.items, key)
+	return nil
+}
+
 // ValkeyStore is the production Store backed by a RESP client.
 type ValkeyStore struct {
 	c *valkey.Client
@@ -343,4 +372,12 @@ func (s *ValkeyStore) Set(ctx context.Context, key string, e Entry, ttl time.Dur
 		return err
 	}
 	return s.c.Set(key, raw, ttl)
+}
+
+// Delete removes key via DEL. Missing keys are not an error.
+func (s *ValkeyStore) Delete(_ context.Context, key string) error {
+	if s == nil || s.c == nil {
+		return nil
+	}
+	return s.c.Del(key)
 }

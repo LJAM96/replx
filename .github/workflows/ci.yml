@@ -72,10 +72,22 @@ jobs:
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - run: docker build -t replx-edge:ci .
+      - run: docker buildx build --platform linux/amd64,linux/arm64 -t replx-edge:ci-multiarch .
       - run: cp deploy/.env.example deploy/.env
       - run: docker compose -f deploy/compose.yml config
       - run: rm -f deploy/.env
         if: always()
+      - name: compose smoke (config + spec + fixtures)
+        run: |
+          test -f tests/fixtures/plex/metadata.xml
+          test -f tests/fixtures/plex/metadata.json
+          test -f tests/fixtures/plex/playback_decision.json
+          test -f tests/fixtures/plex/continue_watching.json
+          test -f tests/fixtures/plex/hls_manifest.m3u8
+          test -f tests/fixtures/plex/dash_manifest.mpd
+          test -f tests/fixtures/plex/pms_events.json
+          test -x scripts/backup.sh
+          test -x scripts/restore.sh
 
   spec:
     runs-on: ubuntu-latest

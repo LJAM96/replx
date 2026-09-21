@@ -1,9 +1,11 @@
 package onboarding
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -202,6 +204,23 @@ func (s *Service) Verify(ctx context.Context) (VerifyReport, error) {
 			report.OriginID, report.ResourceID, report.ProxiedID)
 	}
 	if !report.CustomURLPresent {
+		// Best-effort auto-configure: PUT customConnections on the origin
+		// PMS, then re-list resources once. Failure falls back to manual.
+		if s.PublicURL != "" {
+			if err := tryConfigureCustomURL(internalURL, string(pmsToken), s.PublicURL); err == nil {
+				s.logLoud("info", "onboarding", "Custom Server Access URL configured on PMS; re-checking resources", map[string]any{"publicURL": s.PublicURL})
+				if id2, err := s.EnsureIdentity(ctx); err == nil {
+					if resources2, err := s.NewTV(id2.ClientID).ListServers(ctx, string(ownerToken)); err == nil {
+						resources = resources2
+						report.CustomURLPresent = CustomURLPresent(resources, resourceID, publicHost(s.PublicURL))
+					}
+				}
+			} else {
+				s.logLoud("warn", "onboarding", "automatic Custom URL configure failed; manual step required", map[string]any{"error": err.Error()})
+			}
+		}
+	}
+	if !report.CustomURLPresent {
 		report.Stage = StageSelected
 		report.Checks = append(report.Checks, "Custom Server Access URL NOT published: add "+s.PublicURL+" on the PMS and re-verify")
 		return report, fmt.Errorf("onboarding: Custom Server Access URL %s not published for this PMS (plex.tv lists: %s)",
@@ -221,4 +240,39 @@ func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// tryConfigureCustomURL best-effort sets the PMS Custom Server Access URLs
+// (customConnections) to include publicURL. It never overwrites an existing
+// list that already contains the URL.
+func tryConfigureCustomURL(internalOrigin, pmsToken, publicURL string) error {
+	base := strings.TrimSuffix(internalOrigin, "/")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/:/prefs?X-Plex-Token="+url.QueryEscape(pmsToken), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// Read current customConnections if present; simplest robust path is
+	// to PUT the desired value directly (PMS merges single pref writes).
+	putURL := base + "/:/prefs?customConnections=" + url.QueryEscape(publicURL) + "&X-Plex-Token=" + url.QueryEscape(pmsToken)
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, bytes.NewReader(nil))
+	if err != nil {
+		return err
+	}
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		return err
+	}
+	defer putResp.Body.Close()
+	if putResp.StatusCode < 200 || putResp.StatusCode >= 300 {
+		return fmt.Errorf("pms prefs PUT status %s", putResp.Status)
+	}
+	return nil
 }

@@ -261,6 +261,16 @@ func runServe() error {
 		Artwork:     artworkStore,
 		Identity:    idResolver,
 		Spike:       spikeOpt,
+		// Media authorization precedes transport selection in every
+		// ingress mode; see Options.PartPolicy.
+		PartPolicy: playbackEngine.EnforcePart,
+		MediaFallbackURL: func() string {
+			if cfg.MediaFallbackEnabled {
+				return cfg.MediaPublicURL
+			}
+			return ""
+		}(),
+		SearchDB: db.Raw(),
 	})
 	if err != nil {
 		return err
@@ -273,12 +283,15 @@ func runServe() error {
 		Secret:      cfg.SecretKey,
 		PublicURL:   cfg.PublicURL,
 		InternalURL: cfg.OriginInternalURL,
+		Log: func(level, component, msg string, fields map[string]any) {
+			logger.Log(logging.Entry{Level: level, Component: component, Fields: appendField(fields, "msg", msg)})
+		},
 	}
 	setupToken, err := admin.NewSetupToken()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "onboarding setup token: %s\n", setupToken)
+	fmt.Fprintf(os.Stderr, "onboarding setup token (valid 15m, single-use setup via POST /api/v1/setup): %s\n", setupToken)
 
 	// Owner JWT refresh (JWT mode only): hourly check, refresh within 24h
 	// of expiry. Failures degrade credentials without destroying them.
@@ -309,15 +322,30 @@ func runServe() error {
 	adminMux.SetCapture(captureStore)
 	adminMux.SetWarmer(warm.Stats)
 	adminMux.SetSync(syncWorker)
+	// Diagnostics gauge: active targeted captures.
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				registry.SetDiagnosticsActive(int64(len(captureStore.Targets())))
+			}
+		}
+	}()
 	// Retention janitor: daily purge of playback, trace and audit history.
-	// First pass runs minutes after startup to reclaim long-down backlog.
+	// Bounded batches avoid long locks. First pass runs minutes after
+	// startup to reclaim long-down backlog.
 	go retention.Run(ctx, db.Raw(), retention.Policy{
 		PlaybackDays: cfg.PlaybackRetentionDays, AuditDays: cfg.AuditRetentionDays,
+		BatchSize: 1000,
 	}, logger, 24*time.Hour)
 	fmt.Fprintf(os.Stdout, "replx-edge onboarding panel: http://127.0.0.1:%d/admin/onboarding | spike matrix: http://127.0.0.1:%d/admin/spike\n",
 		cfg.AdminPort, cfg.AdminPort)
 	adminSrv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.AdminPort),
+		Addr:              fmt.Sprintf("%s:%d", cfg.AdminBind, cfg.AdminPort),
 		Handler:           adminMux,
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    1 << 20,
@@ -392,6 +420,14 @@ func publicHostOf(publicURL string) string {
 		return ""
 	}
 	return strings.ToLower(u.Hostname())
+}
+
+func appendField(fields map[string]any, k string, v any) map[string]any {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields[k] = v
+	return fields
 }
 
 // tvClientFor binds a plex.tv client to the installation client ID.

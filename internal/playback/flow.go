@@ -66,8 +66,11 @@ func (e *Engine) indexVariants(ctx context.Context, ratingKey string) []variantS
 		JOIN plex_servers s ON s.id = li.server_id
 		LEFT JOIN media_parts p ON p.media_variant_id = v.id AND p.part_index = 0
 		WHERE s.enabled AND li.rating_key = $1
-		ORDER BY v.media_index`)
+		ORDER BY v.media_index`, ratingKey)
 	if err != nil {
+		e.logDecision("", ratingKey, "", "index_unavailable", map[string]any{
+			"reason": "index query failed, falling back to live metadata",
+		})
 		return nil
 	}
 	defer rows.Close()
@@ -79,12 +82,21 @@ func (e *Engine) indexVariants(ctx context.Context, ratingKey string) []variantS
 		if err := rows.Scan(&s.MediaIndex, &s.PlexMediaID, &width, &height, &bitrate,
 			&dr, &s.VideoCodec, &channels, &s.VariantUUID, &s.PartUUID,
 			&s.PartPlexID, &s.PartKey); err != nil {
+			e.logDecision("", ratingKey, "", "index_unavailable", map[string]any{
+				"reason": "index scan failed, falling back to live metadata",
+			})
 			return nil
 		}
 		s.Width, s.Height, s.BitrateKbps, s.AudioChannels = width, height, bitrate, channels
 		s.DynamicRange = dr
 		s.PartAvailable = s.PartKey != ""
 		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		e.logDecision("", ratingKey, "", "index_unavailable", map[string]any{
+			"reason": "index iteration failed, falling back to live metadata",
+		})
+		return nil
 	}
 	return out
 }

@@ -756,3 +756,99 @@ func TestCacheSkipsTruncatedBody(t *testing.T) {
 		t.Fatalf("second body: %q", second.Body.String())
 	}
 }
+
+func TestSessionsDeny(t *testing.T) {
+	contacted := false
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contacted = true
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/status/sessions", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "SESSIONS_OWNER_ADMIN_ONLY") {
+		t.Fatalf("sessions must 403: %d %s", rec.Code, rec.Body.String())
+	}
+	if contacted {
+		t.Fatal("origin must not be contacted")
+	}
+}
+
+func TestMediaGatewayFallback(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("origin must not be contacted")
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel", Spike: stubSpike{ok: false}, MediaFallbackURL: "https://media.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/parts/11/x", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("fallback must 307, got %d", rec.Code)
+	}
+	if !strings.HasPrefix(rec.Result().Header.Get("Location"), "https://media.example.com/") {
+		t.Fatalf("location: %s", rec.Result().Header.Get("Location"))
+	}
+}
+
+func TestResponseMediaGuard(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("bytes"))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/some/future/non-media-route", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), MediaRouteUnavailable) {
+		t.Fatalf("bulk response must fail closed: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDirectIngressEnforcesPartBoundary(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/302/file.mp4") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("allowed-bytes"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer origin.Close()
+	engine := &playback.Engine{Store: playback.NewMemoryStore()}
+	_, _ = engine.Store.Create(t.Context(), playback.Session{
+		PlexSessionID: "sess-dir", RatingKey: "999", SelectedMediaIndex: 1,
+		SelectedPartPlexID: "302", SelectedPartKey: "/library/parts/302/file.mp4",
+	})
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Playback: engine, PartPolicy: engine.EnforcePart,
+		Client: origin.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Prohibited part without negotiation context for another session:
+	// the boundary substitutes the selected allowed part.
+	req := httptest.NewRequest(http.MethodGet, "/library/parts/301/file.mkv?session=sess-dir", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "allowed-bytes" {
+		t.Fatalf("prohibited part must substitute allowed selection: %d %q", rec.Code, rec.Body.String())
+	}
+	// Unknown session fails closed instead of proxying.
+	ghost := httptest.NewRequest(http.MethodGet, "/library/parts/301/file.mkv?session=ghost", nil)
+	ghostRec := httptest.NewRecorder()
+	h.ServeHTTP(ghostRec, ghost)
+	if ghostRec.Code != http.StatusForbidden {
+		t.Fatalf("sessionless prohibited part must deny: %d", ghostRec.Code)
+	}
+}

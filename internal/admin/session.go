@@ -23,6 +23,7 @@ const (
 type session struct {
 	csrf    string
 	expires time.Time
+	subject string
 }
 
 type sessionStore struct {
@@ -42,6 +43,11 @@ func randomHex(n int) (string, error) {
 
 // create issues a session id + csrf token pair.
 func (s *sessionStore) create() (id, csrf string, err error) {
+	return s.createWithSubject("")
+}
+
+// createWithSubject issues a session bound to an admin subject for audit.
+func (s *sessionStore) createWithSubject(subject string) (id, csrf string, err error) {
 	if id, err = randomHex(24); err != nil {
 		return "", "", err
 	}
@@ -49,7 +55,7 @@ func (s *sessionStore) create() (id, csrf string, err error) {
 		return "", "", err
 	}
 	s.mu.Lock()
-	s.m[id] = session{csrf: csrf, expires: time.Now().Add(sessionTTL)}
+	s.m[id] = session{csrf: csrf, expires: time.Now().Add(sessionTTL), subject: subject}
 	s.mu.Unlock()
 	return id, csrf, nil
 }

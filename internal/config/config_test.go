@@ -67,3 +67,26 @@ func TestLoadReadsEnv(t *testing.T) {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 }
+
+func TestValidateRejectsAdminBindAll(t *testing.T) {
+	c := Config{SecretKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", PublicURL: "https://plex.example.com", IngressMode: "direct", AdminBind: "0.0.0.0"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("0.0.0.0 admin bind must be rejected")
+	}
+}
+
+func TestLoadReadsBudgets(t *testing.T) {
+	t.Setenv("REPLX_EDGE_SECRET_KEY", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	t.Setenv("REPLX_EDGE_PUBLIC_URL", "https://plex.example.com")
+	t.Setenv("REPLX_EDGE_INGRESS_MODE", "direct")
+	t.Setenv("REPLX_EDGE_CACHE_MAX_GB", "20")
+	t.Setenv("REPLX_EDGE_DIAGNOSTICS_MAX_GB", "10")
+	t.Setenv("REPLX_EDGE_ADMIN_BIND", "127.0.0.1")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CacheMaxGB != 20 || cfg.DiagnosticsMaxGB != 10 || cfg.AdminBind != "127.0.0.1" {
+		t.Fatalf("budgets/bind: %+v", cfg)
+	}
+}

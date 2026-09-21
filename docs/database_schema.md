@@ -381,6 +381,9 @@ CREATE TABLE playback_sessions (
     rating_key text,
     selected_media_variant_id uuid REFERENCES media_variants(id),
     selected_media_part_id uuid REFERENCES media_parts(id),
+    selected_media_index integer NOT NULL DEFAULT -1,
+    selected_part_plex_id text NOT NULL DEFAULT '',
+    selected_part_key text NOT NULL DEFAULT '',
     playback_mode text,
     routing_mode text,
     effective_policy jsonb,
@@ -397,6 +400,8 @@ CREATE INDEX playback_sessions_plex_session_idx ON playback_sessions(plex_sessio
 ```
 
 `playback_sessions.trace_id` references `diagnostic_traces.id` (`0003_trace_fk.sql`, `ON DELETE SET NULL`): trace expiry never deletes playback history. It is a loose lifecycle link, not a creation dependency — sessions exist without targeted traces.
+
+`selected_media_index`, `selected_part_plex_id` and `selected_part_key` (`0005_playback_selection.sql`) persist the complete negotiated selection independently of the index foreign keys: live (non-indexed) negotiation supplies no variant/part UUIDs, and the part boundary fails closed when these columns cannot reconstruct the selection.
 
 ## playback_decisions
 

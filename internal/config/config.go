@@ -26,6 +26,7 @@ type Config struct {
 	OriginInternalURL    string
 	IngressMode          string
 	AdminPort            int
+	AdminBind            string
 	LogLevel             string
 	SecretKey            string
 	MediaFallbackEnabled bool
@@ -52,6 +53,10 @@ type Config struct {
 	// the janitor deletes oldest files first.
 	ArtworkDir   string
 	ArtworkMaxGB int
+	// CacheMaxGB and DiagnosticsMaxGB bound filesystem/valkey budgets.
+	// Enforced by janitors; zero disables enforcement for that class.
+	CacheMaxGB       int
+	DiagnosticsMaxGB int
 	// Retention bounds for high-volume records (days). The janitor
 	// enforces them daily; zero disables a class.
 	TraceRetentionDays    int
@@ -90,6 +95,7 @@ func Load() (Config, error) {
 		PublicURL:         getenv("REPLX_EDGE_PUBLIC_URL", ""),
 		OriginInternalURL: getenv("REPLX_EDGE_ORIGIN_INTERNAL_URL", ""),
 		IngressMode:       getenv("REPLX_EDGE_INGRESS_MODE", "cloudflare_tunnel"),
+		AdminBind:         getenv("REPLX_EDGE_ADMIN_BIND", "127.0.0.1"),
 		LogLevel:          getenv("REPLX_EDGE_LOG_LEVEL", "info"),
 		SecretKey:         getenv("REPLX_EDGE_SECRET_KEY", ""),
 		MediaPublicURL:    getenv("REPLX_EDGE_MEDIA_PUBLIC_URL", ""),
@@ -108,6 +114,11 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid REPLX_EDGE_ARTWORK_MAX_GB")
 	}
 	cfg.ArtworkMaxGB = artGB
+	cfg.CacheMaxGB = intEnv("REPLX_EDGE_CACHE_MAX_GB", 20)
+	cfg.DiagnosticsMaxGB = intEnv("REPLX_EDGE_DIAGNOSTICS_MAX_GB", 10)
+	if cfg.CacheMaxGB < 0 || cfg.DiagnosticsMaxGB < 0 {
+		return Config{}, fmt.Errorf("cache/diagnostics budgets must not be negative")
+	}
 	cfg.TraceRetentionDays = intEnv("REPLX_EDGE_TRACE_RETENTION_DAYS", 7)
 	cfg.PlaybackRetentionDays = intEnv("REPLX_EDGE_PLAYBACK_RETENTION_DAYS", 30)
 	cfg.AuditRetentionDays = intEnv("REPLX_EDGE_AUDIT_RETENTION_DAYS", 180)
@@ -148,6 +159,9 @@ func (c Config) Validate() error {
 	}
 	if c.PublicURL == "" {
 		return fmt.Errorf("REPLX_EDGE_PUBLIC_URL is required")
+	}
+	if c.AdminBind == "0.0.0.0" {
+		return fmt.Errorf("REPLX_EDGE_ADMIN_BIND must never be 0.0.0.0: bind loopback or a Tailscale IP")
 	}
 	if c.MediaFallbackEnabled && c.MediaPublicURL == "" {
 		return fmt.Errorf("REPLX_EDGE_MEDIA_PUBLIC_URL is required when media fallback is enabled")
