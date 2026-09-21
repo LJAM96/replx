@@ -41,17 +41,18 @@ func batchSize(p Policy) int {
 
 // purgeBatched deletes matching rows in LIMIT-bounded batches until none
 // remain or the context expires. days < 0 means the predicate takes no arg.
+// Postgres has no DELETE ... LIMIT, so each batch deletes a bounded ctid
+// set selected in a subquery: bounded locks without long transactions.
 func purgeBatched(ctx context.Context, db database.DBTX, table, where string, days, batch int) (int64, error) {
 	var total int64
 	lim := strconv.Itoa(batch)
 	for {
 		var n int64
 		var err error
+		q := `WITH gone AS (DELETE FROM ` + table + ` WHERE ctid IN (SELECT ctid FROM ` + table + ` WHERE ` + where + ` LIMIT ` + lim + `) RETURNING 1) SELECT count(*) FROM gone`
 		if days < 0 {
-			q := `WITH gone AS (DELETE FROM ` + table + ` WHERE ` + where + ` LIMIT ` + lim + ` RETURNING 1) SELECT count(*) FROM gone`
 			err = db.QueryRow(ctx, q).Scan(&n)
 		} else {
-			q := `WITH gone AS (DELETE FROM ` + table + ` WHERE ` + where + ` LIMIT ` + lim + ` RETURNING 1) SELECT count(*) FROM gone`
 			err = db.QueryRow(ctx, q, days).Scan(&n)
 		}
 		if err != nil {
