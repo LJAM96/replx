@@ -7,6 +7,7 @@ package retention
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -131,7 +132,7 @@ func Run(ctx context.Context, db database.DBTX, p Policy, logger *logging.Logger
 }
 
 func purgeAndLog(ctx context.Context, db database.DBTX, p Policy, logger *logging.Logger) {
-	res, err := PurgeOnce(ctx, db, p)
+	res, err := PurgeOnce(ctx, db, livePolicy(ctx, db, p))
 	if logger == nil {
 		return
 	}
@@ -143,4 +144,37 @@ func purgeAndLog(ctx context.Context, db database.DBTX, p Policy, logger *loggin
 	logger.Log(logging.Entry{Level: "info", Component: "retention",
 		Fields: map[string]any{"event": "purged", "sessions": res.Sessions,
 			"decisions": res.Decisions, "traces": res.Traces, "audits": res.Audits}})
+}
+
+// livePolicy reloads retention bounds from the runtime settings table so
+// PATCH /api/v1/settings takes effect without restart. Unset, corrupt or
+// out-of-range values fall back to the startup policy; the admin API only
+// ever stores validated integers, so fallback paths cover races and
+// hand-edited rows.
+func livePolicy(ctx context.Context, db database.DBTX, fallback Policy) Policy {
+	if db == nil {
+		return fallback
+	}
+	out := fallback
+	if n, ok := settingDays(ctx, db, "replx.playback_retention_days"); ok && n >= 1 && n <= 3650 {
+		out.PlaybackDays = n
+	}
+	if n, ok := settingDays(ctx, db, "replx.audit_retention_days"); ok && n >= 1 && n <= 3650 {
+		out.AuditDays = n
+	}
+	return out
+}
+
+func settingDays(ctx context.Context, db database.DBTX, key string) (int, bool) {
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var raw []byte
+	if err := db.QueryRow(cctx, `SELECT value FROM app_settings WHERE key=$1`, key).Scan(&raw); err != nil {
+		return 0, false
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, false
+	}
+	return n, true
 }

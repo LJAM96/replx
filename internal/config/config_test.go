@@ -121,3 +121,24 @@ func TestLoadReadsBudgets(t *testing.T) {
 		t.Fatalf("budgets/bind: %+v", cfg)
 	}
 }
+
+func TestSecretRequiresGeneratedMaterial(t *testing.T) {
+	hexSecret := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	if err := checkSecretEntropy(hexSecret); err != nil {
+		t.Fatalf("64 hex chars must pass: %v", err)
+	}
+	if err := checkSecretEntropy("MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI="); err != nil {
+		t.Fatalf("base64 32 bytes must pass: %v", err)
+	}
+	for _, bad := range []string{
+		"",
+		"short",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 16 bytes: too short
+		"correct horse battery staple, quite long indeed",
+		"replace-with-at-least-32-random-bytes",
+	} {
+		if err := checkSecretEntropy(bad); err == nil {
+			t.Errorf("passphrase %q must be rejected", bad)
+		}
+	}
+}

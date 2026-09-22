@@ -34,6 +34,7 @@
 | `POSTGRES_DB` | No | Postgres database (`replx_edge`) |
 | `POSTGRES_USER` | No | Postgres user (`replx_edge`) |
 | `REPLX_EDGE_POSTGRES_URL` | No | Full Postgres URL override (tests, non-Compose) |
+| `POSTGRES_SSLMODE` | No | Explicit libpq sslmode. Empty default: `disable` on the local deployment network (`postgres`, loopback), `require` everywhere else; unknown values fail startup |
 | `REPLX_EDGE_VALKEY_ADDR` | No | Valkey `host:port` (`valkey:6379`); down degrades cache, never readiness |
 | `REPLX_EDGE_PLEXTV_URL` | No | plex.tv API root override (tests only; default `https://plex.tv`) |
 | `REPLX_EDGE_SPIKE_ROUTING` | No | P0 spike 307 media redirects (`false` = fail-closed 403) |
@@ -56,7 +57,10 @@ A temporary bootstrap token environment variable may be supported only for devel
 
 ## Secret key
 
-`REPLX_EDGE_SECRET_KEY` must contain at least 32 random bytes worth of entropy.
+`REPLX_EDGE_SECRET_KEY` must be 32 or more random bytes represented as
+hex (`openssl rand -hex 32`) or Base64. Human-chosen passphrases are
+rejected at startup: entropy estimation of chosen strings is misleading,
+so generation is part of deployment.
 
 Key loss means encrypted owner PMS credentials cannot be recovered. Back up this key separately with access controls appropriate for credentials.
 

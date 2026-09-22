@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -93,7 +94,7 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 	m := &Mux{mux: http.NewServeMux(), svc: svc, spike: spikeStore, spikeObs: spikeObs, setupToken: setupToken, setupIssued: time.Now(), requireAuth: requireAuth, sessions: newSessionStore()}
 	m.mux.Handle("/health/", health.AdminMux(checks))
 	m.mux.HandleFunc("/admin/login", m.handleLogin)
-	m.mux.HandleFunc("/admin/logout", m.handleLogout)
+	m.mux.HandleFunc("/admin/logout", m.auth(m.handleLogout))
 	m.mux.HandleFunc("/api/v1/onboarding/status", m.auth(m.handleStatus))
 	m.mux.HandleFunc("/api/v1/onboarding/pin", m.auth(m.handlePIN))
 	m.mux.HandleFunc("/api/v1/onboarding/token", m.auth(m.handleToken))
@@ -277,9 +278,23 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "username and password, or setup token, required")
 			return
 		}
-		if !m.verifyAdmin(r.Context(), username, password) {
+		// Throttle by source and username. Failures stay
+		// indistinguishable between unknown and existing usernames.
+		if !m.checkRate("login:"+loginPeer(r)+":"+username, 5*time.Minute, 10) {
+			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many login attempts; retry later")
+			return
+		}
+		hash, ok := m.verifyAdmin(r.Context(), username, password)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "wrong username or password")
 			return
+		}
+		// Transparent upgrade: a valid record with older parameters is
+		// rehashed to current parameters without bothering the operator.
+		if needsRehash(hash) {
+			if fresh, err := hashPassword(password); err == nil {
+				_, _ = m.svc.DB.Exec(r.Context(), `UPDATE admin_users SET password_hash=$1, updated_at=now() WHERE username=$2`, fresh, username)
+			}
 		}
 		id, _, err := m.sessions.createWithSubject(username)
 		if err != nil {
@@ -294,8 +309,11 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Mux) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "POST or GET")
+	// POST only with the normal cookie CSRF protection (enforced by
+	// m.auth): logout is state mutation, and a cross-site navigation
+	// must never terminate an administrator session.
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "POST only")
 		return
 	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
@@ -305,17 +323,33 @@ func (m *Mux) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
 }
 
-func (m *Mux) verifyAdmin(ctx context.Context, username, password string) bool {
+func (m *Mux) verifyAdmin(ctx context.Context, username, password string) (string, bool) {
 	if m.svc == nil {
-		return false
+		return "", false
 	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	var hash string
 	if err := m.svc.DB.QueryRow(cctx, `SELECT password_hash FROM admin_users WHERE username=$1`, username).Scan(&hash); err != nil {
-		return false
+		return "", false
 	}
-	return verifyPassword(hash, password)
+	if !verifyPassword(hash, password) {
+		return "", false
+	}
+	return hash, true
+}
+
+// loginPeer keys login throttling by source address. Unparseable remotes
+// collapse to one shared bucket (fail throttled, never open).
+func loginPeer(r *http.Request) string {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+	if host == "" {
+		host = "unknown"
+	}
+	return host
 }
 
 func writeData(w http.ResponseWriter, status int, data any) {

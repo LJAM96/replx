@@ -912,3 +912,33 @@ func TestStateWriteBumpsCWGeneration(t *testing.T) {
 		t.Fatalf("CW after timeline must miss, got %s", got.Header().Get(CacheHeader))
 	}
 }
+
+func TestForwardedForTrustModel(t *testing.T) {
+	mk := func(remote, xff string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+		req.RemoteAddr = remote
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		return req
+	}
+	// Infrastructure peer (container loopback): history preserved.
+	if got := forwardedFor(mk("127.0.0.1:40000", "203.0.113.7")); got != "203.0.113.7, 127.0.0.1" {
+		t.Fatalf("trusted peer must preserve history: %q", got)
+	}
+	// Arbitrary client: forged history replaced with the observed peer.
+	if got := forwardedFor(mk("203.0.113.9:40000", "10.9.9.9")); got != "203.0.113.9" {
+		t.Fatalf("untrusted peer must not forward history: %q", got)
+	}
+	// IPv6 loopback parses via SplitHostPort, not naive colon split.
+	if got := forwardedFor(mk("[::1]:40000", "")); got != "::1" {
+		t.Fatalf("v6 peer: %q", got)
+	}
+	// Bare IP without port still parses; garbage yields nothing.
+	if got := forwardedFor(mk("10.0.0.5", "")); got != "10.0.0.5" {
+		t.Fatalf("bare IP: %q", got)
+	}
+	if got := forwardedFor(mk("not-an-address", "1.2.3.4")); got != "" {
+		t.Fatalf("garbage peer must yield nothing: %q", got)
+	}
+}

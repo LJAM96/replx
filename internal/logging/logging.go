@@ -68,9 +68,17 @@ func canonicalHeader(k string) string {
 }
 
 // RedactURLString strips sensitive query values from a URL string for logs.
+// Malformed input fails closed: everything from the first query or
+// fragment delimiter is removed, because malformed input is precisely
+// where conservative redaction matters most.
 func RedactURLString(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.RawQuery == "" {
+		if err != nil {
+			if i := strings.IndexAny(raw, "?#"); i >= 0 {
+				return raw[:i] + "?REDACTED"
+			}
+		}
 		return raw
 	}
 	q := u.Query()
@@ -113,8 +121,52 @@ type Logger struct {
 // New returns a Logger writing to w.
 func New(w io.Writer) *Logger { return &Logger{w: w} }
 
-// Log writes e with a UTC timestamp.
+// Log writes e with a UTC timestamp. Fields pass through a final
+// sink-level filter: any string value under a sensitive key
+// (token, secret, password, cookie, authorization, in any case) is
+// replaced, so a caller mistake cannot leak a credential into the log
+// stream. Structured callers must still prefer fingerprints and redacted
+// URLs; this is defense in depth, not the primary control.
 func (l *Logger) Log(e Entry) {
 	e.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
+	e.Path = RedactURLString(e.Path)
+	if e.Fields != nil {
+		for k, v := range e.Fields {
+			if sensitiveField(k) {
+				e.Fields[k] = "REDACTED"
+				continue
+			}
+			if s, ok := v.(string); ok && len(s) > 0 && looksLikeTokenURL(s) {
+				e.Fields[k] = RedactURLString(s)
+			}
+		}
+	}
 	_ = json.NewEncoder(l.w).Encode(e)
+}
+
+func sensitiveField(k string) bool {
+	lk := strings.ToLower(k)
+	for _, sub := range []string{"token", "secret", "password", "cookie", "authorization", "set-cookie"} {
+		if strings.Contains(lk, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeTokenURL redacts string field values that carry a query string
+// with a sensitive-looking parameter, e.g. a redirect Location that
+// escaped RedactedLocation upstream.
+func looksLikeTokenURL(s string) bool {
+	i := strings.IndexByte(s, '?')
+	if i < 0 || !strings.Contains(s[:i], "/") {
+		return false
+	}
+	q := strings.ToLower(s[i:])
+	for _, sub := range []string{"token", "secret", "password", "auth"} {
+		if strings.Contains(q, sub) {
+			return true
+		}
+	}
+	return false
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -757,7 +758,7 @@ func (m *Mux) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		rows, err := m.svc.DB.Query(r.Context(), `SELECT key, value FROM app_settings WHERE key NOT LIKE 'onboarding.%' AND key NOT LIKE '%token%' ORDER BY key LIMIT 200`)
+		rows, err := m.svc.DB.Query(r.Context(), `SELECT key, value FROM app_settings WHERE key = ANY($1) ORDER BY key`, runtimeSettingKeys())
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "SETTINGS_FAILED", err.Error())
 			return
@@ -777,33 +778,80 @@ func (m *Mux) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadGateway, "SETTINGS_FAILED", err.Error())
 			return
 		}
-		writeData(w, http.StatusOK, out)
+		writeData(w, http.StatusOK, map[string]any{"settings": out, "spec": runtimeSettingSpec()})
 	case http.MethodPatch:
 		var body map[string]json.RawMessage
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "INVALID_BODY", "settings JSON required")
 			return
 		}
-		for k := range body {
-			if strings.Contains(k, "SECRET") || strings.Contains(k, "TOKEN") || strings.Contains(k, "token") || strings.HasPrefix(k, "onboarding.") {
-				writeError(w, http.StatusBadRequest, "SETTING_IMMUTABLE", "secrets, tokens and onboarding state require restart/re-onboarding: "+k)
+		for k, v := range body {
+			n, err := validatedSetting(k, v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "SETTING_INVALID", err.Error())
 				return
 			}
-		}
-		for k, v := range body {
 			var before json.RawMessage
 			_ = m.svc.DB.QueryRow(r.Context(), `SELECT value FROM app_settings WHERE key=$1`, k).Scan(&before)
+			raw, _ := json.Marshal(n)
 			if _, err := m.svc.DB.Exec(r.Context(), `INSERT INTO app_settings(key,value,updated_at) VALUES($1,$2,now())
-				ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, k, string(v)); err != nil {
+				ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, k, string(raw)); err != nil {
 				writeError(w, http.StatusBadGateway, "SETTING_STORE_FAILED", err.Error())
 				return
 			}
-			m.auditEventWithBefore(r.Context(), subjectOf(r), "retention.setting.change", "setting", k, before, v)
+			m.auditEventWithBefore(r.Context(), subjectOf(r), "retention.setting.change", "setting", k, before, raw)
 		}
 		writeData(w, http.StatusOK, map[string]any{"updated": true})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET or PATCH")
 	}
+}
+
+// settingBounds defines the explicit allowlist of runtime-mutable
+// settings: name, description, range in days, and default. Anything else
+// is rejected: secrets, listener bindings, ingress mode, database wiring
+// and onboarding state require environment changes and restart, and
+// arbitrary keys would leave the API contract undefined.
+var settingBounds = map[string]struct {
+	desc     string
+	min, max int
+	def      int
+}{
+	"replx.playback_retention_days": {"playback decisions and completed sessions retention (days); live, reloaded each purge", 1, 3650, 30},
+	"replx.audit_retention_days":    {"audit events retention (days); live, reloaded each purge", 1, 3650, 180},
+}
+
+func runtimeSettingKeys() []string {
+	out := make([]string, 0, len(settingBounds))
+	for k := range settingBounds {
+		out = append(out, k)
+	}
+	return out
+}
+
+func runtimeSettingSpec() map[string]any {
+	out := map[string]any{}
+	for k, b := range settingBounds {
+		out[k] = map[string]any{"description": b.desc, "minDays": b.min, "maxDays": b.max, "defaultDays": b.def, "restartRequired": false}
+	}
+	return out
+}
+
+// validatedSetting rejects unknown keys and out-of-range values,
+// returning the normalized integer days.
+func validatedSetting(key string, raw json.RawMessage) (int, error) {
+	b, ok := settingBounds[key]
+	if !ok {
+		return 0, fmt.Errorf("unknown setting %q: mutable settings are exactly %v; secrets, bindings and onboarding state require restart/re-onboarding", key, runtimeSettingKeys())
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, fmt.Errorf("setting %q must be an integer number of days", key)
+	}
+	if n < b.min || n > b.max {
+		return 0, fmt.Errorf("setting %q must be %d..%d days", key, b.min, b.max)
+	}
+	return n, nil
 }
 
 // --- setup / rate limiting ---

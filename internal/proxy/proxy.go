@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -585,12 +587,8 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 	}
 	copyHeaders(out.Header, r.Header)
 	out.Header.Set(RequestIDHeader, id)
-	if host := clientIP(r); host != "" {
-		prior := out.Header.Get("X-Forwarded-For")
-		if prior != "" {
-			host = prior + ", " + host
-		}
-		out.Header.Set("X-Forwarded-For", host)
+	if fwd := forwardedFor(r); fwd != "" {
+		out.Header.Set("X-Forwarded-For", fwd)
 	}
 	out.Host = h.origin.Host
 	originStart := time.Now()
@@ -835,14 +833,10 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	if o.cacheable {
 		out.Header.Del("Accept-Encoding")
 	}
-	// The origin needs the real client IP for its own logs; X-Forwarded-For
-	// is informational only and never trusted for auth.
-	if host := clientIP(r); host != "" {
-		prior := out.Header.Get("X-Forwarded-For")
-		if prior != "" {
-			host = prior + ", " + host
-		}
-		out.Header.Set("X-Forwarded-For", host)
+	// The origin gets an informational client IP for its own logs, never
+	// for auth; see forwardedFor for the trust model.
+	if fwd := forwardedFor(r); fwd != "" {
+		out.Header.Set("X-Forwarded-For", fwd)
 	}
 	out.Host = h.origin.Host
 
@@ -1096,12 +1090,51 @@ func singleJoin(a, b string) string {
 	return strings.TrimSuffix(a, "/") + "/" + strings.TrimPrefix(b, "/")
 }
 
-func clientIP(r *http.Request) string {
-	if r.RemoteAddr == "" {
+// tailscaleRange mirrors the admin bind policy: the CGNAT overlay is an
+// explicitly permitted private route. See internal/config.
+var tailscaleRange = netip.MustParsePrefix("100.64.0.0/10")
+
+// forwardedFor builds the X-Forwarded-For value for origin requests under
+// a defined trusted-peer model. The immediate peer address is parsed with
+// net.SplitHostPort (never a naive colon split) and always recorded.
+// Inbound history is preserved only when the immediate peer is
+// infrastructure Replx terminates behind (loopback, private, Tailscale
+// CGNAT, link-local): any other peer could have forged the leftmost
+// entries, so the value is replaced with just the observed address.
+// Informational for origin logs only, never authentication.
+func forwardedFor(r *http.Request) string {
+	observed := peerIP(r)
+	if observed == "" {
 		return ""
 	}
-	if i := strings.LastIndex(r.RemoteAddr, ":"); i >= 0 {
-		return r.RemoteAddr[:i]
+	if prior := r.Header.Get("X-Forwarded-For"); prior != "" && trustedPeer(observed) {
+		return prior + ", " + observed
 	}
-	return r.RemoteAddr
+	return observed
+}
+
+// peerIP parses the immediate peer address from RemoteAddr.
+func peerIP(r *http.Request) string {
+	if r == nil || r.RemoteAddr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return strings.TrimSpace(host)
+	}
+	// No port present: accept a bare IP literally, reject anything else.
+	if ip, err := netip.ParseAddr(strings.TrimSpace(r.RemoteAddr)); err == nil {
+		return ip.String()
+	}
+	return ""
+}
+
+// trustedPeer reports whether forwarding history arriving from ip may be
+// preserved: only infrastructure peers, never arbitrary clients.
+func trustedPeer(ip string) bool {
+	parsed, err := netip.ParseAddr(ip)
+	if err != nil || parsed.Zone() != "" {
+		return false
+	}
+	return parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() ||
+		tailscaleRange.Contains(parsed)
 }

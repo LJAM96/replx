@@ -84,11 +84,13 @@ type Store struct {
 
 // New creates the cache directory. maxGB<=0 disables the budget check
 // frequency, not the budget itself: pass a positive budget in production.
+// The directory is owner-only: cached artwork is user-accessible media,
+// not world-readable state.
 func New(dir string, maxGB int) (*Store, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("artwork: empty directory")
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("artwork: mkdir: %w", err)
 	}
 	return &Store{dir: dir, maxBytes: int64(maxGB) << 30}, nil
@@ -133,8 +135,13 @@ func (s *Store) Get(key string) (string, []byte, bool) {
 	return m.ContentType, body, true
 }
 
-// Set stores a transcode atomically (tmp+rename). Oversize bodies and
-// empty keys are rejected, never partially stored.
+// Set stores a transcode atomically. Each payload is written to a unique
+// temporary file in the destination filesystem (os.CreateTemp, never a
+// predictable sibling path) and renamed into place; concurrent writers
+// for the same key can no longer share or interleave temporaries. The
+// body lands before the metadata so a crash can only leave an orphaned
+// body, which reads as a miss and is reclaimed by the sweeper — never a
+// metadata record pointing at a torn body. Files are owner-only.
 func (s *Store) Set(key, contentType string, body []byte) error {
 	if s == nil || key == "" {
 		return fmt.Errorf("artwork: empty key")
@@ -144,22 +151,64 @@ func (s *Store) Set(key, contentType string, body []byte) error {
 	}
 	metaPath, bodyPath := s.paths(key)
 	m, _ := json.Marshal(meta{ContentType: contentType, StoredAt: time.Now().UTC().Format(time.RFC3339)})
-	tmpMeta, tmpBody := metaPath+".tmp", bodyPath+".tmp"
-	if err := os.WriteFile(tmpMeta, m, 0o644); err != nil {
+	tmpBody, err := writeTemp(s.dir, body)
+	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(tmpBody, body, 0o644); err != nil {
-		_ = os.Remove(tmpMeta)
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmpBody)
+		}
+	}()
+	tmpMeta, err := writeTemp(s.dir, m)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmpMeta)
+		}
+	}()
+	if err := os.Rename(tmpBody, bodyPath); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpMeta, metaPath); err != nil {
+		_ = os.Remove(bodyPath)
 		return err
 	}
-	if err := os.Rename(tmpBody, bodyPath); err != nil {
-		_ = os.Remove(metaPath)
-		return err
-	}
+	ok = true
 	return nil
+}
+
+// writeTemp Durably writes b to a unique 0600 file in dir and returns its
+// path. Unique names (not key-derived siblings) close the concurrent
+// writer race; fsync keeps a crash from tearing the payload.
+func writeTemp(dir string, b []byte) (string, error) {
+	f, err := os.CreateTemp(dir, ".artwork-tmp-*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
 }
 
 // Sweep deletes oldest bodies until the budget holds. Returns removals.
@@ -179,6 +228,12 @@ func (s *Store) Sweep() (removed int, freed int64) {
 	var bodies []file
 	var total int64
 	for _, e := range entries {
+		// Crash orphans from interrupted writes never become entries:
+		// reclaim them on every sweep.
+		if strings.HasPrefix(e.Name(), ".artwork-tmp-") {
+			_ = os.Remove(filepath.Join(s.dir, e.Name()))
+			continue
+		}
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".body") {
 			continue
 		}
