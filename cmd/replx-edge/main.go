@@ -91,6 +91,17 @@ func runServe() error {
 	}
 	logger := logging.New(os.Stderr)
 
+	// The media gateway profile is a documented placeholder in this
+	// build (health endpoint only, no session/policy/streaming): enabling
+	// it must be a deliberate, loudly logged choice, never mistaken for
+	// a functional media plane. Policy routingMode values that would
+	// select it are rejected at the admin API for the same reason.
+	if cfg.MediaFallbackEnabled {
+		logger.Log(logging.Entry{Level: "warn", Component: "gateway",
+			Fields: map[string]any{"event": "media_fallback_placeholder",
+				"msg": "REPLX_EDGE_MEDIA_FALLBACK_ENABLED=true but the media gateway serves health checks only; direct-origin routing remains the media plane"}})
+	}
+
 	if cfg.OriginInternalURL == "" {
 		return fmt.Errorf("REPLX_EDGE_ORIGIN_INTERNAL_URL is required for serve")
 	}

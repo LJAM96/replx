@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/LJAM96/replx/internal/health"
@@ -51,4 +52,46 @@ func TestLiveSetupRequiresToken(t *testing.T) {
 		t.Fatalf("exactly one administrator: %d %v", n, err)
 	}
 	_ = ctx
+}
+
+// TestLiveConcurrentSetup proves the singleton is database-enforced: two
+// simultaneous setups with independent muxes (separate setup tokens, as in
+// two processes) yield exactly one administrator.
+func TestLiveConcurrentSetup(t *testing.T) {
+	_, db1 := testdb.Begin(t)
+	_, db2 := testdb.Begin(t)
+	m1 := NewMux(health.Checks{}, &onboarding.Service{DB: db1}, "bootstrap-one", true, nil, &spike.Observations{DB: db1})
+	m2 := NewMux(health.Checks{}, &onboarding.Service{DB: db2}, "bootstrap-two", true, nil, &spike.Observations{DB: db2})
+	codes := make([]int, 2)
+	var wg sync.WaitGroup
+	for i, tc := range []struct {
+		m     *Mux
+		token string
+		user  string
+	}{
+		{m1, "bootstrap-one", "first"},
+		{m2, "bootstrap-two", "second"},
+	} {
+		wg.Add(1)
+		go func(i int, m *Mux, token, user string) {
+			defer wg.Done()
+			body := `{"username":"` + user + `","password":"correct-horse-32"}`
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			m.ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		}(i, tc.m, tc.token, tc.user)
+	}
+	wg.Wait()
+	created := 0
+	for _, c := range codes {
+		if c == http.StatusCreated {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("exactly one concurrent setup must win, codes=%v", codes)
+	}
 }

@@ -82,7 +82,27 @@ Never stale serve writes, playback decisions, session termination, timeline or s
 
 ## Stampede control
 
-Use a short Valkey refresh lock. One request refreshes an expired object while other requests either use the permitted stale value or wait for a bounded duration.
+One request refreshes an expired object while other requests wait a
+bounded duration and re-check. Acquisition is atomic (check-and-claim
+under one lock): exactly one request per key becomes the refresher.
+
+## Invalidation generations
+
+Keys carry per-scope, per-class and global generation segments
+(`...:{scope}:{representation}:{scopeGen}:{globalGen}:{hash}`).
+Timeline, scrobble and unscrobble mutations retire the writer's Continue
+Watching namespace in constant time; the admin invalidation API retires
+arbitrary namespaces the same way. TTLs remain the backstop. The cache
+scope is canonically `user:{identity_uuid}` everywhere (proxy, cache and
+owner warmer); legacy `acct:`/`tok:` forms appear only where no identity
+store is wired.
+
+## Representation normalization
+
+Cacheable origin requests are normalized to the identity encoding
+(stored bytes are servable regardless of client `Accept-Encoding`);
+encoded or wildcard-`Vary` responses are never stored. `Content-Encoding`
+is not a persisted header.
 
 ## Owner library sync
 
@@ -110,6 +130,11 @@ Invalidate after successful timeline, scrobble and unscrobble changes.
 ## Search
 
 PostgreSQL provides candidate search with FTS and trigram indexes. In Production 1.0 the local index covers `title`, `sort_title` and `original_title` only. Cast, director, collection and label search fall back to PMS. Search is an optimization. If visibility or index freshness is uncertain, use PMS.
+
+Because the owner index carries no per-user library grants, locally
+serving its candidates would bypass Plex visibility controls. In
+Production 1.0 `/hubs/search` always passes through to PMS; local
+candidates stay behind a future PMS-authorized path.
 
 ## Cloudflare
 

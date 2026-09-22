@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -940,5 +942,84 @@ func TestForwardedForTrustModel(t *testing.T) {
 	}
 	if got := forwardedFor(mk("not-an-address", "1.2.3.4")); got != "" {
 		t.Fatalf("garbage peer must yield nothing: %q", got)
+	}
+}
+
+func TestConcurrentMissesSingleOriginFetch(t *testing.T) {
+	const secret = "test-secret-for-singleflight-0123456789abcdef"
+	var hits int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		time.Sleep(200 * time.Millisecond) // hold the race window open
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte("<MediaContainer/>"))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: cache.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 10
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+			req.Header.Set("X-Plex-Token", "user-flock-token")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+	for _, c := range codes {
+		if c != http.StatusOK {
+			t.Fatalf("all must succeed, got %v", codes)
+		}
+	}
+	if got := atomic.LoadInt64(&hits); got != 1 {
+		t.Fatalf("concurrent misses must cause exactly one origin fetch, got %d", got)
+	}
+}
+
+func TestEncodingNormalizedAcrossClients(t *testing.T) {
+	const secret = "test-secret-for-encoding-0123456789abcdef"
+	var hits int64
+	var sawAE []string
+	var mu sync.Mutex
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		mu.Lock()
+		sawAE = append(sawAE, r.Header.Get("Accept-Encoding"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte("<MediaContainer/>"))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: cache.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(ae string) string {
+		req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+		req.Header.Set("X-Plex-Token", "user-enc-token")
+		if ae != "" {
+			req.Header.Set("Accept-Encoding", ae)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d", rec.Code)
+		}
+		return rec.Body.String()
+	}
+	a, b := get("gzip"), get("")
+	if a != b || a != "<MediaContainer/>" {
+		t.Fatalf("encoding must not split or corrupt responses: %q %q", a, b)
+	}
+	if got := atomic.LoadInt64(&hits); got != 1 {
+		t.Fatalf("normalized encoding must share one origin fetch, hits=%d ae=%v", got, sawAE)
 	}
 }

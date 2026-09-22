@@ -332,3 +332,52 @@ func TestLiveDirtyLightRefreshRevisits(t *testing.T) {
 		t.Fatalf("light refresh must revisit changed records: %q %v", got, err)
 	}
 }
+
+func TestLiveDeletedLibraryReconciled(t *testing.T) {
+	ctx, db := liveDB(t)
+	seedServer(t, db)
+
+	sections := `{"MediaContainer":{"Directory":[{"key":"22","type":"movie","title":"Movies"},{"key":"99","type":"movie","title":"Retired"}]}}`
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/library/sections":
+			_, _ = fmt.Fprint(w, sections)
+		case strings.HasSuffix(r.URL.Path, "/all"):
+			_, _ = fmt.Fprint(w, `{"MediaContainer":{"size":1,"totalSize":1,"offset":0,"Metadata":[ `+liveItemA+` ]}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer origin.Close()
+
+	var reg metrics.Registry
+	w := New(db, origin.URL, func(ctx context.Context) (string, bool) { return "owner-test-token", true },
+		logging.New(io.Discard), &reg)
+	count := func(q string, args ...any) int {
+		var n int
+		if err := db.QueryRow(ctx, q, args...).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if err := w.SyncOnce(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(`SELECT count(*) FROM libraries`); n != 2 {
+		t.Fatalf("libraries=%d", n)
+	}
+	// Origin removes section 99: the next full sweep reconciles it away
+	// (items, variants, parts and cursors cascade; playback history is
+	// preserved by SET NULL references).
+	sections = `{"MediaContainer":{"Directory":[{"key":"22","type":"movie","title":"Movies"}]}}`
+	if err := w.SyncOnce(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(`SELECT count(*) FROM libraries`); n != 1 {
+		t.Fatalf("retired library must reconcile away, libraries=%d", n)
+	}
+	if n := count(`SELECT count(*) FROM sync_cursors WHERE library_id NOT IN (SELECT id FROM libraries)`); n != 0 {
+		t.Fatalf("orphaned cursors: %d", n)
+	}
+}

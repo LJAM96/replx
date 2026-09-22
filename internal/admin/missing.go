@@ -744,11 +744,11 @@ func (m *Mux) handleLogs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
 		return
 	}
-	limit, _ := parseCursor(r, 50, 200)
-	_ = limit
-	// Structured logs stream to stderr (Docker); the API surfaces the
-	// contract without inventing a second log store in 1.0.
-	writePage(w, map[string]any{"logs": []any{}, "note": "structured JSON logs stream to container stderr; use docker compose logs replx-edge"}, nil)
+	// Not implemented as a finished capability: structured logs stream
+	// to container stderr (docker compose logs replx-edge). 501 instead
+	// of an empty 200 so operators never mistake the stub for coverage.
+	writeError(w, http.StatusNotImplemented, "LOGS_NOT_IMPLEMENTED",
+		"live log streaming is not implemented; inspect container stderr (docker compose logs replx-edge)")
 }
 
 func (m *Mux) handleSettings(w http.ResponseWriter, r *http.Request) {
