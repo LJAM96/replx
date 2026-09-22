@@ -37,6 +37,14 @@ import (
 // revalidateAfter bounds plex.tv traffic for definitively bad tokens.
 const revalidateAfter = time.Hour
 
+// credentialValidityPeriod bounds how long a linked credential authorizes
+// locally served responses without fresh proof. Identity association (who
+// this fingerprint belonged to) is kept indefinitely for scoping and
+// policy, but local serving (long lived artwork) requires validity proven
+// within this window. plex.tv is consulted at most once per memTTL per
+// fingerprint, never on the steady-state hot path.
+const credentialValidityPeriod = 24 * time.Hour
+
 // memTTL bounds the process-local resolution caches.
 const memTTL = 5 * time.Minute
 
@@ -63,13 +71,21 @@ func FromTrace(c trace.Client) Client {
 		Platform: c.Platform, Device: c.Device, Model: c.Model}
 }
 
-// Resolved is one fingerprint's identity outcome.
+// Resolved is one fingerprint's identity outcome. Identity association,
+// credential validity and library authorization are separate concepts:
+//   - Known means the fingerprint links to a Plex account (scoping, policy).
+//   - Fresh means the credential was proven valid within
+//     credentialValidityPeriod (authorizes locally served responses).
+//   - Invalid means plex.tv definitively rejected the credential recently:
+//     callers must bypass local serving and let PMS answer (usually 401).
 type Resolved struct {
 	Scope      string // cache scope: acct:<id> or tok:<fingerprint>
 	IdentityID string // plex_identities UUID, "" when unresolved
 	ClientID   string // client_instances UUID, "" when unrecorded
 	AccountID  int64
 	Known      bool // account proven via link table or plex.tv
+	Fresh      bool // credential proven within the validity window
+	Invalid    bool // definitively rejected recently; do not serve locally
 	Degraded   bool // known links keep working; cold tokens retry soon
 }
 
@@ -89,6 +105,8 @@ type acctEntry struct {
 	identityID string
 	accountID  int64
 	known      bool
+	fresh      bool
+	invalid    bool
 	at         time.Time
 }
 
@@ -116,7 +134,8 @@ func (r *Resolver) Resolve(ctx context.Context, fingerprint, token string, clien
 	cli, cliOK := r.cli[cliKey]
 	r.mu.Unlock()
 	if acctOK && now.Sub(acct.at) < memTTL {
-		out := Resolved{Scope: acct.scope, IdentityID: acct.identityID, AccountID: acct.accountID, Known: acct.known}
+		out := Resolved{Scope: acct.scope, IdentityID: acct.identityID, AccountID: acct.accountID,
+			Known: acct.known, Fresh: acct.fresh, Invalid: acct.invalid}
 		if client.Identifier != "" {
 			if cliOK && now.Sub(cli.at) < memTTL {
 				out.ClientID = cli.clientID
@@ -142,7 +161,8 @@ func (r *Resolver) Resolve(ctx context.Context, fingerprint, token string, clien
 			r.evictAcctLocked()
 		}
 		r.acct[fingerprint] = acctEntry{scope: res.Scope, identityID: res.IdentityID,
-			accountID: res.AccountID, known: res.Known, at: now}
+			accountID: res.AccountID, known: res.Known, fresh: res.Fresh,
+			invalid: res.Invalid, at: now}
 	}
 	if client.Identifier == "" {
 		return res
@@ -172,37 +192,72 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 	if serverID == "" {
 		return fallback, true
 	}
-	// Known link?
+	// Known link? Identity association and credential validity are read
+	// together but interpreted separately below.
 	var identityID *string
 	var accountID *int64
 	var status string
-	var validated *float64
+	var validatedAt *time.Time
 	err := r.DB.QueryRow(cctx, `SELECT t.identity_id::text, i.plex_account_id, t.token_status,
-		EXTRACT(EPOCH FROM t.last_validated_at)
+		t.last_validated_at
 		FROM plex_token_identities t LEFT JOIN plex_identities i ON i.id = t.identity_id
 		WHERE t.server_id=$1 AND t.token_fingerprint=$2`, serverID, fingerprint).
-		Scan(&identityID, &accountID, &status, &validated)
-	if err == nil && identityID != nil && *identityID != "" && accountID != nil {
+		Scan(&identityID, &accountID, &status, &validatedAt)
+	linked := err == nil && identityID != nil && *identityID != "" && accountID != nil
+	if status == "invalid" {
+		// Definitive rejection on record: never known. Revalidate at
+		// most hourly so a revoked credential cannot hammer plex.tv
+		// back into validity through request volume.
+		if validatedAt != nil && time.Since(*validatedAt) < revalidateAfter {
+			return Resolved{Scope: fallback.Scope, Invalid: true}, true
+		}
+	} else if linked {
+		fresh := validatedAt != nil && time.Since(*validatedAt) < credentialValidityPeriod
+		if fresh || r.TV == nil || token == "" {
+			// Proven within the validity window, or nothing available
+			// to revalidate with: the association holds and freshness
+			// reflects the last proof.
+			res := Resolved{Scope: "acct:" + strconv.FormatInt(*accountID, 10),
+				IdentityID: *identityID, AccountID: *accountID, Known: true, Fresh: fresh}
+			res.ClientID = r.recordClient(cctx, serverID, *identityID, client)
+			r.touchLink(cctx, serverID, fingerprint)
+			return res, true
+		}
+		// Stale proof: revalidate the credential now.
+		id, username, verr := r.TV.GetUser(cctx, token)
+		if verr == nil && id != 0 {
+			iid := r.upsertIdentity(cctx, serverID, id, username)
+			r.upsertLink(cctx, serverID, fingerprint, iid)
+			if iid == "" {
+				return fallback, true
+			}
+			return Resolved{Scope: "acct:" + strconv.FormatInt(id, 10), AccountID: id,
+				IdentityID: iid, Known: true, Fresh: true,
+				ClientID: r.recordClient(cctx, serverID, iid, client)}, true
+		}
+		if isAuthFailure(verr) {
+			// Definitively rejected: break the association as well as
+			// the validity so the stale identity cannot linger.
+			r.markInvalid(cctx, serverID, fingerprint)
+			return Resolved{Scope: fallback.Scope, Invalid: true}, true
+		}
+		// Transport/5xx: keep the association for scoping and policy
+		// but mark it unfresh so long lived local responses fall
+		// through to PMS; retry validation soon.
 		res := Resolved{Scope: "acct:" + strconv.FormatInt(*accountID, 10),
-			IdentityID: *identityID, AccountID: *accountID, Known: true}
+			IdentityID: *identityID, AccountID: *accountID, Known: true,
+			Degraded: true}
 		res.ClientID = r.recordClient(cctx, serverID, *identityID, client)
-		r.touchLink(cctx, serverID, fingerprint)
-		return res, true
+		return res, false
 	}
-	_ = accountID
 	if r.TV == nil || token == "" {
-		return fallback, true
-	}
-	// Recently-invalid tokens skip revalidation for an hour.
-	if status == "invalid" && validated != nil &&
-		time.Since(time.Unix(int64(*validated), 0)) < revalidateAfter {
 		return fallback, true
 	}
 	id, username, err := r.TV.GetUser(cctx, token)
 	if err != nil {
 		if isAuthFailure(err) {
 			r.markInvalid(cctx, serverID, fingerprint)
-			return fallback, true
+			return Resolved{Scope: fallback.Scope, Invalid: true}, true
 		}
 		// Transport/5xx/decode: degrade without persisting anything.
 		// Established links above keep resolving; cold tokens retry.
@@ -219,7 +274,7 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 		return fallback, true
 	}
 	return Resolved{Scope: "acct:" + strconv.FormatInt(id, 10), AccountID: id,
-		IdentityID: iid, Known: true,
+		IdentityID: iid, Known: true, Fresh: true,
 		ClientID: r.recordClient(cctx, serverID, iid, client)}, true
 }
 
@@ -320,10 +375,12 @@ func (r *Resolver) upsertLink(ctx context.Context, serverID, fingerprint, identi
 }
 
 func (r *Resolver) markInvalid(ctx context.Context, serverID, fingerprint string) {
+	// Definitive rejection breaks the identity association as well as
+	// validity: the stale account link must not linger as Known.
 	_, _ = r.DB.Exec(ctx, `INSERT INTO plex_token_identities(server_id, token_fingerprint, token_status, last_seen_at, last_validated_at)
 		VALUES($1,$2,'invalid',now(),now())
 		ON CONFLICT (server_id, token_fingerprint) DO UPDATE SET
-			token_status='invalid', last_seen_at=now(), last_validated_at=now()`,
+			identity_id=NULL, token_status='invalid', last_seen_at=now(), last_validated_at=now()`,
 		serverID, fingerprint)
 }
 

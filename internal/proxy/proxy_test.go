@@ -852,3 +852,63 @@ func TestDirectIngressEnforcesPartBoundary(t *testing.T) {
 		t.Fatalf("sessionless prohibited part must deny: %d", ghostRec.Code)
 	}
 }
+
+func TestSearchPassthroughNeverServesLocal(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaContainer":{"size":0}}`))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Arbitrary unvalidated token: must reach PMS untouched, never the
+	// owner index (which carries no per-user library grants).
+	req := httptest.NewRequest(http.MethodGet, "/hubs/search?query=secret-title", nil)
+	req.Header.Set("X-Plex-Token", "arbitrary-unvalidated-token")
+	req.Header.Set("Accept", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"size":0`) {
+		t.Fatalf("search must pass through to PMS: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStateWriteBumpsCWGeneration(t *testing.T) {
+	const secret = "test-secret-for-cw-invalidation-0123456789"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte("<MediaContainer/>"))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: cache.NewMemory()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cw := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/hubs/home/continueWatching", nil)
+		req.Header.Set("X-Plex-Token", "user-cw-token")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if got := cw(); got.Header().Get(CacheHeader) != "miss" {
+		t.Fatalf("first CW must miss, got %s", got.Header().Get(CacheHeader))
+	}
+	if got := cw(); got.Header().Get(CacheHeader) != "hit" {
+		t.Fatalf("second CW must hit, got %s", got.Header().Get(CacheHeader))
+	}
+	// Watch-state mutation retires the CW namespace even though the
+	// timeline route itself is never cacheable.
+	timeline := httptest.NewRequest(http.MethodPost, "/:/timeline?ratingKey=1&state=played", nil)
+	timeline.Header.Set("X-Plex-Token", "user-cw-token")
+	timelineRec := httptest.NewRecorder()
+	h.ServeHTTP(timelineRec, timeline)
+	if timelineRec.Code != http.StatusOK {
+		t.Fatalf("timeline must proxy, got %d", timelineRec.Code)
+	}
+	if got := cw(); got.Header().Get(CacheHeader) != "miss" {
+		t.Fatalf("CW after timeline must miss, got %s", got.Header().Get(CacheHeader))
+	}
+}

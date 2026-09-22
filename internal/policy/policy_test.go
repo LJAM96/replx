@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -22,8 +23,38 @@ func TestMergePrecedence(t *testing.T) {
 		t.Fatal("unset fields must inherit defaults")
 	}
 	// Empty levels never weaken.
-	if got := Effective(Policy{}, Policy{}, Policy{}); got != Defaults() {
+	if got, want := stripProv(Effective(Policy{}, Policy{}, Policy{})), stripProv(Defaults()); !reflect.DeepEqual(got, want) {
 		t.Fatal("empty levels must equal defaults")
+	}
+}
+
+// stripProv removes provenance for value comparison; provenance itself is
+// covered by TestRejectionProvenance.
+func stripProv(p Policy) Policy {
+	p.Provenance = nil
+	return p
+}
+
+// TestRejectionProvenance: a device override of an unrelated field must
+// not mislabel an inherited global restriction. Global denies HDR while
+// the device configures only audio channels: the HDR rejection reads
+// GLOBAL_HDR_DENIED.
+func TestRejectionProvenance(t *testing.T) {
+	hdr := Variant{MediaIndex: 0, DynamicRange: "HDR10", Playability: DirectPlay, PartAvailable: true}
+	sdr := Variant{MediaIndex: 1, DynamicRange: "SDR", Playability: DirectPlay, PartAvailable: true}
+	eff := Effective(Policy{AllowHDR: Deny}, Policy{}, Policy{MaxAudioChannels: intp(2)})
+	d, err := Evaluate(eff, "DEVICE", []Variant{hdr, sdr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.SelectedIndex != 1 {
+		t.Fatalf("SDR must win, got %d", d.SelectedIndex)
+	}
+	if len(d.Rejected) != 1 || RenderReason(d.Rejected[0]) != "GLOBAL_HDR_DENIED" {
+		t.Fatalf("provenance must name global: %+v", d.Rejected)
+	}
+	if eff.Provenance["allowHDR"] != ProvGlobal || eff.Provenance["maxAudioChannels"] != ProvDevice {
+		t.Fatalf("provenance map: %+v", eff.Provenance)
 	}
 }
 

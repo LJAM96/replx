@@ -24,22 +24,26 @@ import (
 	"time"
 
 	"github.com/LJAM96/replx/internal/cache"
+	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
+	"github.com/LJAM96/replx/internal/origin"
 )
 
 // maxTracked bounds memory when many distinct paths are browsed.
 const maxTracked = 512
 
 // Snapshot captures how to reproduce one cache entry. Scope is the
-// identity scope ("acct:<id>" or "tok:<fingerprint>"): refresh compares
-// against the owner scope, never raw tokens.
+// identity scope (canonical "user:<identity UUID>", legacy "acct:<id>" or
+// "tok:<fingerprint>"): refresh compares against the owner scope, never
+// raw tokens. Class is the invalidation namespace for key recomputation.
 type Snapshot struct {
 	Method   string
 	Path     string
 	RawQuery string // secret-stripped by Track
 	Accept   string
 	Scope    string
+	Class    string
 	TTL      time.Duration
 }
 
@@ -59,12 +63,19 @@ type Warmer struct {
 	ownerToken func(ctx context.Context) (string, bool)
 	// OwnerAccount resolves the owner account ID for scope comparison,
 	// cached for a minute. Refresh compares snapshot scopes against
-	// "acct:<ownerID>": account identity, never token material.
+	// the canonical owner scope: account identity, never token material.
 	OwnerAccount func(ctx context.Context) (int64, bool)
-	log          *logging.Logger
-	metrics      *metrics.Registry
-	client       *http.Client
-	now          func() time.Time
+	// DB resolves the owner account to its identity UUID for the
+	// canonical "user:<uuid>" scope. Unset (tests) keeps the legacy
+	// "acct:<id>" comparison.
+	DB database.DBTX
+	// KeyFunc recomputes a snapshot's cache key under current
+	// invalidation generations. Unset keeps the tracked key as-is.
+	KeyFunc func(s Snapshot) string
+	log     *logging.Logger
+	metrics *metrics.Registry
+	client  *http.Client
+	now     func() time.Time
 
 	mu        sync.Mutex
 	tracked   map[string]tracked
@@ -72,6 +83,7 @@ type Warmer struct {
 	errors    int64
 	warming   bool
 	ownerAcct int64
+	ownerUUID string
 	ownerOK   bool
 	ownerAt   time.Time
 }
@@ -89,10 +101,19 @@ func New(store cache.Store, origin, secret string,
 	return &Warmer{
 		store: store, origin: strings.TrimSuffix(origin, "/"), secret: secret,
 		ownerToken: ownerToken, log: logger, metrics: reg,
-		client:  &http.Client{Timeout: 30 * time.Second},
+		client:  originClientFor(origin),
 		now:     time.Now,
 		tracked: map[string]tracked{},
 	}
+}
+
+// originClientFor binds refreshes to the configured origin: redirects
+// leaving it are refused rather than followed with the owner credential.
+func originClientFor(originBase string) *http.Client {
+	if c, err := origin.APIClient(originBase, 30*time.Second); err == nil {
+		return c
+	}
+	return origin.TransparentClient(30 * time.Second)
 }
 
 // Track records a freshly stored entry for future refresh. Snapshots with
@@ -219,8 +240,11 @@ func (w *Warmer) owner(ctx context.Context) (string, bool) {
 	return w.ownerToken(cctx)
 }
 
-// ownerScope returns "acct:<ownerID>", caching the account lookup for a
-// minute. Empty when the owner account is unknown: nothing refreshes.
+// ownerScope returns the canonical owner scope, caching the account
+// lookup for a minute. With a database it resolves the owner account to
+// its identity UUID ("user:<uuid>"), matching the proxy's canonical
+// scope; without one (tests) it keeps the legacy "acct:<id>" form.
+// Empty when the owner account is unknown: nothing refreshes.
 func (w *Warmer) ownerScope(ctx context.Context) string {
 	if w.OwnerAccount == nil {
 		return ""
@@ -228,20 +252,40 @@ func (w *Warmer) ownerScope(ctx context.Context) string {
 	w.mu.Lock()
 	if w.ownerOK && w.now().Sub(w.ownerAt) < time.Minute {
 		id := w.ownerAcct
+		uuid := w.ownerUUID
 		w.mu.Unlock()
-		return "acct:" + strconv.FormatInt(id, 10)
+		return w.canonicalScope(id, uuid)
 	}
 	w.mu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	id, ok := w.OwnerAccount(cctx)
+	var uuid string
+	if ok && w.DB != nil {
+		_ = w.DB.QueryRow(cctx, `SELECT i.id::text FROM plex_identities i
+			JOIN plex_servers s ON s.id = i.server_id
+			WHERE s.enabled AND i.plex_account_id=$1
+			ORDER BY i.updated_at DESC LIMIT 1`).Scan(&uuid)
+	}
 	w.mu.Lock()
-	w.ownerAcct, w.ownerOK, w.ownerAt = id, ok, w.now()
+	w.ownerAcct, w.ownerUUID, w.ownerOK, w.ownerAt = id, uuid, ok, w.now()
 	w.mu.Unlock()
 	if !ok {
 		return ""
 	}
-	return "acct:" + strconv.FormatInt(id, 10)
+	return w.canonicalScope(id, uuid)
+}
+
+// canonicalScope prefers the identity UUID form and falls back to the
+// legacy account form only when no identity store is wired.
+func (w *Warmer) canonicalScope(accountID int64, uuid string) string {
+	if uuid != "" {
+		return cache.UserScope(uuid)
+	}
+	if w.DB != nil {
+		return ""
+	}
+	return "acct:" + strconv.FormatInt(accountID, 10)
 }
 
 func (w *Warmer) countErr() {
@@ -255,7 +299,9 @@ func (w *Warmer) countErr() {
 
 // refresh re-fetches one entry under the owner token and stores 200s
 // within the entry cap. Anything else is an error (no negative caching:
-// a flapping origin must not poison hot keys).
+// a flapping origin must not poison hot keys). The store key is
+// recomputed under current invalidation generations so a refresh never
+// resurrects a retired namespace; a superseded tracked key is dropped.
 func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner string) error {
 	target := w.origin + s.Path
 	if s.RawQuery != "" {
@@ -269,6 +315,9 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 	if s.Accept != "" {
 		req.Header.Set("Accept", s.Accept)
 	}
+	// Warmer refreshes feed the identity-normalized cache: ask for
+	// identity encoding so stored bytes stay servable to any client.
+	req.Header.Del("Accept-Encoding")
 	resp, err := w.client.Do(req) //nolint:gosec // admin-configured origin only
 	if err != nil {
 		return err
@@ -278,6 +327,10 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 		return errStatus(resp.StatusCode)
 	}
+	if ce := strings.TrimSpace(strings.ToLower(resp.Header.Get("Content-Encoding"))); ce != "" && ce != "identity" {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		return refreshError{msg: "warmer: encoded origin response not storable"}
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, cache.MaxEntryBytes+1))
 	if err != nil {
 		return err
@@ -285,11 +338,28 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 	if len(body) > cache.MaxEntryBytes {
 		return errTooLarge()
 	}
-	return w.store.Set(ctx, key, cache.Entry{
+	storeKey := key
+	if w.KeyFunc != nil {
+		if nk := w.KeyFunc(s); nk != "" {
+			storeKey = nk
+		}
+	}
+	if err := w.store.Set(ctx, storeKey, cache.Entry{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
 		Body:        body,
-	}, s.TTL)
+	}, s.TTL); err != nil {
+		return err
+	}
+	if storeKey != key {
+		type deleter interface {
+			Delete(ctx context.Context, key string) error
+		}
+		if d, ok := w.store.(deleter); ok {
+			_ = d.Delete(ctx, key)
+		}
+	}
+	return nil
 }
 
 // stripSecrets drops token-bearing params from a raw query so snapshots

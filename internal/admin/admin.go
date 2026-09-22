@@ -42,24 +42,38 @@ func NewSetupToken() (string, error) {
 
 // Mux serves admin routes.
 type Mux struct {
-	mux          *http.ServeMux
-	svc          *onboarding.Service
-	spike        *spike.Store
-	spikeObs     *spike.Observations
-	setupToken   string
-	setupIssued  time.Time
-	requireAuth  bool
-	sessions     *sessionStore
-	registry     *metrics.Registry
-	cap          *capture.Store
-	warmerStats  func() warmer.Stats
-	syncWorker   syncpkgWorker
-	syncMu       sync.Mutex
-	lastSyncFull time.Time
-	lastSyncJob  string
-	checks       health.Checks
-	rateMu       sync.Mutex
-	rate         map[string][]time.Time
+	mux         *http.ServeMux
+	svc         *onboarding.Service
+	spike       *spike.Store
+	spikeObs    *spike.Observations
+	setupToken  string
+	setupIssued time.Time
+	setupMu     sync.Mutex
+	// setupConsumed permanently disables bootstrap authentication once
+	// the administrator account is created. The setup capability is
+	// single use: creation consumes it in the same process lifetime.
+	setupConsumed bool
+	requireAuth   bool
+	sessions      *sessionStore
+	registry      *metrics.Registry
+	cap           *capture.Store
+	warmerStats   func() warmer.Stats
+	syncWorker    syncpkgWorker
+	syncMu        sync.Mutex
+	lastSyncFull  time.Time
+	lastSyncJob   string
+	checks        health.Checks
+	rateMu        sync.Mutex
+	rate          map[string][]time.Time
+	// invalidator retires cache namespaces (wired to the proxy
+	// generations in production). Nil keeps audit-only behaviour.
+	invalidator func(scope, class string)
+}
+
+// SetCacheInvalidator wires the admin invalidation endpoint to real
+// namespace invalidation.
+func (m *Mux) SetCacheInvalidator(fn func(scope, class string)) {
+	m.invalidator = fn
 }
 
 // syncpkgWorker is the sync surface admin needs (narrower than *sync.Worker
@@ -156,11 +170,34 @@ func (m *Mux) setupTokenValid(got string) bool {
 	if subtle.ConstantTimeCompare([]byte(got), []byte(m.setupToken)) != 1 {
 		return false
 	}
+	m.setupMu.Lock()
+	consumed := m.setupConsumed
+	m.setupMu.Unlock()
+	if consumed {
+		return false
+	}
 	// Single-use setup URL valid 15 minutes from process start.
 	if time.Since(m.setupIssued) > 15*time.Minute {
 		return false
 	}
 	return true
+}
+
+// consumeSetup permanently retires the bootstrap capability and revokes
+// every session minted from it. Called once administrator creation
+// commits: a fifteen minute bootstrap credential must never outlive setup
+// as a twelve hour browser session.
+func (m *Mux) consumeSetup() {
+	m.setupMu.Lock()
+	m.setupConsumed = true
+	m.setupMu.Unlock()
+	m.sessions.revokeSubject("setup-token")
+}
+
+// bootstrapTTL caps browser sessions minted from the setup token at the
+// remaining bootstrap window.
+func (m *Mux) bootstrapTTL() time.Duration {
+	return 15*time.Minute - time.Since(m.setupIssued)
 }
 
 func (m *Mux) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -222,15 +259,16 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		if tok := r.FormValue("token"); tok != "" {
 			if !m.setupTokenValid(tok) {
-				writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "wrong or expired setup token (valid 15m from startup)")
+				writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "wrong, expired or consumed setup token (valid 15m from startup, single use)")
 				return
 			}
-			id, _, err := m.sessions.createWithSubject("setup-token")
+			ttl := m.bootstrapTTL()
+			id, _, err := m.sessions.createWithSubjectTTL("setup-token", ttl)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, "SESSION_FAILED", "could not create session")
+				writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "bootstrap window expired")
 				return
 			}
-			setSessionCookie(w, id)
+			setSessionCookieTTL(w, id, ttl)
 			http.Redirect(w, r, "/admin/onboarding", http.StatusSeeOther)
 			return
 		}
@@ -542,17 +580,24 @@ func (m *Mux) handleSpikeReport(w http.ResponseWriter, r *http.Request) {
 				FROM playback_decisions WHERE playback_session_id=$1 ORDER BY created_at`, id)
 			if err == nil {
 				defer rows.Close()
+				scanFailed := false
 				for rows.Next() {
 					var req, sel, code int
 					var dec, reason string
 					var details json.RawMessage
 					var at string
 					if err := rows.Scan(&req, &sel, &dec, &reason, &code, &details, &at); err != nil {
+						scanFailed = true
 						break
 					}
 					decisions = append(decisions, map[string]any{
 						"requestedIndex": req, "selectedIndex": sel, "decision": dec,
 						"reason": reason, "plexCode": code, "details": details, "at": at})
+				}
+				if scanFailed || rows.Err() != nil {
+					// Best-effort evidence bundle: drop partial decisions
+					// rather than present a silently truncated report.
+					decisions = nil
 				}
 			}
 		}

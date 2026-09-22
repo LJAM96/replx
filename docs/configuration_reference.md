@@ -16,7 +16,10 @@
 | `TUNNEL_TOKEN` | Tunnel profile | Cloudflare Tunnel token (or use `TUNNEL_TOKEN_FILE`) |
 | `TUNNEL_TOKEN_FILE` | Tunnel profile (secret file) | Path to file containing the Tunnel token; Docker secrets compatible |
 | `REPLX_EDGE_ADMIN_PORT` | No | Host admin port |
-| `REPLX_EDGE_ADMIN_BIND` | No | Host bind for the admin panel (`127.0.0.1`, or a Tailscale IP; never `0.0.0.0`) |
+| `REPLX_EDGE_ADMIN_LISTEN` | No | In-container process bind (`127.0.0.1` default; `0.0.0.0` only with `REPLX_EDGE_IN_DOCKER=true`, which Compose sets) |
+| `REPLX_EDGE_ADMIN_PUBLISH_BIND` | No | Docker host publish interface (`127.0.0.1`, a Tailscale IP, or other loopback/private address; never `0.0.0.0`) |
+| `REPLX_EDGE_IN_DOCKER` | No | `true` inside Compose; gates the wildcard listen opt-in |
+| `REPLX_EDGE_ADMIN_BIND` | No | Legacy alias for the listen address on direct (non-Docker) runs |
 | `REPLX_EDGE_LOG_LEVEL` | No | Production log level |
 | `REPLX_EDGE_CACHE_MAX_GB` | No | General cache budget |
 | `REPLX_EDGE_ARTWORK_MAX_GB` | No | Artwork budget |

@@ -56,9 +56,18 @@ Routing mode:
 ```text
 inherit
 automatic
-origin_preferred
-media_fallback
 ```
+
+`origin_preferred` and `media_fallback` are reserved values and are
+rejected by the admin API in Production 1.0: transport selection is
+validated direct-origin routing (or the explicit media gateway profile),
+not a per-policy override. A policy field is not accepted as a
+functioning setting until its effect is implemented and testable.
+
+`preferDirectPlay` accepts `inherit` (or `allow`, the default ranking
+behaviour which already prefers the cheapest playback). `deny` is
+rejected as unimplemented: there is no defined semantics for penalizing
+direct play, so the API refuses it rather than silently ignoring it.
 
 ## Defaults
 

@@ -10,6 +10,7 @@ import (
 	"github.com/LJAM96/replx/internal/identity"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
+	"github.com/LJAM96/replx/internal/origin"
 	"github.com/LJAM96/replx/internal/policy"
 	"github.com/LJAM96/replx/internal/trace"
 )
@@ -75,7 +76,14 @@ func (e *Engine) client() *http.Client {
 	if e.Client != nil {
 		return e.Client
 	}
-	return &http.Client{Timeout: 30 * time.Second}
+	// Server-to-server PMS calls stay within the configured origin:
+	// cross-origin redirects are refused, never followed with the user
+	// credential. An unparseable base falls back to transparent (no
+	// redirect following at all), which is equally credential-safe.
+	if c, err := origin.APIClient(e.Origin, 30*time.Second); err == nil {
+		return c
+	}
+	return origin.TransparentClient(30 * time.Second)
 }
 
 // DefaultPolicyLoader resolves global-only effective policy. User and
@@ -167,6 +175,20 @@ func (e *Engine) HandleDecision(w http.ResponseWriter, r *http.Request, id, fp, 
 	resp, err := parseDecisionResponse(fwd.body)
 	if err != nil {
 		e.writeError(w, http.StatusBadGateway, "DECISION_PARSE_FAILED", "PMS decision unreadable")
+		return true, nil
+	}
+	// Only a successful PMS negotiation creates session state: an
+	// error status or a body without any decision signal means PMS
+	// itself rejected the request, and persisting it would create
+	// phantom active sessions with misleading diagnostics.
+	if fwd.status < 200 || fwd.status > 299 {
+		e.persistDecision(ctx, "", d.RequestedIndex, d.RequestedIndex, "deny", "PMS_DECISION_REJECTED", resp.Code, dec.Rejected, pol)
+		e.writeError(w, http.StatusBadGateway, "PMS_DECISION_REJECTED", "PMS rejected the playback negotiation")
+		return true, nil
+	}
+	if resp.Code == 0 && !resp.DirectPlay && !resp.DirectStream && !resp.Transcode {
+		e.persistDecision(ctx, "", d.RequestedIndex, d.RequestedIndex, "deny", "PMS_DECISION_REJECTED", 0, dec.Rejected, pol)
+		e.writeError(w, http.StatusBadGateway, "PMS_DECISION_REJECTED", "PMS decision carries no usable negotiation outcome")
 		return true, nil
 	}
 	// PMS disagreement: a rejected index back from PMS fails closed.

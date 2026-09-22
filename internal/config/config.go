@@ -7,6 +7,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -20,13 +21,29 @@ import (
 // The Cloudflare Tunnel token is deliberately absent: only the cloudflared
 // sidecar needs it. Replx Edge never receives nor requires it.
 type Config struct {
-	ImageOwner           string
-	Version              string
-	PublicURL            string
-	OriginInternalURL    string
-	IngressMode          string
-	AdminPort            int
-	AdminBind            string
+	ImageOwner        string
+	Version           string
+	PublicURL         string
+	OriginInternalURL string
+	IngressMode       string
+	AdminPort         int
+	// AdminBind is the legacy single admin address knob, kept for direct
+	// (non-Docker) runs: it feeds AdminListen when REPLX_EDGE_ADMIN_LISTEN
+	// is unset. New deployments should set the two explicit knobs below.
+	AdminBind string
+	// AdminListen is the in-container process listen address. Only
+	// loopback or the unspecified address are permitted: unspecified is
+	// safe solely inside the container network namespace, where Docker
+	// publish controls exposure. Bare-metal runs must use loopback.
+	AdminListen string
+	// AdminPublishBind is the Docker host interface published to the
+	// container port. Loopback, RFC 1918/ULA private space, Tailscale
+	// CGNAT and link-local are permitted; never the wildcard.
+	AdminPublishBind string
+	// InDocker marks the container network namespace, where the
+	// unspecified listen address is safe because Docker publish controls
+	// exposure. Compose sets it; bare-metal runs must leave it false.
+	InDocker             bool
 	LogLevel             string
 	SecretKey            string
 	MediaFallbackEnabled bool
@@ -96,6 +113,9 @@ func Load() (Config, error) {
 		OriginInternalURL: getenv("REPLX_EDGE_ORIGIN_INTERNAL_URL", ""),
 		IngressMode:       getenv("REPLX_EDGE_INGRESS_MODE", "cloudflare_tunnel"),
 		AdminBind:         getenv("REPLX_EDGE_ADMIN_BIND", "127.0.0.1"),
+		AdminListen:       getenv("REPLX_EDGE_ADMIN_LISTEN", ""),
+		AdminPublishBind:  getenv("REPLX_EDGE_ADMIN_PUBLISH_BIND", "127.0.0.1"),
+		InDocker:          strings.EqualFold(getenv("REPLX_EDGE_IN_DOCKER", "false"), "true"),
 		LogLevel:          getenv("REPLX_EDGE_LOG_LEVEL", "info"),
 		SecretKey:         getenv("REPLX_EDGE_SECRET_KEY", ""),
 		MediaPublicURL:    getenv("REPLX_EDGE_MEDIA_PUBLIC_URL", ""),
@@ -160,13 +180,69 @@ func (c Config) Validate() error {
 	if c.PublicURL == "" {
 		return fmt.Errorf("REPLX_EDGE_PUBLIC_URL is required")
 	}
-	if c.AdminBind == "0.0.0.0" {
-		return fmt.Errorf("REPLX_EDGE_ADMIN_BIND must never be 0.0.0.0: bind loopback or a Tailscale IP")
+	if err := checkAdminListen(c.EffectiveAdminListen(), c.InDocker); err != nil {
+		return err
+	}
+	if err := checkAdminPublishBind(c.AdminPublishBind); err != nil {
+		return err
 	}
 	if c.MediaFallbackEnabled && c.MediaPublicURL == "" {
 		return fmt.Errorf("REPLX_EDGE_MEDIA_PUBLIC_URL is required when media fallback is enabled")
 	}
 	return nil
+}
+
+// EffectiveAdminListen resolves the process listen address: the explicit
+// REPLX_EDGE_ADMIN_LISTEN wins, otherwise the legacy ADMIN_BIND applies.
+func (c Config) EffectiveAdminListen() string {
+	if c.AdminListen != "" {
+		return c.AdminListen
+	}
+	return c.AdminBind
+}
+
+// tailscaleRange is the Tailscale CGNAT overlay: not covered by
+// netip.IsPrivate but an explicitly permitted private route for the admin
+// panel (never the wildcard).
+var tailscaleRange = netip.MustParsePrefix("100.64.0.0/10")
+
+// checkAdminListen permits loopback and explicitly private interfaces
+// (RFC 1918/ULA, Tailscale CGNAT, link-local): binding a specific local
+// interface is an explicit operator choice. The wildcard is permitted
+// solely inside the container network namespace, gated on an explicit
+// opt-in the Compose file sets; anywhere else it fails closed.
+func checkAdminListen(addr string, inDocker bool) error {
+	ip, err := netip.ParseAddr(strings.TrimSpace(addr))
+	if err != nil || ip.Zone() != "" {
+		return fmt.Errorf("admin listen address %q must be a literal IP", addr)
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || tailscaleRange.Contains(ip) {
+		return nil
+	}
+	if ip.IsUnspecified() {
+		if inDocker {
+			return nil
+		}
+		return fmt.Errorf("admin listen address must never be the wildcard outside Docker: bind loopback or an explicit private address")
+	}
+	return fmt.Errorf("admin listen address %q is not loopback or explicitly private (RFC 1918/ULA, Tailscale, link-local)", addr)
+}
+
+// checkAdminPublishBind permits only loopback, private, Tailscale CGNAT or
+// link-local addresses for Docker host publication. Empty and wildcard
+// values (which publish on every host interface) are rejected.
+func checkAdminPublishBind(addr string) error {
+	ip, err := netip.ParseAddr(strings.TrimSpace(addr))
+	if err != nil || ip.Zone() != "" {
+		return fmt.Errorf("admin publish bind %q must be a literal private IP (loopback, RFC 1918/ULA, Tailscale, or link-local)", addr)
+	}
+	if ip.IsUnspecified() {
+		return fmt.Errorf("admin publish bind must never be the wildcard: use loopback or an explicit private address")
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || tailscaleRange.Contains(ip) {
+		return nil
+	}
+	return fmt.Errorf("admin publish bind %q is not loopback, private, Tailscale or link-local", addr)
 }
 
 // checkSecretEntropy requires ≥32 characters holding ≥128 Shannon bits.

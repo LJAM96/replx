@@ -227,3 +227,33 @@ func TestLiveKnownLinkFastPath(t *testing.T) {
 		t.Fatalf("link fast path: %+v calls=%d", got, tv.calls.Load())
 	}
 }
+
+func TestLiveRevokedBreaksAssociation(t *testing.T) {
+	tv := &fakeTV{id: 4242, user: "revoked"}
+	r, _ := liveResolver(t, tv)
+	ctx := context.Background()
+	first := r.Resolve(ctx, "fp-rev", "tok-rev", Client{})
+	if !first.Known || !first.Fresh {
+		t.Fatalf("fresh token must resolve known+fresh: %+v", first)
+	}
+	// Age the proof past the validity window, then revoke at plex.tv.
+	if _, err := r.DB.Exec(ctx, `UPDATE plex_token_identities SET last_validated_at = now() - make_interval(days => 2)
+		WHERE token_fingerprint='fp-rev'`); err != nil {
+		t.Fatal(err)
+	}
+	tv.code = 401
+	tv.id = 0
+	got := New(r.DB, tv).Resolve(ctx, "fp-rev", "tok-rev", Client{})
+	if got.Known || !got.Invalid {
+		t.Fatalf("revoked credential must be unknown+invalid: %+v", got)
+	}
+	var assoc *string
+	var status string
+	if err := r.DB.QueryRow(ctx, `SELECT identity_id::text, token_status FROM plex_token_identities
+		WHERE token_fingerprint='fp-rev'`).Scan(&assoc, &status); err != nil {
+		t.Fatal(err)
+	}
+	if assoc != nil || status != "invalid" {
+		t.Fatalf("revocation must break the association: %v %q", assoc, status)
+	}
+}

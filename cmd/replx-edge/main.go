@@ -18,10 +18,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -275,6 +277,18 @@ func runServe() error {
 	if err != nil {
 		return err
 	}
+	// Warmer uses the canonical owner scope (identity UUID) and
+	// generation-aware keys so refreshes land in the live namespace.
+	warm.DB = db.Raw()
+	warm.KeyFunc = func(s warmer.Snapshot) string {
+		q, _ := url.ParseQuery(s.RawQuery)
+		class := s.Class
+		if class == "" {
+			class = cache.ClassOf(s.Path)
+		}
+		sg, gg := proxyHandler.Generations().Get(s.Scope, class)
+		return cache.ResponseKeyGen(s.Scope, class, s.Method, s.Path, q, s.Accept, sg, gg)
+	}
 
 	onboard := &onboarding.Service{
 		DB:          db.Raw(),
@@ -322,6 +336,7 @@ func runServe() error {
 	adminMux.SetCapture(captureStore)
 	adminMux.SetWarmer(warm.Stats)
 	adminMux.SetSync(syncWorker)
+	adminMux.SetCacheInvalidator(proxyHandler.InvalidateCache)
 	// Diagnostics gauge: active targeted captures.
 	go func() {
 		ticker := time.NewTicker(time.Minute)
@@ -345,7 +360,7 @@ func runServe() error {
 	fmt.Fprintf(os.Stdout, "replx-edge onboarding panel: http://127.0.0.1:%d/admin/onboarding | spike matrix: http://127.0.0.1:%d/admin/spike\n",
 		cfg.AdminPort, cfg.AdminPort)
 	adminSrv := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", cfg.AdminBind, cfg.AdminPort),
+		Addr:              net.JoinHostPort(cfg.EffectiveAdminListen(), strconv.Itoa(cfg.AdminPort)),
 		Handler:           adminMux,
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    1 << 20,

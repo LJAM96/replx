@@ -16,11 +16,18 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/LJAM96/replx/internal/origin"
 )
 
-// Fetch mints a transient token from originBase for userToken.
+// Fetch mints a transient token from originBase for userToken. Redirects
+// leaving the origin are refused rather than followed with the credential.
 func Fetch(ctx context.Context, originBase, userToken string) (string, error) {
-	return FetchWithClient(ctx, http.DefaultClient, originBase, userToken)
+	client, err := origin.APIClient(originBase, 10*time.Second)
+	if err != nil {
+		return "", err
+	}
+	return FetchWithClient(ctx, client, originBase, userToken)
 }
 
 // FetchWithClient is Fetch with an injectable client (tests).

@@ -70,7 +70,7 @@ func TestKeyStripsSecretsAndSorts(t *testing.T) {
 	if a == json {
 		t.Fatal("representations must never share keys")
 	}
-	if !strings.HasPrefix(a, "replx_edge:v1:default:browse:fp-user-1:xml:") {
+	if !strings.HasPrefix(a, "replx_edge:v2:default:hubs:fp-user-1:xml:0:0:") {
 		t.Fatalf("key shape: %s", a)
 	}
 }
@@ -126,5 +126,63 @@ func TestMemoryExpiry(t *testing.T) {
 	now = now.Add(2 * time.Minute)
 	if _, ok, _ := m.Get(ctx, "k"); ok {
 		t.Fatal("want miss after expiry")
+	}
+}
+
+func TestClassOf(t *testing.T) {
+	cases := map[string]string{
+		"/hubs/home/continueWatching":  "cw",
+		"/hubs/continueWatching/items": "cw",
+		"/hubs/search?query=x":         "search",
+		"/hubs/home":                   "hubs",
+		"/library/sections":            "sections",
+		"/library/sections/22/all":     "sections",
+		"/library/metadata/1":          "metadata",
+		"/library/collections/x":       "collections",
+		"/identity":                    "identity",
+		"/photo/:/transcode":           "browse",
+	}
+	for p, want := range cases {
+		if got := ClassOf(p); got != want {
+			t.Errorf("%s: want %s, got %s", p, want, got)
+		}
+	}
+}
+
+func TestGenerationsBumpRetiresNamespace(t *testing.T) {
+	g := NewGenerations()
+	q, _ := url.ParseQuery("type=2")
+	key := func(scope, class string) string {
+		sg, gg := g.Get(scope, class)
+		return ResponseKeyGen(scope, class, "GET", "/hubs/home/continueWatching", q, "xml", sg, gg)
+	}
+	a := key("user:u1", "cw")
+	if key("user:u1", "cw") != a {
+		t.Fatal("stable generation must keep keys")
+	}
+	g.Bump("user:u1", "cw")
+	if key("user:u1", "cw") == a {
+		t.Fatal("bump must retire the namespace")
+	}
+	// Other scopes and classes are unaffected.
+	if key("user:u2", "cw") == a {
+		t.Fatal("scopes must isolate generations")
+	}
+	b := key("user:u1", "hubs")
+	g.BumpScope("user:u1")
+	if key("user:u1", "hubs") == b {
+		t.Fatal("scope bump must retire all its classes")
+	}
+	c := key("user:u1", "hubs")
+	g.BumpAll()
+	if key("user:u1", "hubs") == c {
+		t.Fatal("global bump must retire everything")
+	}
+	var nilGens *Generations
+	nilGens.Bump("s", "c")
+	nilGens.BumpScope("s")
+	nilGens.BumpAll()
+	if sg, gg := nilGens.Get("s", "c"); sg != 0 || gg != 0 {
+		t.Fatal("nil generations must be safe")
 	}
 }
