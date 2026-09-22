@@ -262,10 +262,13 @@ func (w *Warmer) ownerScope(ctx context.Context) string {
 	id, ok := w.OwnerAccount(cctx)
 	var uuid string
 	if ok && w.DB != nil {
-		_ = w.DB.QueryRow(cctx, `SELECT i.id::text FROM plex_identities i
-			JOIN plex_servers s ON s.id = i.server_id
-			WHERE s.enabled AND i.plex_account_id=$1
-			ORDER BY i.updated_at DESC LIMIT 1`).Scan(&uuid)
+		var serverID string
+		if err := w.DB.QueryRow(cctx, `SELECT id FROM plex_servers
+			WHERE enabled ORDER BY created_at DESC LIMIT 1`).Scan(&serverID); err == nil {
+			_ = w.DB.QueryRow(cctx, `SELECT id::text FROM plex_identities
+				WHERE server_id=$1 AND plex_account_id=$2
+				ORDER BY updated_at DESC LIMIT 1`, serverID, id).Scan(&uuid)
+		}
 	}
 	w.mu.Lock()
 	w.ownerAcct, w.ownerUUID, w.ownerOK, w.ownerAt = id, uuid, ok, w.now()

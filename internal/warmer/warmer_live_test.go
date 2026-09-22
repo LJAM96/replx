@@ -24,6 +24,12 @@ func TestLiveOwnerScopeCanonical(t *testing.T) {
 		VALUES($1,4242,'owner','user') RETURNING id::text`, serverID).Scan(&identityID); err != nil {
 		t.Fatal(err)
 	}
+	// Prove the fixture is visible in this transaction before exercising
+	// the scope resolution built on top of it.
+	var visible string
+	if err := db.QueryRow(ctx, `SELECT id::text FROM plex_identities WHERE server_id=$1 AND plex_account_id=$2`, serverID, 4242).Scan(&visible); err != nil || visible != identityID {
+		t.Fatalf("fixture must be visible: %q %v", visible, err)
+	}
 	w := New(nil, "http://test.invalid:32400", "s", nil, nil, nil)
 	w.DB = db
 	w.OwnerAccount = func(ctx context.Context) (int64, bool) { return 4242, true }
