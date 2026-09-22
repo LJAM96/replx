@@ -76,3 +76,13 @@ func TestTransparentClientReturnsRedirectUntouched(t *testing.T) {
 		t.Fatalf("redirect must pass through, got %d", resp.StatusCode)
 	}
 }
+
+func TestStreamClientHasNoWholeRequestTimeout(t *testing.T) {
+	client, err := StreamClient("https://plex.example:32400")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.Timeout != 0 || client.CheckRedirect == nil {
+		t.Fatalf("stream client timeout=%v redirect policy present=%t", client.Timeout, client.CheckRedirect != nil)
+	}
+}

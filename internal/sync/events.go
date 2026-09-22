@@ -110,9 +110,9 @@ func (w *Worker) subscribeOnce(ctx context.Context) error {
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("X-Plex-Token", token)
-	client := origin.TransparentClient(0)
-	if oc, ok := w.Client.(*OriginClient); ok && oc != nil {
-		client = oc.client
+	client, err := origin.StreamClient(w.Origin)
+	if err != nil {
+		return err
 	}
 	resp, err := client.Do(req) //nolint:gosec // admin-configured origin only
 	if err != nil {

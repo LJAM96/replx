@@ -95,6 +95,17 @@ func TestParseItemsPage(t *testing.T) {
 	}
 }
 
+func TestParseItemsPageWithScalarGUID(t *testing.T) {
+	raw := `{"MediaContainer":{"totalSize":1,"Metadata":[{"ratingKey":"1","guid":"plex://movie/123"}]}}`
+	items, total, err := parseItemsPage([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(items) != 1 || len(items[0].Guid) != 1 || items[0].Guid[0].ID != "plex://movie/123" {
+		t.Fatalf("scalar guid: total=%d items=%+v", total, items)
+	}
+}
+
 func TestSplitGUID(t *testing.T) {
 	p, id := splitGUID("imdb://tt1234567")
 	if p != "imdb" || id != "tt1234567" {

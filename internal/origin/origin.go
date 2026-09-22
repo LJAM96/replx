@@ -66,6 +66,18 @@ func MustAPIClient(baseURL string, timeout time.Duration) *http.Client {
 	return c
 }
 
+// StreamClient applies the same redirect boundary as APIClient without a
+// whole-request timeout. Long-lived PMS event streams use this client;
+// their lifetime is controlled by the request context instead.
+func StreamClient(baseURL string) (*http.Client, error) {
+	c, err := APIClient(baseURL, time.Second)
+	if err != nil {
+		return nil, err
+	}
+	c.Timeout = 0
+	return c, nil
+}
+
 // TransparentClient returns a client that never follows redirects: 3xx
 // responses are delivered to the caller as-is. The pass-through proxy uses
 // it so origin redirects remain origin responses rather than being

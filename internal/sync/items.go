@@ -13,6 +13,35 @@ type guidJSON struct {
 	ID string `json:"id"`
 }
 
+// Plex uses both an array of Guid objects and a legacy scalar guid string.
+// encoding/json matches those keys case-insensitively, so one field must
+// accept both shapes or a scalar guid aborts the entire section sync.
+type guidList []guidJSON
+
+func (g *guidList) UnmarshalJSON(raw []byte) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		*g = nil
+		return nil
+	}
+	if raw[0] == '"' {
+		var id string
+		if err := json.Unmarshal(raw, &id); err != nil {
+			return err
+		}
+		*g = nil
+		if id != "" {
+			*g = guidList{{ID: id}}
+		}
+		return nil
+	}
+	var list []guidJSON
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return err
+	}
+	*g = list
+	return nil
+}
+
 type streamJSON struct {
 	ID           *int64 `json:"id"`
 	StreamType   int    `json:"streamType"`
@@ -69,7 +98,7 @@ type itemJSON struct {
 	Art                  string      `json:"art"`
 	AddedAt              *int64      `json:"addedAt"`
 	UpdatedAt            *int64      `json:"updatedAt"`
-	Guid                 []guidJSON  `json:"Guid"`
+	Guid                 guidList    `json:"Guid"`
 	Media                []mediaJSON `json:"Media"`
 }
 
