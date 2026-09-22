@@ -1637,9 +1637,18 @@ Routing mode:
 ```text
 inherit
 automatic
-origin_preferred
-media_fallback
 ```
+
+`origin_preferred` and `media_fallback` are reserved values and are
+rejected by the admin API in Production 1.0: transport selection is
+validated direct-origin routing (or the explicit media gateway profile),
+not a per-policy override. A policy field is not accepted as a
+functioning setting until its effect is implemented and testable.
+
+`preferDirectPlay` accepts `inherit` (or `allow`, the default ranking
+behaviour which already prefers the cheapest playback). `deny` is
+rejected as unimplemented: there is no defined semantics for penalizing
+direct play, so the API refuses it rather than silently ignoring it.
 
 ## Defaults
 
@@ -2838,7 +2847,10 @@ never does. A product version change resets certainty for review.
 | `TUNNEL_TOKEN` | Tunnel profile | Cloudflare Tunnel token (or use `TUNNEL_TOKEN_FILE`) |
 | `TUNNEL_TOKEN_FILE` | Tunnel profile (secret file) | Path to file containing the Tunnel token; Docker secrets compatible |
 | `REPLX_EDGE_ADMIN_PORT` | No | Host admin port |
-| `REPLX_EDGE_ADMIN_BIND` | No | Host bind for the admin panel (`127.0.0.1`, or a Tailscale IP; never `0.0.0.0`) |
+| `REPLX_EDGE_ADMIN_LISTEN` | No | In-container process bind (`127.0.0.1` default; `0.0.0.0` only with `REPLX_EDGE_IN_DOCKER=true`, which Compose sets) |
+| `REPLX_EDGE_ADMIN_PUBLISH_BIND` | No | Docker host publish interface (`127.0.0.1`, a Tailscale IP, or other loopback/private address; never `0.0.0.0`) |
+| `REPLX_EDGE_IN_DOCKER` | No | `true` inside Compose; gates the wildcard listen opt-in |
+| `REPLX_EDGE_ADMIN_BIND` | No | Legacy alias for the listen address on direct (non-Docker) runs |
 | `REPLX_EDGE_LOG_LEVEL` | No | Production log level |
 | `REPLX_EDGE_CACHE_MAX_GB` | No | General cache budget |
 | `REPLX_EDGE_ARTWORK_MAX_GB` | No | Artwork budget |
@@ -3366,7 +3378,12 @@ services:
       REPLX_EDGE_ORIGIN_INTERNAL_URL: ${REPLX_EDGE_ORIGIN_INTERNAL_URL}
       REPLX_EDGE_INGRESS_MODE: ${REPLX_EDGE_INGRESS_MODE}
       REPLX_EDGE_ADMIN_PORT: ${REPLX_EDGE_ADMIN_PORT:-8080}
-      REPLX_EDGE_ADMIN_BIND: ${REPLX_EDGE_ADMIN_BIND:-127.0.0.1}
+      # In-container listen address. 0.0.0.0 is safe ONLY here, inside the
+      # container network namespace, because the ports mapping below
+      # controls which host interface can reach it. REPLX_EDGE_IN_DOCKER
+      # records that opt-in for startup validation.
+      REPLX_EDGE_ADMIN_LISTEN: 0.0.0.0
+      REPLX_EDGE_IN_DOCKER: "true"
       REPLX_EDGE_LOG_LEVEL: ${REPLX_EDGE_LOG_LEVEL:-info}
       REPLX_EDGE_CACHE_MAX_GB: ${REPLX_EDGE_CACHE_MAX_GB:-20}
       REPLX_EDGE_ARTWORK_MAX_GB: ${REPLX_EDGE_ARTWORK_MAX_GB:-50}
@@ -3383,10 +3400,12 @@ services:
       - replx_edge_artwork:/data/artwork
       - replx_edge_diagnostics:/data/diagnostics
     ports:
-      # Loopback by default. Set REPLX_EDGE_ADMIN_BIND to a Tailscale IP to
-      # reach the panel over the tailnet. Never 0.0.0.0: the admin API has
-      # no public business.
-      - "${REPLX_EDGE_ADMIN_BIND:-127.0.0.1}:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
+      # Docker HOST publication side, a different network namespace from
+      # the in-container listen address above. Loopback by default; set
+      # REPLX_EDGE_ADMIN_PUBLISH_BIND to a Tailscale IP to reach the panel
+      # over the tailnet. Never 0.0.0.0: the admin API has no public
+      # business. Validated at startup (loopback/private/Tailscale only).
+      - "${REPLX_EDGE_ADMIN_PUBLISH_BIND:-127.0.0.1}:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
     networks:
       - frontend
       - backend
@@ -3499,9 +3518,15 @@ TUNNEL_TOKEN=replace-me
 # TUNNEL_TOKEN_FILE=/run/secrets/cloudflare_tunnel_token (Docker secrets alternative)
 
 REPLX_EDGE_ADMIN_PORT=8080
-# Bind the admin panel to a Tailscale IP to reach it over the tailnet.
-# Default 127.0.0.1 (SSH tunnel only). Never 0.0.0.0.
-# REPLX_EDGE_ADMIN_BIND=100.116.199.128
+# Admin listener split (two network namespaces, validated at startup):
+# - REPLX_EDGE_ADMIN_LISTEN is the IN-CONTAINER process bind. Compose pins
+#   0.0.0.0, safe only there because Docker publish controls exposure.
+#   Bare-metal runs: loopback or an explicit private IP. Never wildcard.
+# - REPLX_EDGE_ADMIN_PUBLISH_BIND is the Docker HOST interface published to
+#   the container port. Default 127.0.0.1 (SSH tunnel only); set to a
+#   Tailscale IP to reach the panel over the tailnet. Never 0.0.0.0.
+# REPLX_EDGE_ADMIN_LISTEN=127.0.0.1
+# REPLX_EDGE_ADMIN_PUBLISH_BIND=100.116.199.128
 REPLX_EDGE_LOG_LEVEL=info
 REPLX_EDGE_CACHE_MAX_GB=20
 REPLX_EDGE_ARTWORK_MAX_GB=50
