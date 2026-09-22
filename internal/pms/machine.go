@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/LJAM96/replx/internal/origin"
 )
 
 // Identity is the origin PMS server identity Replx Edge must preserve.
@@ -44,10 +46,10 @@ type xmlRoot struct {
 }
 
 func fetchXML(ctx context.Context, base, token string) (Identity, error) {
-	body, err := get(ctx, strings.TrimSuffix(base, "/")+"/identity", token, "application/xml")
+	body, err := get(ctx, base, "/identity", token, "application/xml")
 	if err != nil {
 		// Fall back to the root document, which carries the same attrs.
-		body, err = get(ctx, strings.TrimSuffix(base, "/")+"/", token, "application/xml")
+		body, err = get(ctx, base, "/", token, "application/xml")
 		if err != nil {
 			return Identity{}, err
 		}
@@ -71,7 +73,7 @@ type jsonRoot struct {
 }
 
 func fetchJSON(ctx context.Context, base, token string) (Identity, error) {
-	body, err := get(ctx, strings.TrimSuffix(base, "/")+"/identity", token, "application/json")
+	body, err := get(ctx, base, "/identity", token, "application/json")
 	if err != nil {
 		return Identity{}, err
 	}
@@ -89,8 +91,12 @@ func fetchJSON(ctx context.Context, base, token string) (Identity, error) {
 	}, nil
 }
 
-func get(ctx context.Context, url, token, accept string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func get(ctx context.Context, base, path, token, accept string) ([]byte, error) {
+	client, err := origin.APIClient(base, 0)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(base, "/")+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +104,7 @@ func get(ctx context.Context, url, token, accept string) ([]byte, error) {
 	if token != "" {
 		req.Header.Set("X-Plex-Token", token)
 	}
-	resp, err := http.DefaultClient.Do(req) //nolint:gosec // admin-configured origin only
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

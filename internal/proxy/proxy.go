@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -27,11 +29,11 @@ import (
 	"github.com/LJAM96/replx/internal/identity"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
+	"github.com/LJAM96/replx/internal/origin"
 	"github.com/LJAM96/replx/internal/playback"
 	"github.com/LJAM96/replx/internal/policy"
 	"github.com/LJAM96/replx/internal/requestid"
 	"github.com/LJAM96/replx/internal/routing"
-	"github.com/LJAM96/replx/internal/search"
 	"github.com/LJAM96/replx/internal/spike"
 	"github.com/LJAM96/replx/internal/trace"
 	"github.com/LJAM96/replx/internal/warmer"
@@ -151,6 +153,8 @@ type Handler struct {
 	searchDB      database.DBTX
 	// partPolicy is the playback boundary hook; see Options.PartPolicy.
 	partPolicy func(r *http.Request, partID, sessionID string) (string, bool, string)
+	// gens implements namespace cache invalidation; see cache.Generations.
+	gens *cache.Generations
 	// flightMu guards in-flight cacheable origin fetches for stampede
 	// control: one request refreshes an expired object while concurrent
 	// requests for the same key wait bounded for the cache to populate.
@@ -175,7 +179,10 @@ func New(opts Options) (*Handler, error) {
 	}
 	client := opts.Client
 	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+		// Transparent by design: origin 3xx responses pass through to
+		// the Plex client untouched instead of being followed (and
+		// re-credentialed) by Replx. See internal/origin.
+		client = origin.TransparentClient(60 * time.Second)
 	}
 	var fallback *url.URL
 	if opts.MediaFallbackURL != "" {
@@ -192,7 +199,7 @@ func New(opts Options) (*Handler, error) {
 		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, warmer: opts.Warmer,
 		playback: opts.Playback, artwork: opts.Artwork, identity: opts.Identity,
 		client: client, spike: opts.Spike, mediaFallback: fallback, searchDB: opts.SearchDB,
-		partPolicy: opts.PartPolicy}, nil
+		partPolicy: opts.PartPolicy, gens: cache.NewGenerations()}, nil
 }
 
 // obs is the per-request Beta observability identity: fingerprinted user,
@@ -203,11 +210,16 @@ type obs struct {
 	scope       string
 	identityID  string
 	clientUUID  string
-	client      trace.Client
-	session     string
-	ratingKey   string
-	playback    string
-	captured    bool
+	// fresh authorizes long lived locally served responses (artwork):
+	// the credential was proven within the validity window. invalid
+	// marks definitively rejected credentials: bypass all local serving.
+	fresh     bool
+	invalid   bool
+	client    trace.Client
+	session   string
+	ratingKey string
+	playback  string
+	captured  bool
 	// Cache lookup outcome for control routes: key/ttl when the route is
 	// cacheable and the request carries a user fingerprint, plus the
 	// served state (hit, miss or bypass) for logs and headers.
@@ -236,6 +248,7 @@ func (h *Handler) observe(r *http.Request) obs {
 				o.scope = res.Scope
 			}
 			o.identityID, o.clientUUID = res.IdentityID, res.ClientID
+			o.fresh, o.invalid = res.Fresh, res.Invalid
 		}
 	}
 	if trace.IsPlaybackRoute(r.URL.Path) {
@@ -253,7 +266,9 @@ func (h *Handler) observe(r *http.Request) obs {
 		if ttl, ok := cache.Cacheable(r.Method, r.URL.Path); ok {
 			o.cacheable = true
 			o.cacheTTL = ttl
-			o.cacheKey = cache.ResponseKey(o.scope, r.Method, r.URL.Path, r.URL.Query(), r.Header.Get("Accept"))
+			class := cache.ClassOf(r.URL.Path)
+			sg, gg := h.gens.Get(o.scope, class)
+			o.cacheKey = cache.ResponseKeyGen(o.scope, class, r.Method, r.URL.Path, r.URL.Query(), r.Header.Get("Accept"), sg, gg)
 		}
 	}
 	return o
@@ -263,7 +278,9 @@ func (h *Handler) observe(r *http.Request) obs {
 // wrote the response. Misses flip the obs state to miss for logging,
 // headers and metrics; store errors read as misses (best-effort cache).
 func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, o *obs, start time.Time) bool {
-	if !o.cacheable {
+	if !o.cacheable || o.invalid {
+		// Definitively rejected credentials never read local state:
+		// PMS answers live (usually 401) instead.
 		return false
 	}
 	entry, ok, err := h.cache.Get(r.Context(), o.cacheKey)
@@ -402,23 +419,77 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if routeClass == "control" && h.serveCache(w, r, id, &o, start) {
 		return
 	}
+	// Watch-state invalidation runs for every state mutation, whether or
+	// not the route itself is cacheable: timeline/scrobble POSTs retire
+	// the writer's Continue Watching namespace via generations.
+	if isStateWrite(r.URL.Path) {
+		h.bumpStateGeneration(o.scope)
+	}
 	// Stampede control: one request refreshes an expired object while
 	// concurrent requests for the same key wait bounded for the cache to
 	// populate, then serve the fresh entry instead of churning origin.
+	// Acquisition is atomic: exactly one request per key becomes the
+	// refresher, the rest wait and re-check.
 	if o.cacheable && h.cache != nil {
 		if h.waitForFlight(r.Context(), o.cacheKey) {
 			if h.serveCache(w, r, id, &o, start) {
 				return
 			}
 		}
-		h.beginFlight(o.cacheKey)
-		defer h.endFlight(o.cacheKey)
-		// CW/state invalidation: timeline/scrobble/unscrobble writes
-		// invalidate cached Continue Watching via best-effort delete on
-		// the way through (TTL remains the correctness backstop).
-		defer h.invalidateOnStateWrite(r, o)
+		if h.tryBeginFlight(o.cacheKey) {
+			defer h.endFlight(o.cacheKey)
+		} else {
+			// Lost the race after waiting: re-check once, then fall
+			// through to origin rather than serialize behind the winner.
+			if h.serveCache(w, r, id, &o, start) {
+				return
+			}
+		}
 	}
 	h.proxy(w, r, id, o, routeClass, start)
+}
+
+// isStateWrite reports watch-state mutations that retire Continue
+// Watching: timeline progress plus scrobble transitions.
+func isStateWrite(path string) bool {
+	p := strings.ToLower(path)
+	return strings.Contains(p, "/:/timeline") ||
+		strings.Contains(p, "/:/scrobble") ||
+		strings.Contains(p, "/:/unscrobble")
+}
+
+// bumpStateGeneration retires the writer's Continue Watching namespace in
+// constant time. TTLs remain the correctness backstop.
+func (h *Handler) bumpStateGeneration(scope string) {
+	if h.gens == nil || scope == "" {
+		return
+	}
+	h.gens.Bump(scope, "cw")
+}
+
+// Generations exposes the cache invalidation registry for admin wiring.
+func (h *Handler) Generations() *cache.Generations {
+	if h == nil {
+		return nil
+	}
+	return h.gens
+}
+
+// InvalidateCache retires cache namespaces for the admin invalidation API:
+// scope "all" retires everything, empty class retires the whole scope,
+// otherwise one (scope, class) namespace.
+func (h *Handler) InvalidateCache(scope, class string) {
+	if h.gens == nil {
+		return
+	}
+	switch {
+	case scope == "" || scope == "all":
+		h.gens.BumpAll()
+	case class == "":
+		h.gens.BumpScope(scope)
+	default:
+		h.gens.Bump(scope, class)
+	}
 }
 
 // waitForFlight reports whether another request is already refreshing key.
@@ -456,13 +527,17 @@ func (h *Handler) waitForFlight(ctx context.Context, key string) bool {
 	return false
 }
 
-func (h *Handler) beginFlight(key string) {
+func (h *Handler) tryBeginFlight(key string) bool {
 	h.flightMu.Lock()
 	defer h.flightMu.Unlock()
 	if h.flight == nil {
 		h.flight = map[string]struct{}{}
 	}
+	if _, ok := h.flight[key]; ok {
+		return false
+	}
 	h.flight[key] = struct{}{}
+	return true
 }
 
 func (h *Handler) endFlight(key string) {
@@ -471,35 +546,18 @@ func (h *Handler) endFlight(key string) {
 	delete(h.flight, key)
 }
 
-// invalidateOnStateWrite clears Continue Watching cache after timeline or
-// scrobble state changes. Best-effort: ValkeyStore.Del errors read as misses
-// and TTLs remain the backstop. Scope-aware: only the writer's scope is cleared.
-func (h *Handler) invalidateOnStateWrite(r *http.Request, o obs) {
-	p := strings.ToLower(r.URL.Path)
-	isStateWrite := strings.Contains(p, "/:/timeline") ||
-		strings.Contains(p, "/:/scrobble") ||
-		strings.Contains(p, "/:/unscrobble")
-	if !isStateWrite || h.cache == nil || o.scope == "" {
-		return
-	}
-	// We cannot enumerate keys from Store; clear the two canonical CW keys
-	// (xml + json) that serveCache would have used for this scope.
-	for _, accept := range []string{"application/xml", "application/json"} {
-		q, _ := url.ParseQuery("")
-		key := cache.ResponseKey(o.scope, "GET", "/hubs/home/continueWatching", q, accept)
-		if vs, ok := h.cache.(*cache.ValkeyStore); ok {
-			_ = vs.Delete(r.Context(), key)
-		} else if m, ok := h.cache.(*cache.Memory); ok {
-			_ = m.Delete(r.Context(), key)
-		}
-	}
-}
-
 // serveArtwork serves account-scoped filesystem transcodes. The scope in
 // the key means one account's poster can never satisfy another account's
 // request; anonymous requests bypass (authorization to reference required).
+// A definitively rejected or stale credential (resolver present, not
+// fresh) falls through to PMS, which re-authorizes live: the 7-day cache
+// must not extend a dead credential. Without a resolver (tests) the gate
+// cannot evaluate and artwork caching stays permissive.
 func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) bool {
 	if h.artwork == nil || o.fingerprint == "" || o.scope == "" || !artwork.Match(r.URL.Path) {
+		return false
+	}
+	if o.invalid || (h.identity != nil && !o.fresh) {
 		return false
 	}
 	key := artwork.Key(o.scope, r.URL.Path, r.URL.Query())
@@ -529,12 +587,8 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 	}
 	copyHeaders(out.Header, r.Header)
 	out.Header.Set(RequestIDHeader, id)
-	if host := clientIP(r); host != "" {
-		prior := out.Header.Get("X-Forwarded-For")
-		if prior != "" {
-			host = prior + ", " + host
-		}
-		out.Header.Set("X-Forwarded-For", host)
+	if fwd := forwardedFor(r); fwd != "" {
+		out.Header.Set("X-Forwarded-For", fwd)
 	}
 	out.Host = h.origin.Host
 	originStart := time.Now()
@@ -569,63 +623,20 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 	return true
 }
 
-// serveSearch serves local title candidates for /hubs/search when the owner
-// index is fresh. JSON clients receive a reconstructed MediaContainer;
-// XML and uncertain visibility fall back to PMS (return false). Cast,
-// director, collection and label queries always fall back: the local index
-// covers title/sort_title/original_title only.
+// serveSearch is intentionally a PMS passthrough in Production 1.0: the
+// owner index carries no per-user library grants, so serving its
+// candidates would bypass Plex visibility controls (any token string,
+// valid or not, could read owner-only titles). /hubs/search always falls
+// through to PMS until per-user grants are synchronized or candidates are
+// PMS-authorized. The search package remains for candidate generation
+// behind a future authorized path.
 func (h *Handler) serveSearch(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time) bool {
-	if h.searchDB == nil || o.fingerprint == "" {
-		return false
-	}
-	p := strings.ToLower(r.URL.Path)
-	if !strings.Contains(p, "/hubs/search") {
-		return false
-	}
-	q := r.URL.Query().Get("query")
-	if q == "" {
-		q = r.URL.Query().Get("q")
-	}
-	if strings.TrimSpace(q) == "" {
-		return false
-	}
-	accept := r.Header.Get("Accept")
-	if !strings.Contains(strings.ToLower(accept), "json") && accept != "" && !strings.Contains(strings.ToLower(r.URL.RawQuery), "json") {
-		// XML reconstruction is not implemented; fall through to PMS.
-		// Still counts as local-search attempt in logs for observability.
-		return false
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-	var serverID string
-	if err := h.searchDB.QueryRow(ctx, `SELECT id FROM plex_servers WHERE enabled ORDER BY created_at DESC LIMIT 1`).Scan(&serverID); err != nil {
-		return false
-	}
-	cands, fresh, err := search.Candidates(ctx, h.searchDB, serverID, q, 25)
-	if err != nil || !fresh || len(cands) == 0 {
-		return false
-	}
-	type hubItem struct {
-		RatingKey string `json:"ratingKey"`
-		Title     string `json:"title"`
-		Type      string `json:"type,omitempty"`
-		Year      *int   `json:"year,omitempty"`
-		Thumb     string `json:"thumb,omitempty"`
-	}
-	items := make([]hubItem, 0, len(cands))
-	for _, c := range cands {
-		items = append(items, hubItem{RatingKey: c.RatingKey, Title: c.Title, Type: c.ItemType, Year: c.Year, Thumb: c.Thumb})
-	}
-	body, _ := json.Marshal(map[string]any{"MediaContainer": map[string]any{"size": len(items), "Metadata": items}})
-	w.Header().Set(RequestIDHeader, id)
-	w.Header().Set(CacheHeader, "miss")
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("CDN-Cache-Control", "no-store")
-	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
-	h.emit(r, id, o, "control", http.StatusOK, start, map[string]any{"search": "local", "candidates": len(items)})
-	return true
+	_ = w
+	_ = r
+	_ = id
+	_ = o
+	_ = start
+	return false
 }
 
 func (h *Handler) writeMediaRedirect(w http.ResponseWriter, r *http.Request, id string, o obs, start time.Time, location string) {
@@ -814,14 +825,18 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	}
 	copyHeaders(out.Header, r.Header)
 	out.Header.Set(RequestIDHeader, id)
-	// The origin needs the real client IP for its own logs; X-Forwarded-For
-	// is informational only and never trusted for auth.
-	if host := clientIP(r); host != "" {
-		prior := out.Header.Get("X-Forwarded-For")
-		if prior != "" {
-			host = prior + ", " + host
-		}
-		out.Header.Set("X-Forwarded-For", host)
+	// Cacheable origin requests are normalized to the identity encoding:
+	// Go's transport then fetches (and transparently decodes) gzip
+	// itself, so stored bytes are always servable regardless of what
+	// Accept-Encoding the client sent. Non-cacheable traffic keeps the
+	// client's encoding untouched.
+	if o.cacheable {
+		out.Header.Del("Accept-Encoding")
+	}
+	// The origin gets an informational client IP for its own logs, never
+	// for auth; see forwardedFor for the trust model.
+	if fwd := forwardedFor(r); fwd != "" {
+		out.Header.Set("X-Forwarded-For", fwd)
 	}
 	out.Host = h.origin.Host
 
@@ -868,7 +883,7 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 // response for replay, and oversize bodies stream through uncached. The
 // client always receives whatever the origin produced either way.
 func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *http.Response) int64 {
-	if !o.cacheable || resp.StatusCode != http.StatusOK {
+	if !o.cacheable || resp.StatusCode != http.StatusOK || !storableResponse(resp.Header) {
 		n, _ := io.Copy(w, resp.Body)
 		return n
 	}
@@ -898,10 +913,27 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 			RawQuery: r.URL.RawQuery,
 			Accept:   r.Header.Get("Accept"),
 			Scope:    o.scope,
+			Class:    cache.ClassOf(r.URL.Path),
 			TTL:      o.cacheTTL,
 		})
 	}
 	return n
+}
+
+// storableResponse reports whether an origin response is safe to persist:
+// identity encoding only (stored bytes must be servable regardless of the
+// requester's Accept-Encoding) and no wildcard Vary (the key does not
+// model arbitrary request variation).
+func storableResponse(hdr http.Header) bool {
+	if ce := strings.TrimSpace(strings.ToLower(hdr.Get("Content-Encoding"))); ce != "" && ce != "identity" {
+		return false
+	}
+	for _, v := range strings.Split(hdr.Get("Vary"), ",") {
+		if strings.TrimSpace(strings.ToLower(v)) == "*" {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Handler) writeBadGateway(w http.ResponseWriter, r *http.Request, id string, o obs, routeClass string, start time.Time) {
@@ -1058,12 +1090,51 @@ func singleJoin(a, b string) string {
 	return strings.TrimSuffix(a, "/") + "/" + strings.TrimPrefix(b, "/")
 }
 
-func clientIP(r *http.Request) string {
-	if r.RemoteAddr == "" {
+// tailscaleRange mirrors the admin bind policy: the CGNAT overlay is an
+// explicitly permitted private route. See internal/config.
+var tailscaleRange = netip.MustParsePrefix("100.64.0.0/10")
+
+// forwardedFor builds the X-Forwarded-For value for origin requests under
+// a defined trusted-peer model. The immediate peer address is parsed with
+// net.SplitHostPort (never a naive colon split) and always recorded.
+// Inbound history is preserved only when the immediate peer is
+// infrastructure Replx terminates behind (loopback, private, Tailscale
+// CGNAT, link-local): any other peer could have forged the leftmost
+// entries, so the value is replaced with just the observed address.
+// Informational for origin logs only, never authentication.
+func forwardedFor(r *http.Request) string {
+	observed := peerIP(r)
+	if observed == "" {
 		return ""
 	}
-	if i := strings.LastIndex(r.RemoteAddr, ":"); i >= 0 {
-		return r.RemoteAddr[:i]
+	if prior := r.Header.Get("X-Forwarded-For"); prior != "" && trustedPeer(observed) {
+		return prior + ", " + observed
 	}
-	return r.RemoteAddr
+	return observed
+}
+
+// peerIP parses the immediate peer address from RemoteAddr.
+func peerIP(r *http.Request) string {
+	if r == nil || r.RemoteAddr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return strings.TrimSpace(host)
+	}
+	// No port present: accept a bare IP literally, reject anything else.
+	if ip, err := netip.ParseAddr(strings.TrimSpace(r.RemoteAddr)); err == nil {
+		return ip.String()
+	}
+	return ""
+}
+
+// trustedPeer reports whether forwarding history arriving from ip may be
+// preserved: only infrastructure peers, never arbitrary clients.
+func trustedPeer(ip string) bool {
+	parsed, err := netip.ParseAddr(ip)
+	if err != nil || parsed.Zone() != "" {
+		return false
+	}
+	return parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() ||
+		tailscaleRange.Contains(parsed)
 }

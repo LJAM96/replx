@@ -3,6 +3,7 @@ package admin
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -48,6 +49,16 @@ func (s *sessionStore) create() (id, csrf string, err error) {
 
 // createWithSubject issues a session bound to an admin subject for audit.
 func (s *sessionStore) createWithSubject(subject string) (id, csrf string, err error) {
+	return s.createWithSubjectTTL(subject, sessionTTL)
+}
+
+// createWithSubjectTTL issues a subject-bound session with an explicit
+// lifetime. Bootstrap sessions use this to cap expiry at the bootstrap
+// window instead of the full browser lifetime.
+func (s *sessionStore) createWithSubjectTTL(subject string, ttl time.Duration) (id, csrf string, err error) {
+	if ttl <= 0 {
+		return "", "", errors.New("bootstrap window expired")
+	}
 	if id, err = randomHex(24); err != nil {
 		return "", "", err
 	}
@@ -55,7 +66,8 @@ func (s *sessionStore) createWithSubject(subject string) (id, csrf string, err e
 		return "", "", err
 	}
 	s.mu.Lock()
-	s.m[id] = session{csrf: csrf, expires: time.Now().Add(sessionTTL), subject: subject}
+	s.sweepLocked()
+	s.m[id] = session{csrf: csrf, expires: time.Now().Add(ttl), subject: subject}
 	s.mu.Unlock()
 	return id, csrf, nil
 }
@@ -81,7 +93,38 @@ func (s *sessionStore) revoke(id string) {
 	s.mu.Unlock()
 }
 
+// revokeSubject revokes every session carrying a subject, used to retire
+// bootstrap sessions the moment the administrator account is created.
+func (s *sessionStore) revokeSubject(subject string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, sess := range s.m {
+		if sess.subject == subject {
+			delete(s.m, id)
+		}
+	}
+}
+
+// sweepLocked removes expired sessions. Callers must hold s.mu. Sessions
+// accumulate only on lookup misses otherwise, so creation and lookup both
+// sweep to keep eviction deterministic without a background goroutine.
+func (s *sessionStore) sweepLocked() {
+	now := time.Now()
+	for id, sess := range s.m {
+		if now.After(sess.expires) {
+			delete(s.m, id)
+		}
+	}
+}
+
 func setSessionCookie(w http.ResponseWriter, id string) {
+	setSessionCookieTTL(w, id, sessionTTL)
+}
+
+func setSessionCookieTTL(w http.ResponseWriter, id string, ttl time.Duration) {
+	if ttl <= 0 {
+		ttl = time.Second
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    id,
@@ -91,7 +134,7 @@ func setSessionCookie(w http.ResponseWriter, id string) {
 		// No Secure flag: the admin listener is loopback/plain HTTP by
 		// design (private path via Tailscale/SSH). Revisit if the admin
 		// listener ever terminates TLS itself.
-		MaxAge: int((sessionTTL).Seconds()),
+		MaxAge: int(ttl.Seconds()),
 	})
 }
 

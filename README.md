@@ -147,6 +147,10 @@ The files under `docs/` and `deploy/` are canonical source documents.
 | `docs/acceptance_criteria.md` | Definition of done |
 | `deploy/media_fallback_design.md` | Optional non Cloudflare media gateway |
 
+## Development process
+
+This codebase is primarily AI-written, under human direction and review. Treat it as machine-generated code: read critically, run the full test suite and CI before trusting a change, and validate playback behaviour against real Plex clients before release. Human operators remain responsible for every merge and deployment.
+
 ## Official references
 
 Plex PMS API: https://developer.plex.tv/pms/

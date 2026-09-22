@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/LJAM96/replx/internal/crypto"
+	"github.com/LJAM96/replx/internal/origin"
 	"github.com/LJAM96/replx/internal/plextv"
 	"github.com/LJAM96/replx/internal/pms"
 )
@@ -247,6 +248,10 @@ func zeroBytes(b []byte) {
 // list that already contains the URL.
 func tryConfigureCustomURL(internalOrigin, pmsToken, publicURL string) error {
 	base := strings.TrimSuffix(internalOrigin, "/")
+	client, err := origin.APIClient(internalOrigin, 10*time.Second)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/:/prefs?X-Plex-Token="+url.QueryEscape(pmsToken), nil)
@@ -254,7 +259,7 @@ func tryConfigureCustomURL(internalOrigin, pmsToken, publicURL string) error {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -266,7 +271,7 @@ func tryConfigureCustomURL(internalOrigin, pmsToken, publicURL string) error {
 	if err != nil {
 		return err
 	}
-	putResp, err := http.DefaultClient.Do(putReq)
+	putResp, err := client.Do(putReq)
 	if err != nil {
 		return err
 	}

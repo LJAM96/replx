@@ -154,17 +154,25 @@ func validatePolicy(scopeType, scopeID, name string, config json.RawMessage) (po
 	if err := json.Unmarshal(config, &p); err != nil {
 		return policy.Policy{}, errors.New("config must be policy JSON")
 	}
-	for _, t := range []policy.TriState{p.Allow4K, p.AllowHDR, p.AllowDolbyVision, p.AllowTranscode, p.PreferDirectPlay, p.UnknownDRBehavior} {
+	for _, t := range []policy.TriState{p.Allow4K, p.AllowHDR, p.AllowDolbyVision, p.AllowTranscode, p.UnknownDRBehavior} {
 		switch policy.TriState(strings.ToLower(string(t))) {
 		case "", policy.Inherit, policy.Allow, policy.Deny:
 		default:
 			return policy.Policy{}, errors.New("tristates must be inherit, allow or deny")
 		}
 	}
-	switch p.RoutingMode {
-	case "", "inherit", "automatic", "origin_preferred", "media_fallback":
+	// preferDirectPlay: inherit/allow match the default ranking (cheapest
+	// playback wins); deny has no defined effect and is refused rather
+	// than silently ignored.
+	switch policy.TriState(strings.ToLower(string(p.PreferDirectPlay))) {
+	case "", policy.Inherit, policy.Allow:
 	default:
-		return policy.Policy{}, errors.New("routingMode must be inherit, automatic, origin_preferred or media_fallback")
+		return policy.Policy{}, errors.New("preferDirectPlay=deny is not implemented in Production 1.0")
+	}
+	switch p.RoutingMode {
+	case "", "inherit", "automatic":
+	default:
+		return policy.Policy{}, errors.New("routingMode origin_preferred/media_fallback are not implemented in Production 1.0: transport is validated direct-origin routing or the explicit media gateway profile")
 	}
 	return p, nil
 }
@@ -199,6 +207,10 @@ func (m *Mux) handlePolicies(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			out = append(out, rr)
+		}
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusBadGateway, "POLICIES_FAILED", err.Error())
+			return
 		}
 		var next *int
 		if len(out) > limit {
@@ -338,6 +350,10 @@ func (m *Mux) handleSessions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out = append(out, rr)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusBadGateway, "SESSIONS_FAILED", err.Error())
+		return
 	}
 	var next *int
 	if len(out) > limit {

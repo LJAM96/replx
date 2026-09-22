@@ -18,10 +18,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -88,6 +90,17 @@ func runServe() error {
 		return err
 	}
 	logger := logging.New(os.Stderr)
+
+	// The media gateway profile is a documented placeholder in this
+	// build (health endpoint only, no session/policy/streaming): enabling
+	// it must be a deliberate, loudly logged choice, never mistaken for
+	// a functional media plane. Policy routingMode values that would
+	// select it are rejected at the admin API for the same reason.
+	if cfg.MediaFallbackEnabled {
+		logger.Log(logging.Entry{Level: "warn", Component: "gateway",
+			Fields: map[string]any{"event": "media_fallback_placeholder",
+				"msg": "REPLX_EDGE_MEDIA_FALLBACK_ENABLED=true but the media gateway serves health checks only; direct-origin routing remains the media plane"}})
+	}
 
 	if cfg.OriginInternalURL == "" {
 		return fmt.Errorf("REPLX_EDGE_ORIGIN_INTERNAL_URL is required for serve")
@@ -275,6 +288,18 @@ func runServe() error {
 	if err != nil {
 		return err
 	}
+	// Warmer uses the canonical owner scope (identity UUID) and
+	// generation-aware keys so refreshes land in the live namespace.
+	warm.DB = db.Raw()
+	warm.KeyFunc = func(s warmer.Snapshot) string {
+		q, _ := url.ParseQuery(s.RawQuery)
+		class := s.Class
+		if class == "" {
+			class = cache.ClassOf(s.Path)
+		}
+		sg, gg := proxyHandler.Generations().Get(s.Scope, class)
+		return cache.ResponseKeyGen(s.Scope, class, s.Method, s.Path, q, s.Accept, sg, gg)
+	}
 
 	onboard := &onboarding.Service{
 		DB:          db.Raw(),
@@ -322,6 +347,7 @@ func runServe() error {
 	adminMux.SetCapture(captureStore)
 	adminMux.SetWarmer(warm.Stats)
 	adminMux.SetSync(syncWorker)
+	adminMux.SetCacheInvalidator(proxyHandler.InvalidateCache)
 	// Diagnostics gauge: active targeted captures.
 	go func() {
 		ticker := time.NewTicker(time.Minute)
@@ -345,7 +371,7 @@ func runServe() error {
 	fmt.Fprintf(os.Stdout, "replx-edge onboarding panel: http://127.0.0.1:%d/admin/onboarding | spike matrix: http://127.0.0.1:%d/admin/spike\n",
 		cfg.AdminPort, cfg.AdminPort)
 	adminSrv := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", cfg.AdminBind, cfg.AdminPort),
+		Addr:              net.JoinHostPort(cfg.EffectiveAdminListen(), strconv.Itoa(cfg.AdminPort)),
 		Handler:           adminMux,
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    1 << 20,

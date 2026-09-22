@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -42,24 +43,38 @@ func NewSetupToken() (string, error) {
 
 // Mux serves admin routes.
 type Mux struct {
-	mux          *http.ServeMux
-	svc          *onboarding.Service
-	spike        *spike.Store
-	spikeObs     *spike.Observations
-	setupToken   string
-	setupIssued  time.Time
-	requireAuth  bool
-	sessions     *sessionStore
-	registry     *metrics.Registry
-	cap          *capture.Store
-	warmerStats  func() warmer.Stats
-	syncWorker   syncpkgWorker
-	syncMu       sync.Mutex
-	lastSyncFull time.Time
-	lastSyncJob  string
-	checks       health.Checks
-	rateMu       sync.Mutex
-	rate         map[string][]time.Time
+	mux         *http.ServeMux
+	svc         *onboarding.Service
+	spike       *spike.Store
+	spikeObs    *spike.Observations
+	setupToken  string
+	setupIssued time.Time
+	setupMu     sync.Mutex
+	// setupConsumed permanently disables bootstrap authentication once
+	// the administrator account is created. The setup capability is
+	// single use: creation consumes it in the same process lifetime.
+	setupConsumed bool
+	requireAuth   bool
+	sessions      *sessionStore
+	registry      *metrics.Registry
+	cap           *capture.Store
+	warmerStats   func() warmer.Stats
+	syncWorker    syncpkgWorker
+	syncMu        sync.Mutex
+	lastSyncFull  time.Time
+	lastSyncJob   string
+	checks        health.Checks
+	rateMu        sync.Mutex
+	rate          map[string][]time.Time
+	// invalidator retires cache namespaces (wired to the proxy
+	// generations in production). Nil keeps audit-only behaviour.
+	invalidator func(scope, class string)
+}
+
+// SetCacheInvalidator wires the admin invalidation endpoint to real
+// namespace invalidation.
+func (m *Mux) SetCacheInvalidator(fn func(scope, class string)) {
+	m.invalidator = fn
 }
 
 // syncpkgWorker is the sync surface admin needs (narrower than *sync.Worker
@@ -79,7 +94,7 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 	m := &Mux{mux: http.NewServeMux(), svc: svc, spike: spikeStore, spikeObs: spikeObs, setupToken: setupToken, setupIssued: time.Now(), requireAuth: requireAuth, sessions: newSessionStore()}
 	m.mux.Handle("/health/", health.AdminMux(checks))
 	m.mux.HandleFunc("/admin/login", m.handleLogin)
-	m.mux.HandleFunc("/admin/logout", m.handleLogout)
+	m.mux.HandleFunc("/admin/logout", m.auth(m.handleLogout))
 	m.mux.HandleFunc("/api/v1/onboarding/status", m.auth(m.handleStatus))
 	m.mux.HandleFunc("/api/v1/onboarding/pin", m.auth(m.handlePIN))
 	m.mux.HandleFunc("/api/v1/onboarding/token", m.auth(m.handleToken))
@@ -156,11 +171,34 @@ func (m *Mux) setupTokenValid(got string) bool {
 	if subtle.ConstantTimeCompare([]byte(got), []byte(m.setupToken)) != 1 {
 		return false
 	}
+	m.setupMu.Lock()
+	consumed := m.setupConsumed
+	m.setupMu.Unlock()
+	if consumed {
+		return false
+	}
 	// Single-use setup URL valid 15 minutes from process start.
 	if time.Since(m.setupIssued) > 15*time.Minute {
 		return false
 	}
 	return true
+}
+
+// consumeSetup permanently retires the bootstrap capability and revokes
+// every session minted from it. Called once administrator creation
+// commits: a fifteen minute bootstrap credential must never outlive setup
+// as a twelve hour browser session.
+func (m *Mux) consumeSetup() {
+	m.setupMu.Lock()
+	m.setupConsumed = true
+	m.setupMu.Unlock()
+	m.sessions.revokeSubject("setup-token")
+}
+
+// bootstrapTTL caps browser sessions minted from the setup token at the
+// remaining bootstrap window.
+func (m *Mux) bootstrapTTL() time.Duration {
+	return 15*time.Minute - time.Since(m.setupIssued)
 }
 
 func (m *Mux) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -222,15 +260,16 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		if tok := r.FormValue("token"); tok != "" {
 			if !m.setupTokenValid(tok) {
-				writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "wrong or expired setup token (valid 15m from startup)")
+				writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "wrong, expired or consumed setup token (valid 15m from startup, single use)")
 				return
 			}
-			id, _, err := m.sessions.createWithSubject("setup-token")
+			ttl := m.bootstrapTTL()
+			id, _, err := m.sessions.createWithSubjectTTL("setup-token", ttl)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, "SESSION_FAILED", "could not create session")
+				writeError(w, http.StatusUnauthorized, "INVALID_TOKEN", "bootstrap window expired")
 				return
 			}
-			setSessionCookie(w, id)
+			setSessionCookieTTL(w, id, ttl)
 			http.Redirect(w, r, "/admin/onboarding", http.StatusSeeOther)
 			return
 		}
@@ -239,9 +278,23 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "username and password, or setup token, required")
 			return
 		}
-		if !m.verifyAdmin(r.Context(), username, password) {
+		// Throttle by source and username. Failures stay
+		// indistinguishable between unknown and existing usernames.
+		if !m.checkRate("login:"+loginPeer(r)+":"+username, 5*time.Minute, 10) {
+			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many login attempts; retry later")
+			return
+		}
+		hash, ok := m.verifyAdmin(r.Context(), username, password)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "wrong username or password")
 			return
+		}
+		// Transparent upgrade: a valid record with older parameters is
+		// rehashed to current parameters without bothering the operator.
+		if needsRehash(hash) {
+			if fresh, err := hashPassword(password); err == nil {
+				_, _ = m.svc.DB.Exec(r.Context(), `UPDATE admin_users SET password_hash=$1, updated_at=now() WHERE username=$2`, fresh, username)
+			}
 		}
 		id, _, err := m.sessions.createWithSubject(username)
 		if err != nil {
@@ -256,8 +309,11 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Mux) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "POST or GET")
+	// POST only with the normal cookie CSRF protection (enforced by
+	// m.auth): logout is state mutation, and a cross-site navigation
+	// must never terminate an administrator session.
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "POST only")
 		return
 	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
@@ -267,17 +323,33 @@ func (m *Mux) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
 }
 
-func (m *Mux) verifyAdmin(ctx context.Context, username, password string) bool {
+func (m *Mux) verifyAdmin(ctx context.Context, username, password string) (string, bool) {
 	if m.svc == nil {
-		return false
+		return "", false
 	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	var hash string
 	if err := m.svc.DB.QueryRow(cctx, `SELECT password_hash FROM admin_users WHERE username=$1`, username).Scan(&hash); err != nil {
-		return false
+		return "", false
 	}
-	return verifyPassword(hash, password)
+	if !verifyPassword(hash, password) {
+		return "", false
+	}
+	return hash, true
+}
+
+// loginPeer keys login throttling by source address. Unparseable remotes
+// collapse to one shared bucket (fail throttled, never open).
+func loginPeer(r *http.Request) string {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+	if host == "" {
+		host = "unknown"
+	}
+	return host
 }
 
 func writeData(w http.ResponseWriter, status int, data any) {
@@ -542,17 +614,24 @@ func (m *Mux) handleSpikeReport(w http.ResponseWriter, r *http.Request) {
 				FROM playback_decisions WHERE playback_session_id=$1 ORDER BY created_at`, id)
 			if err == nil {
 				defer rows.Close()
+				scanFailed := false
 				for rows.Next() {
 					var req, sel, code int
 					var dec, reason string
 					var details json.RawMessage
 					var at string
 					if err := rows.Scan(&req, &sel, &dec, &reason, &code, &details, &at); err != nil {
+						scanFailed = true
 						break
 					}
 					decisions = append(decisions, map[string]any{
 						"requestedIndex": req, "selectedIndex": sel, "decision": dec,
 						"reason": reason, "plexCode": code, "details": details, "at": at})
+				}
+				if scanFailed || rows.Err() != nil {
+					// Best-effort evidence bundle: drop partial decisions
+					// rather than present a silently truncated report.
+					decisions = nil
 				}
 			}
 		}

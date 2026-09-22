@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -189,9 +190,14 @@ func (m *Mux) handleUsers(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var rr u
 		if err := rows.Scan(&rr.ID, &rr.Account, &rr.Username, &rr.Name, &rr.Type, &rr.Restricted); err != nil {
-			break
+			writeError(w, http.StatusBadGateway, "USERS_FAILED", err.Error())
+			return
 		}
 		out = append(out, rr)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusBadGateway, "USERS_FAILED", err.Error())
+		return
 	}
 	var next *int
 	if len(out) > limit {
@@ -307,9 +313,14 @@ func (m *Mux) handleDevices(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var rr d
 		if err := rows.Scan(&rr.ID, &rr.Client, &rr.Name, &rr.Product, &rr.Version, &rr.Platform); err != nil {
-			break
+			writeError(w, http.StatusBadGateway, "DEVICES_FAILED", err.Error())
+			return
 		}
 		out = append(out, rr)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusBadGateway, "DEVICES_FAILED", err.Error())
+		return
 	}
 	var next *int
 	if len(out) > limit {
@@ -449,9 +460,14 @@ func (m *Mux) handleLibraryItems(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var rr it
 		if err := rows.Scan(&rr.ID, &rr.RatingKey, &rr.Title, &rr.Type, &rr.Year); err != nil {
-			break
+			writeError(w, http.StatusBadGateway, "LIBRARY_FAILED", err.Error())
+			return
 		}
 		out = append(out, rr)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusBadGateway, "LIBRARY_FAILED", err.Error())
+		return
 	}
 	var next *int
 	if len(out) > limit {
@@ -498,9 +514,14 @@ func (m *Mux) handleLibraryItem(w http.ResponseWriter, r *http.Request) {
 		var container, vcodec, dr string
 		var width, height, bitrate *int
 		if err := vrows.Scan(&idx, &container, &vcodec, &width, &height, &bitrate, &dr); err != nil {
-			break
+			writeError(w, http.StatusBadGateway, "VARIANTS_FAILED", err.Error())
+			return
 		}
 		variants = append(variants, map[string]any{"mediaIndex": idx, "container": container, "videoCodec": vcodec, "width": width, "height": height, "bitrateKbps": bitrate, "dynamicRange": dr})
+	}
+	if err := vrows.Err(); err != nil {
+		writeError(w, http.StatusBadGateway, "VARIANTS_FAILED", err.Error())
+		return
 	}
 	writeData(w, http.StatusOK, map[string]any{"id": itemID, "ratingKey": ratingKey, "title": title, "type": itype, "variants": variants})
 }
@@ -518,13 +539,20 @@ func (m *Mux) handleCacheInvalidate(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Scope string `json:"scope"`
+		Class string `json:"class"`
 	}
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body)
 	if body.Scope == "" {
 		body.Scope = "all"
 	}
-	m.auditEvent(r.Context(), subjectOf(r), "cache.invalidate", "cache", body.Scope, map[string]any{"scope": body.Scope, "note": "TTL expiry remains backstop; targeted deletes for CW handled inline"})
-	writeData(w, http.StatusOK, map[string]any{"invalidated": body.Scope})
+	// Namespace invalidation retires matching keys in constant time via
+	// generations; TTLs remain the backstop if no invalidator is wired.
+	if m.invalidator != nil {
+		m.invalidator(body.Scope, body.Class)
+	}
+	m.auditEvent(r.Context(), subjectOf(r), "cache.invalidate", "cache", body.Scope+"/"+body.Class,
+		map[string]any{"scope": body.Scope, "class": body.Class})
+	writeData(w, http.StatusOK, map[string]any{"invalidated": body.Scope, "class": body.Class})
 }
 
 func (m *Mux) handleStorage(w http.ResponseWriter, r *http.Request) {
@@ -593,9 +621,14 @@ func (m *Mux) handlePlaybackDetail(w http.ResponseWriter, r *http.Request) {
 		var dec, reason string
 		var details json.RawMessage
 		if err := rows.Scan(&req, &sel, &dec, &reason, &code, &details); err != nil {
-			break
+			writeError(w, http.StatusBadGateway, "DECISIONS_FAILED", err.Error())
+			return
 		}
 		decisions = append(decisions, map[string]any{"requestedIndex": req, "selectedIndex": sel, "decision": dec, "reason": reason, "plexCode": code, "details": details})
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusBadGateway, "DECISIONS_FAILED", err.Error())
+		return
 	}
 	writeData(w, http.StatusOK, map[string]any{
 		"id": sid, "ratingKey": ratingKey, "mode": mode, "routing": routing,
@@ -627,9 +660,14 @@ func (m *Mux) handleTraces(w http.ResponseWriter, r *http.Request) {
 		for rows.Next() {
 			var id, typ, status, started, expires string
 			if err := rows.Scan(&id, &typ, &status, &started, &expires); err != nil {
-				break
+				writeError(w, http.StatusBadGateway, "TRACES_FAILED", err.Error())
+				return
 			}
 			out = append(out, map[string]any{"id": id, "type": typ, "status": status, "startedAt": started, "expiresAt": expires})
+		}
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusBadGateway, "TRACES_FAILED", err.Error())
+			return
 		}
 		var next *int
 		if len(out) > limit {
@@ -706,11 +744,11 @@ func (m *Mux) handleLogs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
 		return
 	}
-	limit, _ := parseCursor(r, 50, 200)
-	_ = limit
-	// Structured logs stream to stderr (Docker); the API surfaces the
-	// contract without inventing a second log store in 1.0.
-	writePage(w, map[string]any{"logs": []any{}, "note": "structured JSON logs stream to container stderr; use docker compose logs replx-edge"}, nil)
+	// Not implemented as a finished capability: structured logs stream
+	// to container stderr (docker compose logs replx-edge). 501 instead
+	// of an empty 200 so operators never mistake the stub for coverage.
+	writeError(w, http.StatusNotImplemented, "LOGS_NOT_IMPLEMENTED",
+		"live log streaming is not implemented; inspect container stderr (docker compose logs replx-edge)")
 }
 
 func (m *Mux) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -720,7 +758,7 @@ func (m *Mux) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		rows, err := m.svc.DB.Query(r.Context(), `SELECT key, value FROM app_settings WHERE key NOT LIKE 'onboarding.%' AND key NOT LIKE '%token%' ORDER BY key LIMIT 200`)
+		rows, err := m.svc.DB.Query(r.Context(), `SELECT key, value FROM app_settings WHERE key = ANY($1) ORDER BY key`, runtimeSettingKeys())
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "SETTINGS_FAILED", err.Error())
 			return
@@ -731,37 +769,89 @@ func (m *Mux) handleSettings(w http.ResponseWriter, r *http.Request) {
 			var k string
 			var v json.RawMessage
 			if err := rows.Scan(&k, &v); err != nil {
-				break
+				writeError(w, http.StatusBadGateway, "SETTINGS_FAILED", err.Error())
+				return
 			}
 			out[k] = v
 		}
-		writeData(w, http.StatusOK, out)
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusBadGateway, "SETTINGS_FAILED", err.Error())
+			return
+		}
+		writeData(w, http.StatusOK, map[string]any{"settings": out, "spec": runtimeSettingSpec()})
 	case http.MethodPatch:
 		var body map[string]json.RawMessage
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "INVALID_BODY", "settings JSON required")
 			return
 		}
-		for k := range body {
-			if strings.Contains(k, "SECRET") || strings.Contains(k, "TOKEN") || strings.Contains(k, "token") || strings.HasPrefix(k, "onboarding.") {
-				writeError(w, http.StatusBadRequest, "SETTING_IMMUTABLE", "secrets, tokens and onboarding state require restart/re-onboarding: "+k)
+		for k, v := range body {
+			n, err := validatedSetting(k, v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "SETTING_INVALID", err.Error())
 				return
 			}
-		}
-		for k, v := range body {
 			var before json.RawMessage
 			_ = m.svc.DB.QueryRow(r.Context(), `SELECT value FROM app_settings WHERE key=$1`, k).Scan(&before)
+			raw, _ := json.Marshal(n)
 			if _, err := m.svc.DB.Exec(r.Context(), `INSERT INTO app_settings(key,value,updated_at) VALUES($1,$2,now())
-				ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, k, string(v)); err != nil {
+				ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, k, string(raw)); err != nil {
 				writeError(w, http.StatusBadGateway, "SETTING_STORE_FAILED", err.Error())
 				return
 			}
-			m.auditEventWithBefore(r.Context(), subjectOf(r), "retention.setting.change", "setting", k, before, v)
+			m.auditEventWithBefore(r.Context(), subjectOf(r), "retention.setting.change", "setting", k, before, raw)
 		}
 		writeData(w, http.StatusOK, map[string]any{"updated": true})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET or PATCH")
 	}
+}
+
+// settingBounds defines the explicit allowlist of runtime-mutable
+// settings: name, description, range in days, and default. Anything else
+// is rejected: secrets, listener bindings, ingress mode, database wiring
+// and onboarding state require environment changes and restart, and
+// arbitrary keys would leave the API contract undefined.
+var settingBounds = map[string]struct {
+	desc     string
+	min, max int
+	def      int
+}{
+	"replx.playback_retention_days": {"playback decisions and completed sessions retention (days); live, reloaded each purge", 1, 3650, 30},
+	"replx.audit_retention_days":    {"audit events retention (days); live, reloaded each purge", 1, 3650, 180},
+}
+
+func runtimeSettingKeys() []string {
+	out := make([]string, 0, len(settingBounds))
+	for k := range settingBounds {
+		out = append(out, k)
+	}
+	return out
+}
+
+func runtimeSettingSpec() map[string]any {
+	out := map[string]any{}
+	for k, b := range settingBounds {
+		out[k] = map[string]any{"description": b.desc, "minDays": b.min, "maxDays": b.max, "defaultDays": b.def, "restartRequired": false}
+	}
+	return out
+}
+
+// validatedSetting rejects unknown keys and out-of-range values,
+// returning the normalized integer days.
+func validatedSetting(key string, raw json.RawMessage) (int, error) {
+	b, ok := settingBounds[key]
+	if !ok {
+		return 0, fmt.Errorf("unknown setting %q: mutable settings are exactly %v; secrets, bindings and onboarding state require restart/re-onboarding", key, runtimeSettingKeys())
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, fmt.Errorf("setting %q must be an integer number of days", key)
+	}
+	if n < b.min || n > b.max {
+		return 0, fmt.Errorf("setting %q must be %d..%d days", key, b.min, b.max)
+	}
+	return n, nil
 }
 
 // --- setup / rate limiting ---
@@ -775,21 +865,23 @@ func (m *Mux) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "SETUP_DISABLED", "no database wired")
 		return
 	}
-	var count int
-	if err := m.svc.DB.QueryRow(r.Context(), `SELECT count(*) FROM admin_users`).Scan(&count); err != nil {
-		writeError(w, http.StatusBadGateway, "SETUP_FAILED", err.Error())
-		return
-	}
-	if count > 0 {
-		writeError(w, http.StatusConflict, "SETUP_DISABLED", "admin already exists")
-		return
-	}
 	var body struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		SetupToken string `json:"setupToken"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil || body.Username == "" || body.Password == "" {
-		writeError(w, http.StatusBadRequest, "INVALID_BODY", "JSON {username, password} required")
+		writeError(w, http.StatusBadRequest, "INVALID_BODY", "JSON {username, password, setupToken} required")
+		return
+	}
+	// First-run setup requires the bootstrap capability: bearer token or
+	// explicit field. An empty admin table alone never authorizes claims.
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if token == "" {
+		token = body.SetupToken
+	}
+	if !m.setupTokenValid(token) {
+		writeError(w, http.StatusUnauthorized, "SETUP_TOKEN_REQUIRED", "valid setup token required (15m from startup, single use)")
 		return
 	}
 	hash, err := hashPassword(body.Password)
@@ -797,10 +889,42 @@ func (m *Mux) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "WEAK_PASSWORD", err.Error())
 		return
 	}
-	if _, err := m.svc.DB.Exec(r.Context(), `INSERT INTO admin_users(username, password_hash) VALUES($1,$2)`, body.Username, hash); err != nil {
+	// Atomic singleton creation: advisory lock serializes concurrent
+	// setups, the count re-checks inside the lock, and the unique index
+	// (0006) rejects any residual race at the database level.
+	cctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	tx, err := m.svc.DB.Begin(cctx)
+	if err != nil {
 		writeError(w, http.StatusBadGateway, "SETUP_FAILED", err.Error())
 		return
 	}
+	defer func() { _ = tx.Rollback(cctx) }()
+	if _, err := tx.Exec(cctx, `SELECT pg_advisory_xact_lock(hashtext('replx_edge_admin_setup'))`); err != nil {
+		writeError(w, http.StatusBadGateway, "SETUP_FAILED", err.Error())
+		return
+	}
+	var count int
+	if err := tx.QueryRow(cctx, `SELECT count(*) FROM admin_users`).Scan(&count); err != nil {
+		writeError(w, http.StatusBadGateway, "SETUP_FAILED", err.Error())
+		return
+	}
+	if count > 0 {
+		writeError(w, http.StatusConflict, "SETUP_DISABLED", "admin already exists")
+		return
+	}
+	if _, err := tx.Exec(cctx, `INSERT INTO admin_users(username, password_hash) VALUES($1,$2)`, body.Username, hash); err != nil {
+		// Concurrent winner: unique singleton index rejects the loser.
+		writeError(w, http.StatusConflict, "SETUP_DISABLED", "admin already exists")
+		return
+	}
+	if err := tx.Commit(cctx); err != nil {
+		writeError(w, http.StatusBadGateway, "SETUP_FAILED", err.Error())
+		return
+	}
+	// Creation consumes the bootstrap capability in the same step:
+	// bearer auth retires and every setup-minted session dies now.
+	m.consumeSetup()
 	m.auditEvent(r.Context(), "setup", "admin.credential.change", "admin", body.Username, map[string]any{"created": true})
 	writeData(w, http.StatusCreated, map[string]any{"created": true})
 }

@@ -16,7 +16,10 @@
 | `TUNNEL_TOKEN` | Tunnel profile | Cloudflare Tunnel token (or use `TUNNEL_TOKEN_FILE`) |
 | `TUNNEL_TOKEN_FILE` | Tunnel profile (secret file) | Path to file containing the Tunnel token; Docker secrets compatible |
 | `REPLX_EDGE_ADMIN_PORT` | No | Host admin port |
-| `REPLX_EDGE_ADMIN_BIND` | No | Host bind for the admin panel (`127.0.0.1`, or a Tailscale IP; never `0.0.0.0`) |
+| `REPLX_EDGE_ADMIN_LISTEN` | No | In-container process bind (`127.0.0.1` default; `0.0.0.0` only with `REPLX_EDGE_IN_DOCKER=true`, which Compose sets) |
+| `REPLX_EDGE_ADMIN_PUBLISH_BIND` | No | Docker host publish interface (`127.0.0.1`, a Tailscale IP, or other loopback/private address; never `0.0.0.0`) |
+| `REPLX_EDGE_IN_DOCKER` | No | `true` inside Compose; gates the wildcard listen opt-in |
+| `REPLX_EDGE_ADMIN_BIND` | No | Legacy alias for the listen address on direct (non-Docker) runs |
 | `REPLX_EDGE_LOG_LEVEL` | No | Production log level |
 | `REPLX_EDGE_CACHE_MAX_GB` | No | General cache budget |
 | `REPLX_EDGE_ARTWORK_MAX_GB` | No | Artwork budget |
@@ -31,6 +34,7 @@
 | `POSTGRES_DB` | No | Postgres database (`replx_edge`) |
 | `POSTGRES_USER` | No | Postgres user (`replx_edge`) |
 | `REPLX_EDGE_POSTGRES_URL` | No | Full Postgres URL override (tests, non-Compose) |
+| `POSTGRES_SSLMODE` | No | Explicit libpq sslmode. Empty default: `disable` on the local deployment network (`postgres`, loopback), `require` everywhere else; unknown values fail startup |
 | `REPLX_EDGE_VALKEY_ADDR` | No | Valkey `host:port` (`valkey:6379`); down degrades cache, never readiness |
 | `REPLX_EDGE_PLEXTV_URL` | No | plex.tv API root override (tests only; default `https://plex.tv`) |
 | `REPLX_EDGE_SPIKE_ROUTING` | No | P0 spike 307 media redirects (`false` = fail-closed 403) |
@@ -53,7 +57,10 @@ A temporary bootstrap token environment variable may be supported only for devel
 
 ## Secret key
 
-`REPLX_EDGE_SECRET_KEY` must contain at least 32 random bytes worth of entropy.
+`REPLX_EDGE_SECRET_KEY` must be 32 or more random bytes represented as
+hex (`openssl rand -hex 32`) or Base64. Human-chosen passphrases are
+rejected at startup: entropy estimation of chosen strings is misleading,
+so generation is part of deployment.
 
 Key loss means encrypted owner PMS credentials cannot be recovered. Back up this key separately with access controls appropriate for credentials.
 

@@ -58,7 +58,12 @@ services:
       REPLX_EDGE_ORIGIN_INTERNAL_URL: ${REPLX_EDGE_ORIGIN_INTERNAL_URL}
       REPLX_EDGE_INGRESS_MODE: ${REPLX_EDGE_INGRESS_MODE}
       REPLX_EDGE_ADMIN_PORT: ${REPLX_EDGE_ADMIN_PORT:-8080}
-      REPLX_EDGE_ADMIN_BIND: ${REPLX_EDGE_ADMIN_BIND:-127.0.0.1}
+      # In-container listen address. 0.0.0.0 is safe ONLY here, inside the
+      # container network namespace, because the ports mapping below
+      # controls which host interface can reach it. REPLX_EDGE_IN_DOCKER
+      # records that opt-in for startup validation.
+      REPLX_EDGE_ADMIN_LISTEN: 0.0.0.0
+      REPLX_EDGE_IN_DOCKER: "true"
       REPLX_EDGE_LOG_LEVEL: ${REPLX_EDGE_LOG_LEVEL:-info}
       REPLX_EDGE_CACHE_MAX_GB: ${REPLX_EDGE_CACHE_MAX_GB:-20}
       REPLX_EDGE_ARTWORK_MAX_GB: ${REPLX_EDGE_ARTWORK_MAX_GB:-50}
@@ -75,10 +80,12 @@ services:
       - replx_edge_artwork:/data/artwork
       - replx_edge_diagnostics:/data/diagnostics
     ports:
-      # Loopback by default. Set REPLX_EDGE_ADMIN_BIND to a Tailscale IP to
-      # reach the panel over the tailnet. Never 0.0.0.0: the admin API has
-      # no public business.
-      - "${REPLX_EDGE_ADMIN_BIND:-127.0.0.1}:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
+      # Docker HOST publication side, a different network namespace from
+      # the in-container listen address above. Loopback by default; set
+      # REPLX_EDGE_ADMIN_PUBLISH_BIND to a Tailscale IP to reach the panel
+      # over the tailnet. Never 0.0.0.0: the admin API has no public
+      # business. Validated at startup (loopback/private/Tailscale only).
+      - "${REPLX_EDGE_ADMIN_PUBLISH_BIND:-127.0.0.1}:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
     networks:
       - frontend
       - backend

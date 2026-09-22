@@ -16,7 +16,9 @@ The optional media gateway is a separate public attack surface and must remain d
 
 Admin binds to loopback and should be reached through Tailscale or another private path. It is not routed through `plex.example.com`.
 
-Admin bootstrap uses a per-process setup token from server logs: `/admin/login` exchanges it for an HttpOnly session cookie (12h), and cookie-authenticated mutations require a per-session CSRF token. API clients use the bearer directly (no CSRF exposure). There is no default admin password and no password-via-environment in production.
+Admin bootstrap uses a per-process setup token from server logs: `/admin/login` exchanges it for an HttpOnly session cookie capped at the 15-minute bootstrap window, and cookie-authenticated mutations require a per-session CSRF token. API clients use the bearer directly (no CSRF exposure). Administrator creation requires the token, runs atomically against a database-enforced singleton, consumes the bootstrap capability permanently, and revokes every setup-minted session. There is no default admin password and no password-via-environment in production.
+
+The admin listener uses separate listen versus publish addresses (validated with `net/netip`: no wildcards on the publish side, no public addresses anywhere). Origin-bound HTTP uses a hardened transport: server-side Plex API calls refuse cross-origin redirects, and the pass-through proxy never follows origin redirects with credentials.
 
 ## Owner credentials
 
@@ -27,6 +29,14 @@ Owner credentials are used for indexing and administration only. They are never 
 ## User tokens
 
 Client tokens are fingerprinted for identity lookup. Persist raw user token ciphertext only when a feature requires it. Normal logs never contain the token.
+
+Identity association, credential validity and library authorization are
+separate: a linked fingerprint proves who the token belonged to, not
+that it is still valid. Credentials are re-proven against plex.tv when
+their proof ages past the validity window (24h); definitive rejections
+break the association immediately. Stale or rejected credentials fall
+through to PMS instead of reading long lived local responses (notably
+the artwork cache).
 
 ## Cache isolation
 

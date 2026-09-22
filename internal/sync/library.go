@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/LJAM96/replx/internal/origin"
 )
 
 // OriginClient fetches internal PMS API JSON with an owner token.
@@ -14,12 +16,17 @@ type OriginClient struct {
 	client *http.Client
 }
 
-// NewOriginClient builds a client with the given request timeout.
-func NewOriginClient(timeout time.Duration) *OriginClient {
+// NewOriginClient builds a client bound to the configured origin with the
+// given request timeout. Redirects leaving the origin are refused rather
+// than followed with the owner credential.
+func NewOriginClient(originBase string, timeout time.Duration) *OriginClient {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	return &OriginClient{client: &http.Client{Timeout: timeout}}
+	if c, err := origin.APIClient(originBase, timeout); err == nil {
+		return &OriginClient{client: c}
+	}
+	return &OriginClient{client: origin.TransparentClient(timeout)}
 }
 
 // GetJSON GETs url with the owner token and JSON accept, capped at limit.
@@ -77,8 +84,11 @@ type sectionsResponse struct {
 }
 
 // syncSections refreshes the section list and returns sections with their
-// watermarks. On full sweeps, sections absent from the origin are removed.
-func (w *Worker) syncSections(ctx context.Context, serverID, token string) ([]sectionInfo, error) {
+// watermarks. On full sweeps, sections absent from the origin are removed:
+// the listing completed successfully at this point, so absence means
+// deletion at the origin. Cascades remove items, variants, parts and
+// cursors; playback history survives via SET NULL references.
+func (w *Worker) syncSections(ctx context.Context, serverID, token string, full bool) ([]sectionInfo, error) {
 	raw, err := w.Client.GetJSON(ctx, w.Origin+"/library/sections", token, 8<<20)
 	if err != nil {
 		return nil, err
@@ -112,6 +122,19 @@ func (w *Worker) syncSections(ctx context.Context, serverID, token string) ([]se
 		_ = w.DB.QueryRow(ctx, `SELECT count(*) FROM library_items li JOIN libraries l ON l.id=li.library_id
 			WHERE l.server_id=$1 AND l.plex_section_id=$2`, serverID, d.Key).Scan(&items)
 		out = append(out, sectionInfo{LibraryID: libraryID, SectionID: d.Key, Title: d.Title, MediaType: d.Type, NeverSynced: items == 0})
+	}
+	if full && len(seen) > 0 {
+		// An empty successful listing is ambiguous (origin wipe versus
+		// transient glitch): never delete everything on it. A genuinely
+		// removed library disappears from a non-empty listing instead.
+		keys := make([]string, 0, len(seen))
+		for k := range seen {
+			keys = append(keys, k)
+		}
+		if _, err := w.DB.Exec(ctx, `DELETE FROM libraries
+			WHERE server_id=$1 AND NOT (plex_section_id = ANY($2))`, serverID, keys); err != nil {
+			return nil, fmt.Errorf("sync: reconcile deleted libraries: %w", err)
+		}
 	}
 	return out, nil
 }

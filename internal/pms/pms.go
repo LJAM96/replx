@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/LJAM96/replx/internal/origin"
 )
 
 // Status values for the admin Overview page.
@@ -30,11 +32,15 @@ func Check(base string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	client, err := origin.APIClient(base, 5*time.Second)
+	if err != nil {
+		return StatusUnknown
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(base, "/")+"/identity", nil)
 	if err != nil {
 		return StatusUnknown
 	}
-	resp, err := http.DefaultClient.Do(req) //nolint:gosec // admin-configured origin only
+	resp, err := client.Do(req)
 	if err != nil {
 		// Fall back to the root: some PMS builds behave differently on
 		// /identity for unauthenticated requests.
@@ -42,7 +48,7 @@ func Check(base string) string {
 		if err2 != nil {
 			return StatusUnavailable
 		}
-		resp2, err2 := http.DefaultClient.Do(req2) //nolint:gosec // admin-configured origin only
+		resp2, err2 := client.Do(req2)
 		if err2 != nil {
 			return StatusUnavailable
 		}

@@ -155,6 +155,10 @@ The files under `docs/` and `deploy/` are canonical source documents.
 | `docs/acceptance_criteria.md` | Definition of done |
 | `deploy/media_fallback_design.md` | Optional non Cloudflare media gateway |
 
+## Development process
+
+This codebase is primarily AI-written, under human direction and review. Treat it as machine-generated code: read critically, run the full test suite and CI before trusting a change, and validate playback behaviour against real Plex clients before release. Human operators remain responsible for every merge and deployment.
+
 ## Official references
 
 Plex PMS API: https://developer.plex.tv/pms/
@@ -1255,7 +1259,9 @@ The optional media gateway is a separate public attack surface and must remain d
 
 Admin binds to loopback and should be reached through Tailscale or another private path. It is not routed through `plex.example.com`.
 
-Admin bootstrap uses a per-process setup token from server logs: `/admin/login` exchanges it for an HttpOnly session cookie (12h), and cookie-authenticated mutations require a per-session CSRF token. API clients use the bearer directly (no CSRF exposure). There is no default admin password and no password-via-environment in production.
+Admin bootstrap uses a per-process setup token from server logs: `/admin/login` exchanges it for an HttpOnly session cookie capped at the 15-minute bootstrap window, and cookie-authenticated mutations require a per-session CSRF token. API clients use the bearer directly (no CSRF exposure). Administrator creation requires the token, runs atomically against a database-enforced singleton, consumes the bootstrap capability permanently, and revokes every setup-minted session. There is no default admin password and no password-via-environment in production.
+
+The admin listener uses separate listen versus publish addresses (validated with `net/netip`: no wildcards on the publish side, no public addresses anywhere). Origin-bound HTTP uses a hardened transport: server-side Plex API calls refuse cross-origin redirects, and the pass-through proxy never follows origin redirects with credentials.
 
 ## Owner credentials
 
@@ -1266,6 +1272,14 @@ Owner credentials are used for indexing and administration only. They are never 
 ## User tokens
 
 Client tokens are fingerprinted for identity lookup. Persist raw user token ciphertext only when a feature requires it. Normal logs never contain the token.
+
+Identity association, credential validity and library authorization are
+separate: a linked fingerprint proves who the token belonged to, not
+that it is still valid. Credentials are re-proven against plex.tv when
+their proof ages past the validity window (24h); definitive rejections
+break the association immediately. Stale or rejected credentials fall
+through to PMS instead of reading long lived local responses (notably
+the artwork cache).
 
 ## Cache isolation
 
@@ -1537,7 +1551,27 @@ Never stale serve writes, playback decisions, session termination, timeline or s
 
 ## Stampede control
 
-Use a short Valkey refresh lock. One request refreshes an expired object while other requests either use the permitted stale value or wait for a bounded duration.
+One request refreshes an expired object while other requests wait a
+bounded duration and re-check. Acquisition is atomic (check-and-claim
+under one lock): exactly one request per key becomes the refresher.
+
+## Invalidation generations
+
+Keys carry per-scope, per-class and global generation segments
+(`...:{scope}:{representation}:{scopeGen}:{globalGen}:{hash}`).
+Timeline, scrobble and unscrobble mutations retire the writer's Continue
+Watching namespace in constant time; the admin invalidation API retires
+arbitrary namespaces the same way. TTLs remain the backstop. The cache
+scope is canonically `user:{identity_uuid}` everywhere (proxy, cache and
+owner warmer); legacy `acct:`/`tok:` forms appear only where no identity
+store is wired.
+
+## Representation normalization
+
+Cacheable origin requests are normalized to the identity encoding
+(stored bytes are servable regardless of client `Accept-Encoding`);
+encoded or wildcard-`Vary` responses are never stored. `Content-Encoding`
+is not a persisted header.
 
 ## Owner library sync
 
@@ -1565,6 +1599,11 @@ Invalidate after successful timeline, scrobble and unscrobble changes.
 ## Search
 
 PostgreSQL provides candidate search with FTS and trigram indexes. In Production 1.0 the local index covers `title`, `sort_title` and `original_title` only. Cast, director, collection and label search fall back to PMS. Search is an optimization. If visibility or index freshness is uncertain, use PMS.
+
+Because the owner index carries no per-user library grants, locally
+serving its candidates would bypass Plex visibility controls. In
+Production 1.0 `/hubs/search` always passes through to PMS; local
+candidates stay behind a future PMS-authorized path.
 
 ## Cloudflare
 
@@ -1633,9 +1672,18 @@ Routing mode:
 ```text
 inherit
 automatic
-origin_preferred
-media_fallback
 ```
+
+`origin_preferred` and `media_fallback` are reserved values and are
+rejected by the admin API in Production 1.0: transport selection is
+validated direct-origin routing (or the explicit media gateway profile),
+not a per-policy override. A policy field is not accepted as a
+functioning setting until its effect is implemented and testable.
+
+`preferDirectPlay` accepts `inherit` (or `allow`, the default ranking
+behaviour which already prefers the cheapest playback). `deny` is
+rejected as unimplemented: there is no defined semantics for penalizing
+direct play, so the API refuses it rather than silently ignoring it.
 
 ## Defaults
 
@@ -2372,7 +2420,7 @@ Default host binding:
 
 Production 1.0 supports one local administrator account using Argon2id password hashing and secure session cookies.
 
-First-run bootstrap: when `admin_users` is empty, the server logs a single-use setup URL with a random token valid for 15 minutes. The operator opens it via the private admin path and sets the initial password through `POST /api/v1/setup`. The setup route disables itself once an admin exists. No default password is shipped and no password is accepted via environment variable.
+First-run bootstrap: when `admin_users` is empty, the server logs a single-use setup URL with a random token valid for 15 minutes. The operator opens it via the private admin path and sets the initial password through `POST /api/v1/setup`. Setup requires the bootstrap token (bearer or `setupToken` field) and runs inside one advisory-locked transaction against a database-enforced singleton administrator (at most one row). Creation consumes the bootstrap capability permanently: the bearer stops working and every setup-minted session is revoked. Browser sessions minted from the setup token never outlive the 15-minute window. No default password is shipped and no password is accepted via environment variable. Password logins are throttled per source and username; logout is POST-only with CSRF.
 
 OIDC is future work.
 
@@ -2419,15 +2467,15 @@ Responses include:
 | GET | `/api/v1/library/items` | Search indexed items |
 | GET | `/api/v1/library/items/{id}` | Variants and parts |
 | GET | `/api/v1/cache` | Cache statistics |
-| POST | `/api/v1/cache/invalidate` | Invalidate selected cache |
+| POST | `/api/v1/cache/invalidate` | Retire cache namespaces by scope/class via generations (audited) |
 | GET | `/api/v1/storage` | Storage use |
 | GET | `/api/v1/sessions` | Active and recent playback |
 | GET | `/api/v1/playback/{id}` | Decision explanation |
 | POST | `/api/v1/diagnostics/traces` | Arm targeted trace |
 | GET | `/api/v1/diagnostics/traces/{id}` | Trace summary |
-| GET | `/api/v1/logs` | Structured logs |
-| GET | `/api/v1/settings` | Safe runtime settings |
-| PATCH | `/api/v1/settings` | Change safe runtime settings |
+| GET | `/api/v1/logs` | Not implemented (501; inspect container stderr) |
+| GET | `/api/v1/settings` | Allowlisted runtime settings with spec |
+| PATCH | `/api/v1/settings` | Change allowlisted runtime settings (validated, audited) |
 | GET | `/api/v1/onboarding/status` | Onboarding stage and identity |
 | POST | `/api/v1/onboarding/pin` | Issue Plex PIN (returns claim URL + code, never tokens) |
 | GET | `/api/v1/onboarding/pin` | Poll PIN claim |
@@ -2452,7 +2500,17 @@ Browser panels authenticate with the session cookie plus per-session CSRF token;
 
 `POST /server/sync` is idempotent while a sync is already queued or running. Only one full reconciliation may run at once. A repeated call returns the current job ID instead of starting a second scan.
 
-Expensive cache invalidation operations require explicit scope and are rate limited.
+Expensive cache invalidation operations require explicit scope and are rate limited. Invalidation retires generations (per scope/class, or global), never reconstructed keys.
+
+## Runtime settings allowlist
+
+`GET /api/v1/settings` returns exactly the mutable settings plus their
+spec (range, default, restart behaviour). `PATCH` accepts only
+`replx.playback_retention_days` and `replx.audit_retention_days`
+(validated integers, reloaded live by the retention worker); unknown
+keys, secrets, bindings and onboarding state are rejected. Password
+records store full Argon2id parameters, verify with the stored values,
+and transparently rehash on login.
 
 ## Audit
 
@@ -2834,7 +2892,10 @@ never does. A product version change resets certainty for review.
 | `TUNNEL_TOKEN` | Tunnel profile | Cloudflare Tunnel token (or use `TUNNEL_TOKEN_FILE`) |
 | `TUNNEL_TOKEN_FILE` | Tunnel profile (secret file) | Path to file containing the Tunnel token; Docker secrets compatible |
 | `REPLX_EDGE_ADMIN_PORT` | No | Host admin port |
-| `REPLX_EDGE_ADMIN_BIND` | No | Host bind for the admin panel (`127.0.0.1`, or a Tailscale IP; never `0.0.0.0`) |
+| `REPLX_EDGE_ADMIN_LISTEN` | No | In-container process bind (`127.0.0.1` default; `0.0.0.0` only with `REPLX_EDGE_IN_DOCKER=true`, which Compose sets) |
+| `REPLX_EDGE_ADMIN_PUBLISH_BIND` | No | Docker host publish interface (`127.0.0.1`, a Tailscale IP, or other loopback/private address; never `0.0.0.0`) |
+| `REPLX_EDGE_IN_DOCKER` | No | `true` inside Compose; gates the wildcard listen opt-in |
+| `REPLX_EDGE_ADMIN_BIND` | No | Legacy alias for the listen address on direct (non-Docker) runs |
 | `REPLX_EDGE_LOG_LEVEL` | No | Production log level |
 | `REPLX_EDGE_CACHE_MAX_GB` | No | General cache budget |
 | `REPLX_EDGE_ARTWORK_MAX_GB` | No | Artwork budget |
@@ -2849,6 +2910,7 @@ never does. A product version change resets certainty for review.
 | `POSTGRES_DB` | No | Postgres database (`replx_edge`) |
 | `POSTGRES_USER` | No | Postgres user (`replx_edge`) |
 | `REPLX_EDGE_POSTGRES_URL` | No | Full Postgres URL override (tests, non-Compose) |
+| `POSTGRES_SSLMODE` | No | Explicit libpq sslmode. Empty default: `disable` on the local deployment network (`postgres`, loopback), `require` everywhere else; unknown values fail startup |
 | `REPLX_EDGE_VALKEY_ADDR` | No | Valkey `host:port` (`valkey:6379`); down degrades cache, never readiness |
 | `REPLX_EDGE_PLEXTV_URL` | No | plex.tv API root override (tests only; default `https://plex.tv`) |
 | `REPLX_EDGE_SPIKE_ROUTING` | No | P0 spike 307 media redirects (`false` = fail-closed 403) |
@@ -2871,7 +2933,10 @@ A temporary bootstrap token environment variable may be supported only for devel
 
 ## Secret key
 
-`REPLX_EDGE_SECRET_KEY` must contain at least 32 random bytes worth of entropy.
+`REPLX_EDGE_SECRET_KEY` must be 32 or more random bytes represented as
+hex (`openssl rand -hex 32`) or Base64. Human-chosen passphrases are
+rejected at startup: entropy estimation of chosen strings is misleading,
+so generation is part of deployment.
 
 Key loss means encrypted owner PMS credentials cannot be recovered. Back up this key separately with access controls appropriate for credentials.
 
@@ -3362,7 +3427,12 @@ services:
       REPLX_EDGE_ORIGIN_INTERNAL_URL: ${REPLX_EDGE_ORIGIN_INTERNAL_URL}
       REPLX_EDGE_INGRESS_MODE: ${REPLX_EDGE_INGRESS_MODE}
       REPLX_EDGE_ADMIN_PORT: ${REPLX_EDGE_ADMIN_PORT:-8080}
-      REPLX_EDGE_ADMIN_BIND: ${REPLX_EDGE_ADMIN_BIND:-127.0.0.1}
+      # In-container listen address. 0.0.0.0 is safe ONLY here, inside the
+      # container network namespace, because the ports mapping below
+      # controls which host interface can reach it. REPLX_EDGE_IN_DOCKER
+      # records that opt-in for startup validation.
+      REPLX_EDGE_ADMIN_LISTEN: 0.0.0.0
+      REPLX_EDGE_IN_DOCKER: "true"
       REPLX_EDGE_LOG_LEVEL: ${REPLX_EDGE_LOG_LEVEL:-info}
       REPLX_EDGE_CACHE_MAX_GB: ${REPLX_EDGE_CACHE_MAX_GB:-20}
       REPLX_EDGE_ARTWORK_MAX_GB: ${REPLX_EDGE_ARTWORK_MAX_GB:-50}
@@ -3379,10 +3449,12 @@ services:
       - replx_edge_artwork:/data/artwork
       - replx_edge_diagnostics:/data/diagnostics
     ports:
-      # Loopback by default. Set REPLX_EDGE_ADMIN_BIND to a Tailscale IP to
-      # reach the panel over the tailnet. Never 0.0.0.0: the admin API has
-      # no public business.
-      - "${REPLX_EDGE_ADMIN_BIND:-127.0.0.1}:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
+      # Docker HOST publication side, a different network namespace from
+      # the in-container listen address above. Loopback by default; set
+      # REPLX_EDGE_ADMIN_PUBLISH_BIND to a Tailscale IP to reach the panel
+      # over the tailnet. Never 0.0.0.0: the admin API has no public
+      # business. Validated at startup (loopback/private/Tailscale only).
+      - "${REPLX_EDGE_ADMIN_PUBLISH_BIND:-127.0.0.1}:${REPLX_EDGE_ADMIN_PORT:-8080}:8080"
     networks:
       - frontend
       - backend
@@ -3485,7 +3557,9 @@ VALKEY_VERSION=8.1.3
 CLOUDFLARED_VERSION=2026.9.0
 
 POSTGRES_PASSWORD=replace-me
-REPLX_EDGE_SECRET_KEY=replace-with-at-least-32-random-bytes
+# 32+ random bytes as hex or Base64 (passphrases are rejected at startup):
+# openssl rand -hex 32
+REPLX_EDGE_SECRET_KEY=replace-with-openssl-rand-hex-32-output
 
 REPLX_EDGE_PUBLIC_URL=https://plex.example.com
 REPLX_EDGE_ORIGIN_INTERNAL_URL=https://internal-or-validated-origin.example:32400
@@ -3495,9 +3569,15 @@ TUNNEL_TOKEN=replace-me
 # TUNNEL_TOKEN_FILE=/run/secrets/cloudflare_tunnel_token (Docker secrets alternative)
 
 REPLX_EDGE_ADMIN_PORT=8080
-# Bind the admin panel to a Tailscale IP to reach it over the tailnet.
-# Default 127.0.0.1 (SSH tunnel only). Never 0.0.0.0.
-# REPLX_EDGE_ADMIN_BIND=100.116.199.128
+# Admin listener split (two network namespaces, validated at startup):
+# - REPLX_EDGE_ADMIN_LISTEN is the IN-CONTAINER process bind. Compose pins
+#   0.0.0.0, safe only there because Docker publish controls exposure.
+#   Bare-metal runs: loopback or an explicit private IP. Never wildcard.
+# - REPLX_EDGE_ADMIN_PUBLISH_BIND is the Docker HOST interface published to
+#   the container port. Default 127.0.0.1 (SSH tunnel only); set to a
+#   Tailscale IP to reach the panel over the tailnet. Never 0.0.0.0.
+# REPLX_EDGE_ADMIN_LISTEN=127.0.0.1
+# REPLX_EDGE_ADMIN_PUBLISH_BIND=100.116.199.128
 REPLX_EDGE_LOG_LEVEL=info
 REPLX_EDGE_CACHE_MAX_GB=20
 REPLX_EDGE_ARTWORK_MAX_GB=50

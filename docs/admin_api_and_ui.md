@@ -14,7 +14,7 @@ Default host binding:
 
 Production 1.0 supports one local administrator account using Argon2id password hashing and secure session cookies.
 
-First-run bootstrap: when `admin_users` is empty, the server logs a single-use setup URL with a random token valid for 15 minutes. The operator opens it via the private admin path and sets the initial password through `POST /api/v1/setup`. The setup route disables itself once an admin exists. No default password is shipped and no password is accepted via environment variable.
+First-run bootstrap: when `admin_users` is empty, the server logs a single-use setup URL with a random token valid for 15 minutes. The operator opens it via the private admin path and sets the initial password through `POST /api/v1/setup`. Setup requires the bootstrap token (bearer or `setupToken` field) and runs inside one advisory-locked transaction against a database-enforced singleton administrator (at most one row). Creation consumes the bootstrap capability permanently: the bearer stops working and every setup-minted session is revoked. Browser sessions minted from the setup token never outlive the 15-minute window. No default password is shipped and no password is accepted via environment variable. Password logins are throttled per source and username; logout is POST-only with CSRF.
 
 OIDC is future work.
 
@@ -61,15 +61,15 @@ Responses include:
 | GET | `/api/v1/library/items` | Search indexed items |
 | GET | `/api/v1/library/items/{id}` | Variants and parts |
 | GET | `/api/v1/cache` | Cache statistics |
-| POST | `/api/v1/cache/invalidate` | Invalidate selected cache |
+| POST | `/api/v1/cache/invalidate` | Retire cache namespaces by scope/class via generations (audited) |
 | GET | `/api/v1/storage` | Storage use |
 | GET | `/api/v1/sessions` | Active and recent playback |
 | GET | `/api/v1/playback/{id}` | Decision explanation |
 | POST | `/api/v1/diagnostics/traces` | Arm targeted trace |
 | GET | `/api/v1/diagnostics/traces/{id}` | Trace summary |
-| GET | `/api/v1/logs` | Structured logs |
-| GET | `/api/v1/settings` | Safe runtime settings |
-| PATCH | `/api/v1/settings` | Change safe runtime settings |
+| GET | `/api/v1/logs` | Not implemented (501; inspect container stderr) |
+| GET | `/api/v1/settings` | Allowlisted runtime settings with spec |
+| PATCH | `/api/v1/settings` | Change allowlisted runtime settings (validated, audited) |
 | GET | `/api/v1/onboarding/status` | Onboarding stage and identity |
 | POST | `/api/v1/onboarding/pin` | Issue Plex PIN (returns claim URL + code, never tokens) |
 | GET | `/api/v1/onboarding/pin` | Poll PIN claim |
@@ -94,7 +94,17 @@ Browser panels authenticate with the session cookie plus per-session CSRF token;
 
 `POST /server/sync` is idempotent while a sync is already queued or running. Only one full reconciliation may run at once. A repeated call returns the current job ID instead of starting a second scan.
 
-Expensive cache invalidation operations require explicit scope and are rate limited.
+Expensive cache invalidation operations require explicit scope and are rate limited. Invalidation retires generations (per scope/class, or global), never reconstructed keys.
+
+## Runtime settings allowlist
+
+`GET /api/v1/settings` returns exactly the mutable settings plus their
+spec (range, default, restart behaviour). `PATCH` accepts only
+`replx.playback_retention_days` and `replx.audit_retention_days`
+(validated integers, reloaded live by the retention worker); unknown
+keys, secrets, bindings and onboarding state are rejected. Password
+records store full Argon2id parameters, verify with the stored values,
+and transparently rehash on login.
 
 ## Audit
 

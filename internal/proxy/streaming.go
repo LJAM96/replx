@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/LJAM96/replx/internal/origin"
 )
 
 // Event paths for Plex real-time notifications. Both are CONTROL traffic:
@@ -63,8 +65,10 @@ func (h *Handler) streamSSE(w http.ResponseWriter, r *http.Request, id string, o
 	copyHeaders(out.Header, r.Header)
 	out.Header.Set(RequestIDHeader, id)
 	out.Host = h.origin.Host
-	// No timeout: lifetime is bound to the client request context.
-	resp, err := http.DefaultClient.Do(out) //nolint:gosec // admin-configured origin only
+	// No timeout and no redirect following: the event lifetime is bound
+	// to the client request context, and origin 3xx stays an origin
+	// response rather than a credentialed follow.
+	resp, err := origin.TransparentClient(0).Do(out)
 	if err != nil {
 		h.writeBadGateway(w, r, id, o, "control", start)
 		return

@@ -378,3 +378,34 @@ func TestDirectStreamExplicitTranscodeDenied(t *testing.T) {
 		t.Fatalf("transcode retry from directStream session must fail closed: %v %q", deny, reason)
 	}
 }
+
+func TestHandleDecisionRejectsFailedPMSAnswer(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/library/metadata/"):
+			_, _ = fmt.Fprint(w, decisionItem)
+		case strings.Contains(r.URL.Path, "/transcode/universal/decision"):
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = fmt.Fprint(w, `{"error":"upstream PMS refused"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer origin.Close()
+	e := &Engine{Origin: origin.URL, Store: NewMemoryStore(), LoadPolicy: jodiePolicy}
+	req := httptest.NewRequest(http.MethodGet,
+		"/video/:/transcode/universal/decision?path=%2Flibrary%2Fmetadata%2F999&mediaIndex=0&session=sess-fail", nil)
+	req.Header.Set("X-Plex-Token", "user-tok")
+	rec := httptest.NewRecorder()
+	handled, _ := e.HandleDecision(rec, req, "req-f", "fp-f", "sess-fail", "", "")
+	if !handled {
+		t.Fatal("must handle")
+	}
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "PMS_DECISION_REJECTED") {
+		t.Fatalf("failed PMS answer must not create a session: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, ok, _ := e.Store.FindActive(context.Background(), "sess-fail"); ok {
+		t.Fatal("phantom session must never persist for a rejected negotiation")
+	}
+}

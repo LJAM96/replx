@@ -27,9 +27,9 @@ func LoadEffective(ctx context.Context, db database.DBTX, serverID string, ident
 		scopeID   *string
 		name      string
 	}{
-		{"global", nil, "GLOBAL"},
-		{"user", identityID, "USER"},
-		{"device", clientID, "DEVICE"},
+		{"global", nil, ProvGlobal},
+		{"user", identityID, ProvUser},
+		{"device", clientID, ProvDevice},
 	}
 	for _, l := range levels {
 		if l.scopeID == nil && l.scopeType != "global" {
@@ -42,7 +42,7 @@ func LoadEffective(ctx context.Context, db database.DBTX, serverID string, ident
 		if !found {
 			continue
 		}
-		eff = Merge(eff, p)
+		eff = MergeAs(eff, p, l.name)
 		scope = l.name
 	}
 	return eff, scope, nil

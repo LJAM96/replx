@@ -60,7 +60,7 @@ func New(db database.DBTX, origin string, owner func(ctx context.Context) (strin
 	return &Worker{
 		DB: db, Origin: origin, OwnerToken: ownerTokenOrNil(owner),
 		Logger: logger, Metrics: reg,
-		Client:        NewOriginClient(30 * time.Second),
+		Client:        NewOriginClient(origin, 30*time.Second),
 		LightInterval: 15 * time.Minute, FullInterval: 6 * time.Hour,
 		PageSize: 100, dirty: map[string]bool{},
 	}
@@ -140,7 +140,7 @@ func (w *Worker) SyncOnce(ctx context.Context, full bool) error {
 	if err := w.setCursor(ctx, serverID, "libraries", nil, "running", ""); err != nil {
 		return err
 	}
-	sections, err := w.syncSections(ctx, serverID, token)
+	sections, err := w.syncSections(ctx, serverID, token, full)
 	if err != nil {
 		w.countErr()
 		_ = w.setCursor(ctx, serverID, "libraries", nil, "error", err.Error())

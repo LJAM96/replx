@@ -26,7 +26,7 @@ import (
 )
 
 // SchemaVersion prefixes every key so a codec/policy change can roll keys.
-const SchemaVersion = "v1"
+const SchemaVersion = "v2"
 
 // MaxEntryBytes caps a cacheable body. Larger origins stream uncached;
 // the client still receives full bytes, only caching is skipped.
@@ -101,15 +101,23 @@ func Cacheable(method, path string) (time.Duration, bool) {
 
 // ResponseKey builds the canonical user-scoped key:
 //
-//	replx_edge:{schema}:{server}:{class}:{scope}:{representation}:{hash}
+//	replx_edge:{schema}:{server}:{class}:{scope}:{representation}:{scopeGen}:{globalGen}:{hash}
 //
 // Server is "default" in single-origin 1.0 (schema keys stay server-scoped
-// for future multi-server). Class is "browse". Scope is user:{uuid} when
+// for future multi-server). Class partitions invalidation namespaces
+// (sections, metadata, hubs, cw, search, ...). Scope is user:{uuid} when
 // resolved, else the caller-provided tok:/acct: fallback (never shared
-// across users). Representation normalizes Accept to json/xml. The hash
-// covers method, path and sorted non-secret query params, so param order
-// and token rotation never split entries.
+// across users). Representation normalizes Accept to json/xml. The two
+// generation segments implement namespace invalidation: bumping a
+// generation retires every key in that namespace in constant time. The
+// hash covers method, path and sorted non-secret query params, so param
+// order and token rotation never split entries.
 func ResponseKey(scope, method, path string, query url.Values, accept string) string {
+	return ResponseKeyGen(scope, ClassOf(path), method, path, query, accept, 0, 0)
+}
+
+// ResponseKeyGen is ResponseKey with explicit invalidation generations.
+func ResponseKeyGen(scope, class, method, path string, query url.Values, accept string, scopeGen, globalGen uint64) string {
 	var b strings.Builder
 	b.WriteString(strings.ToUpper(method))
 	b.WriteByte(0)
@@ -135,8 +143,111 @@ func ResponseKey(scope, method, path string, query url.Values, accept string) st
 	}
 	sum := sha256.Sum256([]byte(b.String()))
 	rep := normalizeRepresentation(accept)
-	return fmt.Sprintf("replx_edge:%s:%s:%s:%s:%s:%s",
-		SchemaVersion, "default", "browse", scope, rep, hex.EncodeToString(sum[:])[:16])
+	if class == "" {
+		class = "browse"
+	}
+	return fmt.Sprintf("replx_edge:%s:%s:%s:%s:%s:%d:%d:%s",
+		SchemaVersion, "default", class, scope, rep, scopeGen, globalGen, hex.EncodeToString(sum[:])[:16])
+}
+
+// ClassOf partitions a path into an invalidation namespace. Continue
+// Watching gets its own class so watch-state writes retire only it, not
+// every hub for the user.
+func ClassOf(path string) string {
+	p := strings.ToLower(path)
+	switch {
+	case strings.HasPrefix(p, "/hubs/") && strings.Contains(p, "continuewatching"):
+		return "cw"
+	case strings.HasPrefix(p, "/hubs/search") || strings.Contains(p, "/hubs/search"):
+		return "search"
+	case strings.HasPrefix(p, "/hubs/"):
+		return "hubs"
+	case strings.HasPrefix(p, "/library/sections"):
+		return "sections"
+	case strings.HasPrefix(p, "/library/metadata"):
+		return "metadata"
+	case strings.HasPrefix(p, "/library/collections"):
+		return "collections"
+	case strings.HasPrefix(p, "/identity"):
+		return "identity"
+	default:
+		return "browse"
+	}
+}
+
+// Generations implements namespace invalidation: bumping a generation
+// retires every key in that namespace in constant time, without
+// enumerating or guessing keys. Single-replica safe via mutex; cross
+// process, a restart resets generations and orphaned entries expire by
+// TTL (short for every user-scoped class).
+type Generations struct {
+	mu         sync.Mutex
+	scopeClass map[string]uint64
+	classes    map[string]map[string]bool
+	global     uint64
+}
+
+// NewGenerations returns an empty generation registry.
+func NewGenerations() *Generations {
+	return &Generations{scopeClass: map[string]uint64{}, classes: map[string]map[string]bool{}}
+}
+
+// Get returns the current (scope, global) generations, recording the
+// class for later scope-wide bumps. Nil-safe.
+func (g *Generations) Get(scope, class string) (uint64, uint64) {
+	if g == nil {
+		return 0, 0
+	}
+	if class == "" {
+		class = "browse"
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.classes[scope] == nil {
+		g.classes[scope] = map[string]bool{}
+	}
+	g.classes[scope][class] = true
+	return g.scopeClass[scope+"\x00"+class], g.global
+}
+
+// Bump retires one (scope, class) namespace. Nil-safe.
+func (g *Generations) Bump(scope, class string) {
+	if g == nil || scope == "" {
+		return
+	}
+	if class == "" {
+		class = "browse"
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.classes[scope] == nil {
+		g.classes[scope] = map[string]bool{}
+	}
+	g.classes[scope][class] = true
+	g.scopeClass[scope+"\x00"+class]++
+}
+
+// BumpScope retires every recorded class for a scope. Nil-safe.
+func (g *Generations) BumpScope(scope string) {
+	if g == nil || scope == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for class := range g.classes[scope] {
+		g.scopeClass[scope+"\x00"+class]++
+	}
+}
+
+// BumpAll retires every namespace at once (explicit operator action).
+// Nil-safe.
+func (g *Generations) BumpAll() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.global++
 }
 
 func normalizeRepresentation(accept string) string {
@@ -160,9 +271,12 @@ func normalizeRepresentation(accept string) string {
 // dropped: Set-Cookie, Authorization, Cookie, X-Plex-Token,
 // Content-Length (recomputed) and X-Replx-* never persist, and
 // Cache-Control stays ours (TTLs govern, not origin hints).
+// Content-Encoding is deliberately absent: cacheable origin requests are
+// normalized to the identity encoding (see proxy), so stored bytes are
+// always servable to clients regardless of Accept-Encoding. Entries
+// written by older allowlists are re-filtered on read and lose it.
 var safeHeaders = map[string]bool{
 	"Etag": true, "Last-Modified": true, "Content-Language": true,
-	"Content-Encoding": true,
 }
 
 // SafeHeaders extracts the allowlisted subset of an origin header set.

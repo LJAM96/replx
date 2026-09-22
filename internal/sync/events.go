@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/LJAM96/replx/internal/origin"
 )
 
 // errNoCredentials pauses the event stream until onboarding completes.
@@ -108,7 +110,7 @@ func (w *Worker) subscribeOnce(ctx context.Context) error {
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("X-Plex-Token", token)
-	client := http.DefaultClient
+	client := origin.TransparentClient(0)
 	if oc, ok := w.Client.(*OriginClient); ok && oc != nil {
 		client = oc.client
 	}

@@ -41,78 +41,142 @@ func (t TriState) Normalize() TriState {
 }
 
 // Policy is one scope level. Nil numerics mean unrestricted; inherit
-// tristates defer to the less specific level.
+// tristates defer to the less specific level. Provenance records the
+// winning scope ("DEFAULT", "GLOBAL", "USER", "DEVICE") per effective
+// field so rejections name the level that actually imposed the
+// restriction instead of the most specific configured row.
 type Policy struct {
-	MaxSourceWidth          *int     `json:"maxSourceWidth"`
-	MaxSourceHeight         *int     `json:"maxSourceHeight"`
-	MaxSourceBitrateKbps    *int     `json:"maxSourceBitrateKbps"`
-	MaxStreamingBitrateKbps *int     `json:"maxStreamingBitrateKbps"`
-	Allow4K                 TriState `json:"allow4K"`
-	AllowHDR                TriState `json:"allowHDR"`
-	AllowDolbyVision        TriState `json:"allowDolbyVision"`
-	AllowTranscode          TriState `json:"allowTranscode"`
-	PreferDirectPlay        TriState `json:"preferDirectPlay"`
-	MaxAudioChannels        *int     `json:"maxAudioChannels"`
-	UnknownDRBehavior       TriState `json:"unknownDynamicRangeBehavior"`
-	RoutingMode             string   `json:"routingMode"`
+	MaxSourceWidth          *int              `json:"maxSourceWidth"`
+	MaxSourceHeight         *int              `json:"maxSourceHeight"`
+	MaxSourceBitrateKbps    *int              `json:"maxSourceBitrateKbps"`
+	MaxStreamingBitrateKbps *int              `json:"maxStreamingBitrateKbps"`
+	Allow4K                 TriState          `json:"allow4K"`
+	AllowHDR                TriState          `json:"allowHDR"`
+	AllowDolbyVision        TriState          `json:"allowDolbyVision"`
+	AllowTranscode          TriState          `json:"allowTranscode"`
+	PreferDirectPlay        TriState          `json:"preferDirectPlay"`
+	MaxAudioChannels        *int              `json:"maxAudioChannels"`
+	UnknownDRBehavior       TriState          `json:"unknownDynamicRangeBehavior"`
+	RoutingMode             string            `json:"routingMode"`
+	Provenance              map[string]string `json:"provenance,omitempty"`
 }
+
+// Provenance scopes.
+const (
+	ProvDefault = "DEFAULT"
+	ProvGlobal  = "GLOBAL"
+	ProvUser    = "USER"
+	ProvDevice  = "DEVICE"
+)
 
 // Defaults approximates normal Plex behaviour: everything allowed,
 // routing automatic.
 func Defaults() Policy {
+	prov := map[string]string{}
+	for _, f := range provFields {
+		prov[f] = ProvDefault
+	}
 	return Policy{
 		Allow4K: Allow, AllowHDR: Allow, AllowDolbyVision: Allow,
 		AllowTranscode: Allow, PreferDirectPlay: Allow,
 		UnknownDRBehavior: Allow, RoutingMode: "automatic",
+		Provenance: prov,
 	}
 }
 
+// provFields enumerates effective fields tracked for provenance.
+var provFields = []string{
+	"maxSourceWidth", "maxSourceHeight", "maxSourceBitrateKbps",
+	"maxStreamingBitrateKbps", "allow4K", "allowHDR", "allowDolbyVision",
+	"allowTranscode", "preferDirectPlay", "maxAudioChannels",
+	"unknownDynamicRangeBehavior", "routingMode",
+}
+
 // Merge overlays specific onto base field by field: only configured
-// (non-nil, non-inherit) fields replace.
+// (non-nil, non-inherit) fields replace. Provenance carries over for
+// replaced fields only when merging with MergeAs.
 func Merge(base, specific Policy) Policy {
+	return MergeAs(base, specific, "")
+}
+
+// MergeAs is Merge that attributes replaced fields to scope. Empty scope
+// leaves existing provenance untouched.
+func MergeAs(base, specific Policy, scope string) Policy {
 	out := base
+	out.Provenance = cloneProv(base.Provenance)
+	stamp := func(field string) {
+		if scope != "" {
+			if out.Provenance == nil {
+				out.Provenance = map[string]string{}
+			}
+			out.Provenance[field] = scope
+		}
+	}
 	if specific.MaxSourceWidth != nil {
 		out.MaxSourceWidth = specific.MaxSourceWidth
+		stamp("maxSourceWidth")
 	}
 	if specific.MaxSourceHeight != nil {
 		out.MaxSourceHeight = specific.MaxSourceHeight
+		stamp("maxSourceHeight")
 	}
 	if specific.MaxSourceBitrateKbps != nil {
 		out.MaxSourceBitrateKbps = specific.MaxSourceBitrateKbps
+		stamp("maxSourceBitrateKbps")
 	}
 	if specific.MaxStreamingBitrateKbps != nil {
 		out.MaxStreamingBitrateKbps = specific.MaxStreamingBitrateKbps
+		stamp("maxStreamingBitrateKbps")
 	}
 	if v := specific.Allow4K.Normalize(); v != Inherit {
 		out.Allow4K = v
+		stamp("allow4K")
 	}
 	if v := specific.AllowHDR.Normalize(); v != Inherit {
 		out.AllowHDR = v
+		stamp("allowHDR")
 	}
 	if v := specific.AllowDolbyVision.Normalize(); v != Inherit {
 		out.AllowDolbyVision = v
+		stamp("allowDolbyVision")
 	}
 	if v := specific.AllowTranscode.Normalize(); v != Inherit {
 		out.AllowTranscode = v
+		stamp("allowTranscode")
 	}
 	if v := specific.PreferDirectPlay.Normalize(); v != Inherit {
 		out.PreferDirectPlay = v
+		stamp("preferDirectPlay")
 	}
 	if specific.MaxAudioChannels != nil {
 		out.MaxAudioChannels = specific.MaxAudioChannels
+		stamp("maxAudioChannels")
 	}
 	if v := specific.UnknownDRBehavior.Normalize(); v != Inherit {
 		out.UnknownDRBehavior = v
+		stamp("unknownDynamicRangeBehavior")
 	}
 	if specific.RoutingMode != "" && !strings.EqualFold(specific.RoutingMode, "inherit") {
 		out.RoutingMode = specific.RoutingMode
+		stamp("routingMode")
+	}
+	return out
+}
+
+func cloneProv(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
 	}
 	return out
 }
 
 // Effective folds defaults < global < user < device.
 func Effective(global, user, device Policy) Policy {
-	return Merge(Merge(Merge(Defaults(), global), user), device)
+	return MergeAs(MergeAs(MergeAs(Defaults(), global, ProvGlobal), user, ProvUser), device, ProvDevice)
 }
 
 // Playability is how the client can play a variant, cheapest first.
@@ -181,42 +245,53 @@ const (
 	RUnknownDRDenied     = "UNKNOWN_DYNAMIC_RANGE_DENIED"
 )
 
-// Evaluate filters, ranks and selects. scope names the most specific
-// configured level for rejection provenance ("USER", "DEVICE", "GLOBAL").
+// Evaluate filters, ranks and selects. scope is the fallback provenance
+// label; each rejection prefers the per-field winning scope recorded in
+// Policy.Provenance so explanations name the level that imposed them.
 func Evaluate(p Policy, scope string, variants []Variant) (Decision, error) {
 	if scope == "" {
 		scope = "GLOBAL"
 	}
+	prov := func(field string) string {
+		if s, ok := p.Provenance[field]; ok && s != "" {
+			return s
+		}
+		return scope
+	}
 	var eligible []Variant
 	var rejected []Rejection
-	reject := func(v Variant, reason string) {
-		rejected = append(rejected, Rejection{MediaIndex: v.MediaIndex, Scope: scope, Reason: reason})
+	reject := func(v Variant, reason, field string) {
+		s := scope
+		if field != "" {
+			s = prov(field)
+		}
+		rejected = append(rejected, Rejection{MediaIndex: v.MediaIndex, Scope: s, Reason: reason})
 	}
 	for _, v := range variants {
 		if !v.PartAvailable {
-			reject(v, RPartUnavailable)
+			reject(v, RPartUnavailable, "")
 			continue
 		}
 		if is4K(v) && p.Allow4K.Normalize() == Deny {
-			reject(v, RSource4KDenied)
+			reject(v, RSource4KDenied, "allow4K")
 			continue
 		}
 		if overResolution(v, p) {
-			reject(v, RMaxSourceResolution)
+			reject(v, RMaxSourceResolution, resolutionField(v, p))
 			continue
 		}
 		if deniesDR(p, v) {
 			if v.DynamicRange == "UNKNOWN" {
-				reject(v, RUnknownDRDenied)
+				reject(v, RUnknownDRDenied, "unknownDynamicRangeBehavior")
 			} else if v.DynamicRange == "DOLBY_VISION" && p.AllowDolbyVision.Normalize() == Deny {
-				reject(v, RDolbyVisionDenied)
+				reject(v, RDolbyVisionDenied, "allowDolbyVision")
 			} else {
-				reject(v, RHDRDenied)
+				reject(v, RHDRDenied, "allowHDR")
 			}
 			continue
 		}
 		if p.MaxSourceBitrateKbps != nil && v.BitrateKbps != nil && *v.BitrateKbps > *p.MaxSourceBitrateKbps {
-			reject(v, RSourceBitrateCeil)
+			reject(v, RSourceBitrateCeil, "maxSourceBitrateKbps")
 			continue
 		}
 		eligible = append(eligible, v)
@@ -242,6 +317,15 @@ func Evaluate(p Policy, scope string, variants []Variant) (Decision, error) {
 		d.OutputBitrateKbps = &cap
 	}
 	return d, nil
+}
+
+// resolutionField names the bound that overResolution fired on, so the
+// rejection carries that field's provenance.
+func resolutionField(v Variant, p Policy) string {
+	if p.MaxSourceHeight != nil && v.Height != nil && *v.Height > *p.MaxSourceHeight {
+		return "maxSourceHeight"
+	}
+	return "maxSourceWidth"
 }
 
 func is4K(v Variant) bool {
