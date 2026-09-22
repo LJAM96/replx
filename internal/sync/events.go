@@ -122,6 +122,10 @@ func (w *Worker) subscribeOnce(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("sync: event stream status %d", resp.StatusCode)
 	}
+	if w.Metrics != nil {
+		w.Metrics.SetEventstreamConnected(1)
+		defer w.Metrics.SetEventstreamConnected(0)
+	}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
 	for scanner.Scan() {

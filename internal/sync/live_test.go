@@ -183,12 +183,27 @@ func TestLiveEventStreamDirtiesSection(t *testing.T) {
 		<-r.Context().Done()
 	}))
 	defer sse.Close()
-	w := &Worker{DB: nil, Origin: sse.URL,
+	var reg metrics.Registry
+	w := &Worker{DB: nil, Origin: sse.URL, Metrics: &reg,
 		OwnerToken: func(ctx context.Context) (string, bool) { return "t", true },
 		dirty:      map[string]bool{}}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_ = w.subscribeOnce(ctx)
+	done := make(chan error, 1)
+	go func() { done <- w.subscribeOnce(ctx) }()
+	deadline := time.After(time.Second)
+	for reg.Snapshot().EventstreamConnected != 1 || !w.isDirty("22") {
+		select {
+		case <-deadline:
+			t.Fatal("event stream never reported connected")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	if reg.Snapshot().EventstreamConnected != 0 {
+		t.Fatal("event stream must report disconnected after cancellation")
+	}
 	if !w.isDirty("22") {
 		t.Fatal("refresh-complete event must dirty section 22")
 	}
