@@ -96,3 +96,34 @@ func TestPreloadWithoutOwnerDoesNotFetch(t *testing.T) {
 		t.Fatalf("preload without owner: %+v", got)
 	}
 }
+
+func TestPreloadUsesConfiguredHubQueryForBrowserKey(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Plex-Token") != "owner-token" {
+			t.Error("preload did not use owner credential")
+		}
+		if r.URL.Query().Has("X-Plex-Token") {
+			t.Error("preload replayed a token from the query profile")
+		}
+		_, _ = w.Write([]byte(`{"MediaContainer":{}}`))
+	}))
+	defer origin.Close()
+	store := cache.NewMemory()
+	w := withOwnerAccount(New(store, origin.URL, testSecret, ownerProvider("owner-token"), nil, nil), 7)
+	w.PreloadHubQuery = "count=12&includeMeta=1&X-Plex-Client-Identifier=browser-1&X-Plex-Token=must-not-replay"
+	w.PreloadSections = func(context.Context) ([]string, error) { return []string{"23"}, nil }
+	w.KeyFunc = func(s Snapshot) string {
+		q, _ := url.ParseQuery(s.RawQuery)
+		return cache.ResponseKey(s.Scope, s.Method, s.Path, q, s.Accept)
+	}
+	w.PreloadOnce(context.Background())
+	browserQuery, _ := url.ParseQuery("includeMeta=1&count=12&X-Plex-Client-Identifier=browser-1&X-Plex-Token=rotated")
+	key := cache.ResponseKey("acct:7", http.MethodGet, "/hubs/sections/23", browserQuery, preloadAccept)
+	if _, ok, _ := store.Get(context.Background(), key); !ok {
+		t.Fatal("browser's exact collection query was not preloaded")
+	}
+	cwKey := cache.ResponseKey("acct:7", http.MethodGet, "/hubs/continueWatching", browserQuery, preloadAccept)
+	if _, ok, _ := store.Get(context.Background(), cwKey); !ok {
+		t.Fatal("browser's exact Continue Watching query was not preloaded")
+	}
+}

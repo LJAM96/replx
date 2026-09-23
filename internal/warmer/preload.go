@@ -84,26 +84,34 @@ func (w *Warmer) PreloadOnce(ctx context.Context) PreloadResult {
 		if !ok {
 			continue
 		}
-		s := Snapshot{Method: http.MethodGet, Path: path, Accept: preloadAccept,
-			Scope: scope, Class: cache.ClassOf(path), TTL: ttl}
-		key := w.KeyFunc(s)
-		if key == "" {
-			result.Errors++
-			continue
+		queries := []string{""}
+		if strings.HasPrefix(path, "/hubs/sections/") || strings.Contains(strings.ToLower(path), "continuewatching") {
+			if profile := stripSecrets(w.PreloadHubQuery); profile != "" && len(profile) <= 4096 {
+				queries = append(queries, profile)
+			}
 		}
-		if _, hit, err := w.store.Get(ctx, key); err == nil && hit {
+		for _, query := range queries {
+			s := Snapshot{Method: http.MethodGet, Path: path, RawQuery: query,
+				Accept: preloadAccept, Scope: scope, Class: cache.ClassOf(path), TTL: ttl}
+			key := w.KeyFunc(s)
+			if key == "" {
+				result.Errors++
+				continue
+			}
+			if _, hit, err := w.store.Get(ctx, key); err == nil && hit {
+				w.Track(key, s)
+				continue
+			}
+			requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			err := w.refresh(requestCtx, key, s, owner)
+			cancel()
+			if err != nil {
+				result.Errors++
+				continue
+			}
 			w.Track(key, s)
-			continue
+			result.Pages++
 		}
-		requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-		err := w.refresh(requestCtx, key, s, owner)
-		cancel()
-		if err != nil {
-			result.Errors++
-			continue
-		}
-		w.Track(key, s)
-		result.Pages++
 	}
 	if w.Artwork != nil && w.PreloadArtworkPaths != nil {
 		thumbs, err := w.PreloadArtworkPaths(ctx)

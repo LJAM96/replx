@@ -82,11 +82,14 @@ type Warmer struct {
 	// Optional bounded candidate providers for proactive owner preloading.
 	PreloadSections     func(ctx context.Context) ([]string, error)
 	PreloadArtworkPaths func(ctx context.Context) ([]string, error)
-	Artwork             *artwork.Store
-	log                 *logging.Logger
-	metrics             *metrics.Registry
-	client              *http.Client
-	now                 func() time.Time
+	// PreloadHubQuery is an optional browser query profile for section hubs
+	// and Continue Watching; credentials are stripped before storage.
+	PreloadHubQuery string
+	Artwork         *artwork.Store
+	log             *logging.Logger
+	metrics         *metrics.Registry
+	client          *http.Client
+	now             func() time.Time
 
 	mu               sync.Mutex
 	tracked          map[string]tracked
