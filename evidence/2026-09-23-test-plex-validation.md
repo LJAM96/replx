@@ -342,3 +342,9 @@ the next request to return 200 `stale` in 32ms; the following request was a
 fresh cache hit in 34ms after background refresh. This validates the
 fallback mechanism for one collection query. A separate stale-response
 counter was added to cache stats and Prometheus metrics for later monitoring.
+The metric build `0.4.0-2a5ec99-test` (image ID
+`sha256:6361f96d4f0a7f0ec25c3097ffdeae47a27ac903226b928348949dfb3fbe0212`)
+was deployed on `oi-2`. It became healthy with zero restarts, no application
+errors in the initial log sample, and an initial preload pass of 11 pages
+with zero errors. The earlier cache replay measurements used the same cache
+behavior in the immediately preceding test image.
