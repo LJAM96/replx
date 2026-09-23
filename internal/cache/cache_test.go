@@ -39,8 +39,11 @@ func TestCodecRoundTrip(t *testing.T) {
 }
 
 func TestFallbackPolicyKeepsWatchStateLive(t *testing.T) {
-	if ttl, ok := FallbackTTL("/hubs/promoted"); !ok || ttl != time.Minute {
+	if ttl, ok := FallbackTTL("/hubs/promoted"); !ok || ttl != StructuralHubStaleTTL {
 		t.Fatalf("home fallback: %v %v", ttl, ok)
+	}
+	if ttl, ok := FallbackTTL("/hubs/sections/23"); !ok || ttl != StructuralHubStaleTTL {
+		t.Fatalf("section hub fallback: %v %v", ttl, ok)
 	}
 	if ttl, ok := FallbackTTL("/library/collections/101/children"); !ok || ttl != CollectionStaleTTL {
 		t.Fatalf("collection fallback: %v %v", ttl, ok)

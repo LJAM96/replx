@@ -35,6 +35,7 @@ const MaxEntryBytes = 2 << 20 // 2 MiB
 // Structural browse responses keep a bounded fallback copy. Only the proxy
 // serves it, after a fresh credential check, while a refresh runs separately.
 const CollectionStaleTTL = 15 * time.Minute
+const StructuralHubStaleTTL = 15 * time.Minute
 
 func StaleKey(key string) string { return key + ":stale" }
 
@@ -51,7 +52,7 @@ func FallbackTTL(path string) (time.Duration, bool) {
 	}
 	p := strings.ToLower(path)
 	if p == "/hubs/promoted" || strings.HasPrefix(p, "/hubs/sections/") {
-		return time.Minute, true
+		return StructuralHubStaleTTL, true
 	}
 	return 0, false
 }
