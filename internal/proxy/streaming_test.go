@@ -80,39 +80,42 @@ func TestWebSocketTunnel(t *testing.T) {
 	proxySrv := httptest.NewServer(h)
 	defer proxySrv.Close()
 
-	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(proxySrv.URL, "http://"), 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	fmt.Fprintf(conn, "GET /:/websocket/notifications HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
-	br := bufio.NewReader(conn)
-	status, err := br.ReadString('\n')
-	if err != nil || !strings.Contains(status, "101") {
-		t.Fatalf("handshake: %q %v", status, err)
-	}
-	// Drain headers, then verify echo through the tunnel.
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if line == "\r\n" {
-			break
-		}
-	}
-	if _, err := conn.Write([]byte("ping-tunnel")); err != nil {
-		t.Fatal(err)
-	}
-	echo := make([]byte, len("ping-tunnel"))
-	if _, err := io.ReadFull(br, echo); err != nil || string(echo) != "ping-tunnel" {
-		t.Fatalf("echo: %q %v", echo, err)
+	for _, path := range []string{"/:/websocket/notifications", "/:/websockets/notifications"} {
+		t.Run(path, func(t *testing.T) {
+			conn, err := net.DialTimeout("tcp", strings.TrimPrefix(proxySrv.URL, "http://"), 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", path)
+			br := bufio.NewReader(conn)
+			status, err := br.ReadString('\n')
+			if err != nil || !strings.Contains(status, "101") {
+				t.Fatalf("handshake: %q %v", status, err)
+			}
+			for {
+				line, err := br.ReadString('\n')
+				if err != nil {
+					t.Fatal(err)
+				}
+				if line == "\r\n" {
+					break
+				}
+			}
+			if _, err := conn.Write([]byte("ping-tunnel")); err != nil {
+				t.Fatal(err)
+			}
+			echo := make([]byte, len("ping-tunnel"))
+			if _, err := io.ReadFull(br, echo); err != nil || string(echo) != "ping-tunnel" {
+				t.Fatalf("echo: %q %v", echo, err)
+			}
+		})
 	}
 }
 
 func TestStreamingPathsAreControl(t *testing.T) {
-	for _, p := range []string{"/:/eventsource/notifications", "/:/websocket/notifications"} {
+	for _, p := range []string{"/:/eventsource/notifications", "/:/websocket/notifications", "/:/websockets/notifications"} {
 		if gateway.IsBulkMediaRoute(p) {
 			t.Fatalf("%s must be control, not media", p)
 		}

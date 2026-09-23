@@ -17,8 +17,9 @@ import (
 // carries bulk video, and neither may be subjected to the 60s media-client
 // timeout or hop-by-hop header stripping.
 const (
-	ssePath = "/:/eventsource/notifications"
-	wsPath  = "/:/websocket/notifications"
+	ssePath      = "/:/eventsource/notifications"
+	wsPath       = "/:/websocket/notifications"
+	wsPluralPath = "/:/websockets/notifications"
 )
 
 func isSSE(r *http.Request) bool {
@@ -26,7 +27,7 @@ func isSSE(r *http.Request) bool {
 }
 
 func isWebSocket(r *http.Request) bool {
-	if r.URL.Path != wsPath {
+	if r.URL.Path != wsPath && r.URL.Path != wsPluralPath {
 		return false
 	}
 	for _, v := range strings.Split(r.Header.Get("Upgrade"), ",") {
