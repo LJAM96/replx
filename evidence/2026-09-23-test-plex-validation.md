@@ -457,3 +457,31 @@ Later cold child misses took up to 27.6s and some were canceled at around
 30s. Thus the longer fallback improves already populated exact-query
 responses, but does not eliminate cold variants. Operator visual feedback
 on poster display time is still pending.
+
+## Blank deeper collection pages and library browse
+
+In Luke's latest visual test, initial collection items appeared fairly quickly,
+but deeper horizontal items lacked names and artwork, while a library was slow
+or showed no content. The matching Replx log window had 137 collection-child
+requests. Their pagination was not limited to the preloaded first profile:
+114 requested start 12, size 24; the rest requested start 36, size 39 or
+other later offsets. Some of these uncached deeper pages took 19–28 seconds
+before returning 200; others were canceled at about 30 seconds and returned
+502 through Replx. A library `/library/sections/*/all` request was canceled
+after 26 seconds; a later request returned 200 after 21 seconds. The blank
+items are consistent with missing or canceled page data; logs do not prove
+which individual response the browser rendered.
+
+The configured collection preload profiles both target start 12, size 24, and
+the owner-only warmer cannot populate Luke's user-specific cache. Aggregarr
+on `oi-2` has 55 active collections, all marked library-promoted; 52 have
+`maxItems` 350. This is a large set of paged content for Plex Web to request.
+No Aggregarr settings were changed.
+
+Commit `6309e9a` adds a five-minute same-user, exact-query stale fallback for
+successful library `/all` pages. Continue Watching remains live and uncached
+by fallback. Full Go tests passed. The test image
+`ghcr.io/ljam96/replx-edge:0.4.0-6309e9a-test` (image ID
+`sha256:74d7cc80bfd2e9b2fb62fbd53ea9996a75e8210f709d1b096ad5baca98c2c85b`)
+is deployed and healthy with zero restarts. This improves repeat library loads
+after one successful response; it does not cover uncached deeper offsets.
