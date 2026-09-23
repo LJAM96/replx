@@ -137,10 +137,28 @@ section collection lists, and up to 96 recent poster transforms directly from Pl
 credential. It stores only in the canonical owner scope and skips absent
 credentials. Artwork keys omit nested Plex tokens so a preloaded transform
 matches a later owner request after token rotation. Full Go tests, `go vet`,
-and Compose configuration validation pass locally. The test host was not
-reachable by SSH when this change was prepared, so deployment and real cache
-hit evidence are still pending. Exact Plex Web query variants and other users'
-personalized pages are not preloaded.
+and Compose configuration validation pass locally. Exact Plex Web query
+variants and other users' personalized pages are not preloaded.
+
+The test host became reachable and commit `f33df26` was deployed as
+`ghcr.io/ljam96/replx-edge:0.4.0-f33df26-test` (image ID
+`sha256:4b03074c65bc429c04571ede055a49c132bd8bd19cfa07d3b7031e51d455ae73`).
+The previous `.env` remains privately backed up on the test server.
+Readiness reports `ready`, PMS healthy and Valkey ok; container restarts remain
+zero; the owner index still contains 112,078 items. The first preload pass
+stored 8 pages and 96 posters, with 4 page errors. The artwork volume had
+208 files after the pass (two per entry plus a few existing entries).
+
+Using the diagnostic browser token without printing or storing it, a poster
+selected from the preload candidate query returned `200 hit` twice through
+the public Replx hostname (about 0.16 and 0.08 seconds). `/library/sections`
+and `/hubs/continueWatching` also returned `200 hit` (about 0.07–0.08
+seconds). A section hub variant with Plex Web query parameters initially
+timed out twice at 12 seconds via Replx, then returned `200 miss` in about
+0.22 seconds and `200 hit` in about 0.10 seconds. The same variant returned
+200 directly from the Plex origin in about 2.5 seconds from the Mac and
+0.59 seconds from `oi-2`. The intermittent slow path is not resolved or
+explained by the preload; keep it as a production release blocker.
 
 ## Evidence sequence
 
