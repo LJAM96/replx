@@ -14,6 +14,7 @@ import (
 
 func TestPreloadFillsOwnerPagesAndMatchingArtwork(t *testing.T) {
 	pages, images := 0, 0
+	seen := map[string]bool{}
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Plex-Token") != "owner-token" {
 			t.Errorf("preload used the wrong credential")
@@ -31,6 +32,7 @@ func TestPreloadFillsOwnerPagesAndMatchingArtwork(t *testing.T) {
 			return
 		}
 		pages++
+		seen[r.URL.Path] = true
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"MediaContainer":{}}`))
 	}))
@@ -56,6 +58,9 @@ func TestPreloadFillsOwnerPagesAndMatchingArtwork(t *testing.T) {
 	}
 	if pages != 6 || images != 1 {
 		t.Fatalf("unexpected origin work: pages=%d images=%d", pages, images)
+	}
+	if !seen["/hubs/continueWatching"] || !seen["/library/sections/23/collections"] {
+		t.Fatal("common owner pages were not fetched")
 	}
 	if stats := w.Stats(); stats.PreloadPages != 6 || stats.PreloadArtwork != 1 || stats.LastPreloadUnix == 0 {
 		t.Fatalf("preload evidence missing: %+v", stats)

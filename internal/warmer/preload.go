@@ -62,7 +62,7 @@ func (w *Warmer) PreloadOnce(ctx context.Context) PreloadResult {
 		return result
 	}
 	result.Ready = true
-	paths := []string{"/library/sections", "/hubs/promoted", "/hubs/home/recentlyAdded", "/hubs/home/continueWatching"}
+	paths := []string{"/library/sections", "/hubs/promoted", "/hubs/home/recentlyAdded", "/hubs/continueWatching"}
 	if w.PreloadSections != nil {
 		sections, err := w.PreloadSections(ctx)
 		if err != nil {
