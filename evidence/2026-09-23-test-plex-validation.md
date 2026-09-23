@@ -185,6 +185,19 @@ the same result, nor explain the earlier intermittent 12-second timeout.
 
 ## Evidence sequence
 
+The 12:50 BST browser capture supplied after the Firefox preload test shows
+454 requests from a page whose referrer was `replex.lukemulvaney.com`, but
+all requests targeted `plex.direct` hosts and none targeted Replx. Its creator
+identifies as Zen. Fifty requests were collection children; six completed
+with 200 after a median of about 11.1 seconds and 44 were recorded with
+status 0. Of 394 poster requests, 393 completed with 200; timed successes
+had a median of about 2.9 seconds. These timings are direct Plex traffic,
+so Replx's preload and cache could not accelerate this browser load. The
+captured collection query replayed through Replx returned 200 miss in about
+3.21 seconds, then 200 hit in about 0.08 seconds. Routing browser control
+requests through Replx is therefore a release blocker; a Replx page URL
+alone does not prove that the Plex app selected Replx for data traffic.
+
 1. Deploy a versioned build containing the correction. Record its image digest and commit.
 2. Trigger a full owner sync. Require four completed section cursors, a plausible nonzero item count, and no new sync errors. Confirm the event stream remains connected while idle for at least 15 minutes.
 3. In Plex Web through the Replx connection, open Home, one large library, and one collection twice. Record screen load time and Replx cache counters before and after each repeat load.
