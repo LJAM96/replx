@@ -110,6 +110,25 @@ Owner sync uses the encrypted owner PMS credential obtained during onboarding.
 
 Initial sync indexes library sections, items, GUIDs, variants, parts and streams using pagination. Progress is persisted and resumable.
 
+## Owner preload
+
+After startup and every five minutes, a bounded background pass uses the
+current owner credential to fetch the library list, common home hubs, up to
+eight section hubs and collection lists, and up to 96 recent poster transforms
+directly from PMS.
+The pass does not delay readiness, and failed requests are not cached. Cached
+responses and artwork use the canonical owner scope. Other users still need
+their own authorized requests before their responses can be cached.
+The admin cache statistics expose cumulative preload page, artwork, and error
+counts plus the time of the last completed pass.
+
+The response key includes non-secret query parameters and representation.
+Preloaded pages only hit when a client makes the same request variant; a Plex
+Web request with extra parameters may still be a first miss. The warmer
+refreshes owner entries that clients actually request. Artwork keys remove a
+Plex token nested inside the transcode URL, so the owner preloaded poster can
+match the same transform after token rotation without crossing user scopes.
+
 ## Events and reconciliation
 
 Use PMS event streams for targeted invalidation and refresh. Events are not assumed lossless, so reconcile periodically.

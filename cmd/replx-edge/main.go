@@ -232,7 +232,7 @@ func runServe() error {
 	}
 	warm := warmer.New(cacheStore, cfg.OriginInternalURL, cfg.SecretKey, ownerPMSToken, logger, registry)
 	warm.OwnerAccount = ownerAccount
-	go warm.Run(ctx, 15*time.Second)
+	go warm.Run(ctx, 2*time.Second)
 	// Eta artwork: shared filesystem transcode cache with oldest-first
 	// janitor. Directory failure degrades to uncached artwork, never to
 	// failed startup.
@@ -300,6 +300,45 @@ func runServe() error {
 		sg, gg := proxyHandler.Generations().Get(s.Scope, class)
 		return cache.ResponseKeyGen(s.Scope, class, s.Method, s.Path, q, s.Accept, sg, gg)
 	}
+	warm.Artwork = artworkStore
+	warm.PreloadSections = func(ctx context.Context) ([]string, error) {
+		rows, err := db.Raw().Query(ctx, `SELECT plex_section_id FROM libraries
+			WHERE server_id=(SELECT id FROM plex_servers WHERE enabled ORDER BY created_at DESC LIMIT 1)
+			ORDER BY plex_section_id LIMIT 8`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var sections []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return nil, err
+			}
+			sections = append(sections, id)
+		}
+		return sections, rows.Err()
+	}
+	warm.PreloadArtworkPaths = func(ctx context.Context) ([]string, error) {
+		rows, err := db.Raw().Query(ctx, `SELECT thumb FROM library_items
+			WHERE server_id=(SELECT id FROM plex_servers WHERE enabled ORDER BY created_at DESC LIMIT 1)
+				AND thumb LIKE '/library/metadata/%'
+			ORDER BY added_at DESC NULLS LAST LIMIT 96`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var thumbs []string
+		for rows.Next() {
+			var thumb string
+			if err := rows.Scan(&thumb); err != nil {
+				return nil, err
+			}
+			thumbs = append(thumbs, thumb)
+		}
+		return thumbs, rows.Err()
+	}
+	go warm.RunPreload(ctx, 5*time.Minute)
 
 	onboard := &onboarding.Service{
 		DB:          db.Raw(),

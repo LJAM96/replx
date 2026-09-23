@@ -130,6 +130,18 @@ deployment. This addresses the measured repeated-poster cache failure; it
 does not prove first-load speed or resolve browser request cancellations.
 Re-test cold and warm collection loads before claiming a speed improvement.
 
+## Direct owner preload prepared
+
+A bounded background preloader now fetches common owner browse pages,
+section collection lists, and up to 96 recent poster transforms directly from Plex using the encrypted owner
+credential. It stores only in the canonical owner scope and skips absent
+credentials. Artwork keys omit nested Plex tokens so a preloaded transform
+matches a later owner request after token rotation. Full Go tests, `go vet`,
+and Compose configuration validation pass locally. The test host was not
+reachable by SSH when this change was prepared, so deployment and real cache
+hit evidence are still pending. Exact Plex Web query variants and other users'
+personalized pages are not preloaded.
+
 ## Evidence sequence
 
 1. Deploy a versioned build containing the correction. Record its image digest and commit.

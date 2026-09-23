@@ -29,6 +29,17 @@ func TestKeyScopes(t *testing.T) {
 	}
 }
 
+func TestKeyIgnoresNestedPlexToken(t *testing.T) {
+	a, _ := url.ParseQuery("width=480&height=720&url=%2Flibrary%2Fmetadata%2F1%2Fthumb%2F2%3FX-Plex-Token%3Dold")
+	b, _ := url.ParseQuery("width=480&height=720&url=%2Flibrary%2Fmetadata%2F1%2Fthumb%2F2%3FX-Plex-Token%3Dnew")
+	if Key("user:owner", "/photo/:/transcode", a) != Key("user:owner", "/photo/:/transcode", b) {
+		t.Fatal("nested token rotation must retain the owner artwork entry")
+	}
+	if Key("user:other", "/photo/:/transcode", a) == Key("user:owner", "/photo/:/transcode", b) {
+		t.Fatal("different users must remain isolated")
+	}
+}
+
 func TestRoundTripAndExpiry(t *testing.T) {
 	dir := t.TempDir()
 	s, err := New(dir, 1)

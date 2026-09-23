@@ -18,11 +18,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/cache"
 	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/logging"
@@ -32,6 +34,7 @@ import (
 
 // maxTracked bounds memory when many distinct paths are browsed.
 const maxTracked = 512
+const maxRefreshPerCycle = 8
 
 // Snapshot captures how to reproduce one cache entry. Scope is the
 // identity scope (canonical "user:<identity UUID>", legacy "acct:<id>" or
@@ -49,10 +52,14 @@ type Snapshot struct {
 
 // Stats is the operator-visible warmer state.
 type Stats struct {
-	Tracked      int   `json:"tracked"`
-	Refreshed    int64 `json:"refreshed"`
-	Errors       int64 `json:"errors"`
-	OwnerWarming bool  `json:"ownerWarming"`
+	Tracked         int   `json:"tracked"`
+	Refreshed       int64 `json:"refreshed"`
+	Errors          int64 `json:"errors"`
+	OwnerWarming    bool  `json:"ownerWarming"`
+	PreloadPages    int64 `json:"preloadPages"`
+	PreloadArtwork  int64 `json:"preloadArtwork"`
+	PreloadErrors   int64 `json:"preloadErrors"`
+	LastPreloadUnix int64 `json:"lastPreloadUnix"`
 }
 
 // Warmer refreshes due owner-scoped entries against the origin.
@@ -61,8 +68,8 @@ type Warmer struct {
 	origin     string
 	secret     string
 	ownerToken func(ctx context.Context) (string, bool)
-	// OwnerAccount resolves the owner account ID for scope comparison,
-	// cached for a minute. Refresh compares snapshot scopes against
+	// OwnerAccount resolves the current owner account for scope comparison.
+	// Refresh compares snapshot scopes against
 	// the canonical owner scope: account identity, never token material.
 	OwnerAccount func(ctx context.Context) (int64, bool)
 	// DB resolves the owner account to its identity UUID for the
@@ -72,20 +79,24 @@ type Warmer struct {
 	// KeyFunc recomputes a snapshot's cache key under current
 	// invalidation generations. Unset keeps the tracked key as-is.
 	KeyFunc func(s Snapshot) string
-	log     *logging.Logger
-	metrics *metrics.Registry
-	client  *http.Client
-	now     func() time.Time
+	// Optional bounded candidate providers for proactive owner preloading.
+	PreloadSections     func(ctx context.Context) ([]string, error)
+	PreloadArtworkPaths func(ctx context.Context) ([]string, error)
+	Artwork             *artwork.Store
+	log                 *logging.Logger
+	metrics             *metrics.Registry
+	client              *http.Client
+	now                 func() time.Time
 
-	mu        sync.Mutex
-	tracked   map[string]tracked
-	refreshed int64
-	errors    int64
-	warming   bool
-	ownerAcct int64
-	ownerUUID string
-	ownerOK   bool
-	ownerAt   time.Time
+	mu               sync.Mutex
+	tracked          map[string]tracked
+	refreshed        int64
+	errors           int64
+	warming          bool
+	preloadPages     int64
+	preloadedArtwork int64
+	preloadErrors    int64
+	lastPreloadUnix  int64
 }
 
 type tracked struct {
@@ -167,15 +178,23 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 	}
 	now := w.now()
 	w.mu.Lock()
-	due := make([]string, 0)
+	type dueEntry struct {
+		key  string
+		last time.Time
+	}
+	due := make([]dueEntry, 0)
 	for k, t := range w.tracked {
 		if t.snap.TTL <= 0 || now.Sub(t.last) >= t.snap.TTL/2 {
-			due = append(due, k)
+			due = append(due, dueEntry{key: k, last: t.last})
 		}
 	}
 	w.mu.Unlock()
 	if len(due) == 0 {
 		return
+	}
+	sort.Slice(due, func(i, j int) bool { return due[i].last.Before(due[j].last) })
+	if len(due) > maxRefreshPerCycle {
+		due = due[:maxRefreshPerCycle]
 	}
 	owner, ok := w.owner(ctx)
 	w.mu.Lock()
@@ -188,7 +207,8 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 	if ownerScope == "" {
 		return
 	}
-	for _, k := range due {
+	for _, item := range due {
+		k := item.key
 		w.mu.Lock()
 		t, exists := w.tracked[k]
 		w.mu.Unlock()
@@ -204,7 +224,10 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 			w.mu.Unlock()
 			continue
 		}
-		if err := w.refresh(ctx, k, t.snap, owner); err != nil {
+		requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		err := w.refresh(requestCtx, k, t.snap, owner)
+		cancel()
+		if err != nil {
 			w.countErr()
 			continue
 		}
@@ -228,7 +251,10 @@ func (w *Warmer) Stats() Stats {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return Stats{Tracked: len(w.tracked), Refreshed: w.refreshed, Errors: w.errors, OwnerWarming: w.warming}
+	return Stats{Tracked: len(w.tracked), Refreshed: w.refreshed, Errors: w.errors,
+		OwnerWarming: w.warming, PreloadPages: w.preloadPages,
+		PreloadArtwork: w.preloadedArtwork, PreloadErrors: w.preloadErrors,
+		LastPreloadUnix: w.lastPreloadUnix}
 }
 
 func (w *Warmer) owner(ctx context.Context) (string, bool) {
@@ -237,11 +263,14 @@ func (w *Warmer) owner(ctx context.Context) (string, bool) {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	return w.ownerToken(cctx)
+	token, ok := w.ownerToken(cctx)
+	return token, ok && token != ""
 }
 
-// ownerScope returns the canonical owner scope, caching the account
-// lookup for a minute. With a database it resolves the owner account to
+// ownerScope returns the current canonical owner scope. It intentionally
+// re-resolves each pass so a changed active server or owner cannot reuse a
+// cached identity when a new credential is loaded. With a database it maps
+// the owner account to
 // its identity UUID ("user:<uuid>"), matching the proxy's canonical
 // scope; without one (tests) it keeps the legacy "acct:<id>" form.
 // Empty when the owner account is unknown: nothing refreshes.
@@ -249,14 +278,6 @@ func (w *Warmer) ownerScope(ctx context.Context) string {
 	if w.OwnerAccount == nil {
 		return ""
 	}
-	w.mu.Lock()
-	if w.ownerOK && w.now().Sub(w.ownerAt) < time.Minute {
-		id := w.ownerAcct
-		uuid := w.ownerUUID
-		w.mu.Unlock()
-		return w.canonicalScope(id, uuid)
-	}
-	w.mu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	id, ok := w.OwnerAccount(cctx)
@@ -270,9 +291,6 @@ func (w *Warmer) ownerScope(ctx context.Context) string {
 				ORDER BY updated_at DESC LIMIT 1`, serverID, id).Scan(&uuid)
 		}
 	}
-	w.mu.Lock()
-	w.ownerAcct, w.ownerUUID, w.ownerOK, w.ownerAt = id, uuid, ok, w.now()
-	w.mu.Unlock()
 	if !ok {
 		return ""
 	}

@@ -58,6 +58,9 @@ func Key(scope, path string, query url.Values) string {
 		vals := append([]string(nil), query[k]...)
 		sort.Strings(vals)
 		for _, v := range vals {
+			if strings.EqualFold(k, "url") {
+				v = stripNestedToken(v)
+			}
 			b.WriteString(strings.ToLower(k))
 			b.WriteByte('=')
 			b.WriteString(v)
@@ -66,6 +69,24 @@ func Key(scope, path string, query url.Values) string {
 	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])
+}
+
+// Plex Web places its token inside the transcode's nested url parameter.
+// The account scope already separates users, so token rotation must not
+// split otherwise identical artwork entries.
+func stripNestedToken(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.IsAbs() || u.Host != "" || !strings.HasPrefix(u.Path, "/") {
+		return raw
+	}
+	q := u.Query()
+	for k := range q {
+		if isSecret(k) {
+			q.Del(k)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func isSecret(k string) bool {
