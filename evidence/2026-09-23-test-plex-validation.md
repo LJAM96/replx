@@ -237,10 +237,10 @@ in 0.43 seconds (0.34 seconds connecting, 0.06 seconds to headers), showing
 the slowness is intermittent.
 
 The operator identified a Docker container named `agregarr` on `oi-2`.
-It was running, but its logs contained no entries during the 12:00–12:09
-slow-load window; there is no evidence of a concurrent rebuild in that
-window. Its generated collection count may still make Plex Web issue many
-child queries. The `plex` container on `oi-2` has a different machine identity
+It was running, but its container logs contained no entries during the
+12:00–12:09 slow-load window. That silence does not establish that it was
+idle. Its generated collection count may make Plex Web issue many child
+queries. The `plex` container on `oi-2` has a different machine identity
 from Lukeflix, so its process metrics do not describe the target PMS.
 
 Commit `030300a` limits Replx to eight simultaneous uncached browse origin
@@ -254,6 +254,47 @@ eight 200 misses and four client timeouts at 18 seconds (median 9.83
 seconds). The limit has **not** proved the cold collection path reliable.
 Do not promote this test build until a full browser retest and Lukeflix PMS
 log review explain the remaining stalls.
+
+## Lukeflix Plex log review (operator ZIP, 23 September)
+
+The operator supplied a Plex Media Server log archive covering the browser
+test. Request IDs were matched between Plex's `Request` and `Completed`
+records; raw URLs, tokens, IPs and media titles were excluded from the
+analysis. Times below are Plex log times.
+
+| Interval | Completed collection-child requests | Median | p95 | Longest | Peak Plex live requests | Slow-query warnings |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 11:49–11:56 | 34 | 10.01s | 11.07s | 11.29s | 23 | 1 |
+| 11:56–12:09 | 324 | 49.45s | 100.8s | 123.95s | 77 | 392 |
+| 12:09–12:18 | 120 | 21.09s | 60.73s | 65.42s | 52 | 76 |
+
+For example, one collection-child request took about 54 seconds from
+11:59:29 to 12:00:23. A logged 36-item query inside it took 240ms, so that
+query alone does not explain the end-to-end delay. Plex also logged many
+scanner-related lines during the test and slow-query warnings during the
+browser's collection request burst. The severe period had 21–46 new
+collection-child requests per minute from 11:56 to 12:04, apart from
+12:02. There were no `PUT /library/metadata/*` requests from 11:56 through
+12:04, so concurrent metadata edits cannot by themselves explain that
+period. The number of simultaneous collection requests and Plex-side
+latency are the strongest evidence for the cold-path bottleneck; the logs
+do not isolate CPU, disk, database locking, or another internal wait as
+the precise cause.
+
+The word `agregarr` appears in some Plex request query values for metadata
+labels. Those lines show label-related GET and PUT operations before 11:56
+and again around 12:05 and 12:09–12:15. The label does **not** identify the
+requesting client, so these records alone cannot prove which process made
+the changes. The prior absence of container log entries should not be used
+as evidence of inactivity.
+
+This confirms the test build is not production ready: a cold collection
+burst can take tens of seconds at the actual Lukeflix origin, even with
+Replx limiting its own concurrent origin fetches. A warm Replx cache can
+serve a matching request quickly, but Plex Web may issue new query variants
+or bypass the Replx route. Further work needs a controlled cold/warm
+browser trace and a Plex-side performance window with collection and scan
+activity observed together.
 
 1. Deploy a versioned build containing the correction. Record its image digest and commit.
 2. Trigger a full owner sync. Require four completed section cursors, a plausible nonzero item count, and no new sync errors. Confirm the event stream remains connected while idle for at least 15 minutes.
