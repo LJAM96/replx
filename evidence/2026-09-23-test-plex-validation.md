@@ -221,6 +221,40 @@ returned `101 Switching Protocols` through both direct Plex and Replx.
 This proves the route protocol fix, but the Zen offline behavior and
 collection burst still need a fresh browser retest before release.
 
+## Zen retest and bounded browse experiment
+
+On the next Zen test, Lukeflix stayed online and the notification WebSocket
+returned 101. Repeated `/hubs/sections/23` requests were mostly cache hits
+served by Replx in 0–3ms internally. The same query missed twice and waited
+about 3.8 and 10 seconds for origin headers; the browser's brief content
+refresh is consistent with those hard-expiry misses. Across nearby browser
+loads, collection-child requests reached 28 concurrent origin fetches;
+74 of 77 recorded requests were canceled before Plex answered. One
+`/library/sections/23/collections` request made directly from `oi-2` to the
+configured Lukeflix origin timed out at 12 seconds, proving that path can
+stall without the Replx public ingress. A later direct request returned 200
+in 0.43 seconds (0.34 seconds connecting, 0.06 seconds to headers), showing
+the slowness is intermittent.
+
+The operator identified a Docker container named `agregarr` on `oi-2`.
+It was running, but its logs contained no entries during the 12:00–12:09
+slow-load window; there is no evidence of a concurrent rebuild in that
+window. Its generated collection count may still make Plex Web issue many
+child queries. The `plex` container on `oi-2` has a different machine identity
+from Lukeflix, so its process metrics do not describe the target PMS.
+
+Commit `030300a` limits Replx to eight simultaneous uncached browse origin
+requests and records queue time separately. A concurrency regression test,
+full Go tests, vet and Compose validation passed. It is deployed to test as
+`0.4.0-030300a-test` (image ID
+`sha256:d972e2c2e51ccebccd3ed80182cbe0fa1ae0dd365011579cc199399bdeebc1db`),
+healthy with zero restarts. Its first preload pass stored 9 pages with 1
+error. A bounded replay of 12 captured collection-child requests returned
+eight 200 misses and four client timeouts at 18 seconds (median 9.83
+seconds). The limit has **not** proved the cold collection path reliable.
+Do not promote this test build until a full browser retest and Lukeflix PMS
+log review explain the remaining stalls.
+
 1. Deploy a versioned build containing the correction. Record its image digest and commit.
 2. Trigger a full owner sync. Require four completed section cursors, a plausible nonzero item count, and no new sync errors. Confirm the event stream remains connected while idle for at least 15 minutes.
 3. In Plex Web through the Replx connection, open Home, one large library, and one collection twice. Record screen load time and Replx cache counters before and after each repeat load.
