@@ -232,7 +232,7 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 			continue
 		}
 		timeout := 8 * time.Second
-		if cache.CollectionStale(t.snap.Path) {
+		if _, ok := cache.FallbackTTL(t.snap.Path); ok {
 			timeout = 90 * time.Second
 		}
 		requestCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -384,8 +384,8 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 	if err := w.store.Set(ctx, storeKey, entry, s.TTL); err != nil {
 		return err
 	}
-	if cache.CollectionStale(s.Path) {
-		if err := w.store.Set(ctx, cache.StaleKey(storeKey), entry, cache.CollectionStaleTTL); err != nil {
+	if ttl, ok := cache.FallbackTTL(s.Path); ok {
+		if err := w.store.Set(ctx, cache.StaleKey(storeKey), entry, ttl); err != nil {
 			return err
 		}
 	}

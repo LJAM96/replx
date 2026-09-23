@@ -325,11 +325,11 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 	return true
 }
 
-// serveStale keeps an already visited collection responsive while Plex is
-// slow. A validated credential and the exact user/query cache key are
+// serveStale keeps an already visited structural page responsive while Plex
+// is slow. A validated credential and the exact user/query cache key are
 // required; Continue Watching and playback state never use this path.
 func (h *Handler) serveStale(w http.ResponseWriter, r *http.Request, id string, o *obs, start time.Time) bool {
-	if !o.cacheable || !cache.CollectionStale(r.URL.Path) || o.invalid ||
+	if _, allowed := cache.FallbackTTL(r.URL.Path); !o.cacheable || !allowed || o.invalid ||
 		(h.identity != nil && !o.fresh) {
 		return false
 	}
@@ -1038,8 +1038,8 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 		Body:        body,
 	}
 	_ = h.cache.Set(r.Context(), o.cacheKey, entry, o.cacheTTL)
-	if cache.CollectionStale(r.URL.Path) {
-		_ = h.cache.Set(r.Context(), cache.StaleKey(o.cacheKey), entry, cache.CollectionStaleTTL)
+	if ttl, ok := cache.FallbackTTL(r.URL.Path); ok {
+		_ = h.cache.Set(r.Context(), cache.StaleKey(o.cacheKey), entry, ttl)
 	}
 	if h.warmer != nil {
 		h.warmer.Track(o.cacheKey, warmer.Snapshot{

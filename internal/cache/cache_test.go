@@ -38,6 +38,20 @@ func TestCodecRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFallbackPolicyKeepsWatchStateLive(t *testing.T) {
+	if ttl, ok := FallbackTTL("/hubs/promoted"); !ok || ttl != time.Minute {
+		t.Fatalf("home fallback: %v %v", ttl, ok)
+	}
+	if ttl, ok := FallbackTTL("/library/collections/101/children"); !ok || ttl != CollectionStaleTTL {
+		t.Fatalf("collection fallback: %v %v", ttl, ok)
+	}
+	for _, path := range []string{"/hubs/continueWatching", "/hubs/home/recentlyAdded", "/:/timeline"} {
+		if _, ok := FallbackTTL(path); ok {
+			t.Fatalf("watch-state path must not use fallback: %s", path)
+		}
+	}
+}
+
 func TestSafeHeaders(t *testing.T) {
 	h := map[string][]string{
 		"ETag":           {`"x"`},

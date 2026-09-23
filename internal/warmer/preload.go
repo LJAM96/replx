@@ -65,6 +65,7 @@ func (w *Warmer) PreloadOnce(ctx context.Context) PreloadResult {
 	}
 	result.Ready = true
 	paths := []string{"/library/sections", "/hubs/promoted", "/hubs/home/recentlyAdded", "/hubs/continueWatching"}
+	var sectionIDs []string
 	if w.PreloadSections != nil {
 		sections, err := w.PreloadSections(ctx)
 		if err != nil {
@@ -75,6 +76,7 @@ func (w *Warmer) PreloadOnce(ctx context.Context) PreloadResult {
 					break
 				}
 				if safeSectionID(section) {
+					sectionIDs = append(sectionIDs, section)
 					paths = append(paths, "/hubs/sections/"+section)
 					paths = append(paths, "/library/sections/"+section+"/collections")
 				}
@@ -87,8 +89,23 @@ func (w *Warmer) PreloadOnce(ctx context.Context) PreloadResult {
 			continue
 		}
 		queries := []string{""}
-		if strings.HasPrefix(path, "/hubs/sections/") || strings.Contains(strings.ToLower(path), "continuewatching") {
-			if profile := stripSecrets(w.PreloadHubQuery); profile != "" && len(profile) <= 4096 {
+		if profile := stripSecrets(w.PreloadHubQuery); profile != "" && len(profile) <= 4096 {
+			switch {
+			case path == "/hubs/promoted":
+				for _, section := range sectionIDs {
+					q, err := url.ParseQuery(profile)
+					if err == nil {
+						q.Set("contentDirectoryID", section)
+						queries = append(queries, q.Encode())
+					}
+				}
+			case strings.HasPrefix(path, "/hubs/sections/"):
+				q, err := url.ParseQuery(profile)
+				if err == nil {
+					q.Set("contentDirectoryID", strings.TrimPrefix(path, "/hubs/sections/"))
+					queries = append(queries, q.Encode())
+				}
+			case strings.Contains(strings.ToLower(path), "continuewatching"):
 				queries = append(queries, profile)
 			}
 		}
@@ -107,6 +124,8 @@ func (w *Warmer) PreloadOnce(ctx context.Context) PreloadResult {
 			timeout := 8 * time.Second
 			if cache.CollectionStale(path) {
 				timeout = 90 * time.Second
+			} else if _, ok := cache.FallbackTTL(path); ok {
+				timeout = 60 * time.Second
 			}
 			requestCtx, cancel := context.WithTimeout(ctx, timeout)
 			err := w.refresh(requestCtx, key, s, owner)

@@ -348,3 +348,32 @@ was deployed on `oi-2`. It became healthy with zero restarts, no application
 errors in the initial log sample, and an initial preload pass of 11 pages
 with zero errors. The earlier cache replay measurements used the same cache
 behavior in the immediately preceding test image.
+
+## Older logs and account-switch retest
+
+The operator reported an empty Home screen on admin sign-in, then slow
+collection browsing after switching to the Luke user. Replx's current
+container started at 12:45:55 UTC and remained healthy with zero restarts.
+Its logs through 22:17 UTC contain 266 HTTP requests and no
+`/library/collections/*` request at all. Home, library section and Continue
+Watching requests are present. The Luke collection traffic therefore did
+not traverse this Replx container during the captured period, if the
+reported browsing occurred after that start time. A browser HAR is needed
+to identify its actual hostname; direct Plex routing is the leading
+hypothesis, not yet confirmed.
+
+Around 12:47 UTC, Plex Web made four `/hubs/promoted` requests with distinct
+`contentDirectoryID` values. Two returned nonempty 200 responses in 141ms
+and 433ms; two other variants waited about 30 seconds and were canceled
+with Replx 502 responses. An `/library/sections/*/all` request was also
+canceled, while two others returned nonempty 200s. The empty Home view is
+consistent with the canceled Home requests, but the logs cannot establish
+exactly what the browser rendered.
+
+The supplied Lukeflix PMS archive covers 11:20–12:18 UTC only, before this
+account-switch retest. Earlier collection-child requests took a median
+3.55s (23 requests, 11:20–11:35) and 3.17s (23 requests, 11:35–11:49),
+with no slow-query warnings. At 11:56–12:09, 324 requests took a median
+49.52s and Plex recorded 392 slow-query warnings. The burst, rather than
+metadata updates alone, tracks the severe origin slowdown. The archive
+cannot diagnose the later Luke session directly.

@@ -32,7 +32,7 @@ const SchemaVersion = "v2"
 // the client still receives full bytes, only caching is skipped.
 const MaxEntryBytes = 2 << 20 // 2 MiB
 
-// Collection responses keep a short-lived fallback copy. Only the proxy
+// Structural browse responses keep a bounded fallback copy. Only the proxy
 // serves it, after a fresh credential check, while a refresh runs separately.
 const CollectionStaleTTL = 15 * time.Minute
 
@@ -42,6 +42,18 @@ func CollectionStale(path string) bool {
 	p := strings.ToLower(path)
 	return strings.HasPrefix(p, "/library/collections/") ||
 		(strings.HasPrefix(p, "/library/sections/") && strings.HasSuffix(p, "/collections"))
+}
+
+// FallbackTTL excludes Continue Watching and other watch-state feeds.
+func FallbackTTL(path string) (time.Duration, bool) {
+	if CollectionStale(path) {
+		return CollectionStaleTTL, true
+	}
+	p := strings.ToLower(path)
+	if p == "/hubs/promoted" || strings.HasPrefix(p, "/hubs/sections/") {
+		return time.Minute, true
+	}
+	return 0, false
 }
 
 // secretParams are stripped from keys (case-insensitive).

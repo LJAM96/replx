@@ -117,11 +117,16 @@ func TestPreloadUsesConfiguredHubQueryForBrowserKey(t *testing.T) {
 		return cache.ResponseKey(s.Scope, s.Method, s.Path, q, s.Accept)
 	}
 	w.PreloadOnce(context.Background())
-	browserQuery, _ := url.ParseQuery("includeMeta=1&count=12&X-Plex-Client-Identifier=browser-1&X-Plex-Token=rotated")
+	browserQuery, _ := url.ParseQuery("includeMeta=1&count=12&contentDirectoryID=23&X-Plex-Client-Identifier=browser-1&X-Plex-Token=rotated")
 	key := cache.ResponseKey("acct:7", http.MethodGet, "/hubs/sections/23", browserQuery, preloadAccept)
 	if _, ok, _ := store.Get(context.Background(), key); !ok {
 		t.Fatal("browser's exact collection query was not preloaded")
 	}
+	promotedKey := cache.ResponseKey("acct:7", http.MethodGet, "/hubs/promoted", browserQuery, preloadAccept)
+	if _, ok, _ := store.Get(context.Background(), promotedKey); !ok {
+		t.Fatal("browser's per-section home query was not preloaded")
+	}
+	browserQuery.Del("contentDirectoryID")
 	cwKey := cache.ResponseKey("acct:7", http.MethodGet, "/hubs/continueWatching", browserQuery, preloadAccept)
 	if _, ok, _ := store.Get(context.Background(), cwKey); !ok {
 		t.Fatal("browser's exact Continue Watching query was not preloaded")
