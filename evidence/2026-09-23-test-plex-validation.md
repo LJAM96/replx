@@ -443,3 +443,17 @@ was deployed to `oi-2`; the container is healthy with zero restarts, and its
 initial owner preload reported eight pages and zero errors. Luke browser
 validation after this build is pending. The first new Home variant remains
 dependent on an origin success before a fallback can exist.
+
+## Immediate browser retest after Home fallback change
+
+In the first Luke browser session after deploying `176eaea`, 27 collection
+children were served as 200 stale responses in at most 1ms. The first
+`/hubs/promoted` variant missed and took 27.8s; another was canceled after
+30.1s, so the first view remained slow. In the next visit, one promoted
+variant returned 200 stale in 1ms, while another missed and returned 200 in
+302ms. A concurrent group of collection misses was canceled by request
+context; these logs do not establish that PMS itself rejected those queries.
+Later cold child misses took up to 27.6s and some were canceled at around
+30s. Thus the longer fallback improves already populated exact-query
+responses, but does not eliminate cold variants. Operator visual feedback
+on poster display time is still pending.
