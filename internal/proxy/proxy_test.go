@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +25,21 @@ import (
 	"github.com/LJAM96/replx/internal/trace"
 	"github.com/LJAM96/replx/internal/warmer"
 )
+
+func TestOriginFailureLogIsClassifiedWithoutCredential(t *testing.T) {
+	var out bytes.Buffer
+	h := &Handler{log: logging.New(&out)}
+	h.logOriginFailure("request-1", &url.Error{
+		Op: "Get", URL: "https://plex.example/hubs?X-Plex-Token=secret-value",
+		Err: context.DeadlineExceeded,
+	})
+	if strings.Contains(out.String(), "secret-value") || !strings.Contains(out.String(), "deadline_exceeded") {
+		t.Fatalf("unsafe or missing origin failure category: %s", out.String())
+	}
+	if got := originErrorClass(errors.New("opaque transport failure")); got != "transport_other" {
+		t.Fatalf("unexpected category %q", got)
+	}
+}
 
 func TestPassthroughPreservesSemantics(t *testing.T) {
 	var logs bytes.Buffer

@@ -33,7 +33,76 @@ Existing compatibility rows record Plex Web progressive and Apple TV progressive
 - PMS event stream uses a client without a whole-request timeout while retaining the origin redirect boundary.
 - `go test ./... -count=1` passed locally. Live database tests require `REPLX_EDGE_TEST_POSTGRES_URL` and were not exercised by this command.
 
-The correction is not yet deployed. Recheck all baseline counts after deployment.
+The correction was not deployed when this baseline was captured.
+
+## Test deployment update (2026-09-22 23:46 UTC)
+
+The correction was deployed from commit `bdb1664` as
+`ghcr.io/ljam96/replx-edge:0.4.0-bdb1664-test`, image ID
+`sha256:aaebe6bf64589192a1bc32324942a4624af0dc16f29882f3ebb9c1d4f792e8ff`.
+The previous `.env` was privately backed up on the test server before the
+version change.
+
+The container is healthy with zero restarts. Readiness reports PMS healthy
+and Valkey ok. The first full sync completed with 112,078 items and all four
+section cursors complete; none remained running or in error. Origin and sync
+error counters were zero. No sync or event-stream reconnect log entry appeared
+in its first 15 minutes. No current-version playback evidence has been captured.
+
+The first Plex Web attempt at `replex.lukemulvaney.com` felt slow for
+collections and Continue Watching. Recent Replx logs show the Plex Web page
+assets and identity requests, but no `/library` or `/hubs` requests. Cache
+hits and misses stayed at zero. This is evidence that those browse requests
+did not traverse Replx during the attempt; it is not a valid cache-speed
+measurement. Confirm the client's selected API connection before measuring
+load times again.
+
+The user's Firefox network export confirms this: its 11 captured requests
+all targeted a `*.plex.direct` hostname (four `/hubs/promoted` requests and
+seven artwork requests). No response carried `X-Replx-Edge-Cache`. The public
+hostname itself returns Replx headers, so the Plex Web shell reaches Replx
+but Plex Web selects a direct PMS connection for its browse data. The captured
+successful hub responses took approximately 178–238 ms each; this does not
+include the complete screen render time. The export is not copied into this
+repository because it may contain authentication material.
+
+Replx's active server is labeled `Lukeflix` and uses the same public
+`*.plex.direct` origin observed in the browser export. Its machine identity
+does not match the local `plex` container on `oi-2` (confirmed against that
+container's live `/identity` response). The local Plex preferences also have
+no `customConnections` setting. Confirm which Plex server is intended for
+this test before changing origin or discovery configuration.
+
+The operator confirmed `Lukeflix` is the intended origin. A temporary
+Firefox request block for `plex.direct` caused Plex Web to send browse
+requests through Replx, proving fallback is possible for this browser.
+During that attempt, counters reached 400 cache misses, 2 hits, 95 control
+502 responses, and 97 origin transport errors. Collection child and home hub
+requests were among the 502s. The process remained healthy with zero
+restarts, but this is a release-blocking user-visible failure. Five
+credential-free `/identity` probes from `oi-2` to the public origin all
+succeeded in roughly 0.20–0.22 seconds; the failures appear under real
+browse traffic rather than simple connectivity. The current request logs
+omit the underlying transport error, so its cause remains unverified.
+
+A second browser export captured three `/hubs/sections/23` requests to
+Replx, all with browser status 0 and no usable timing. Replx's own logs
+showed repeated roughly 10-second 502s on that route, alongside occasional
+successful responses and one 1 ms cache hit. By the end of the browser-only
+test, process counters reached 762 misses, 37 hits, 406 control 502s, and
+612 origin transport errors. These are cumulative process counters, not a
+single-page failure rate. The operator reported that collections eventually
+appeared but were very slow.
+
+A local diagnostic change now categorizes origin transport failures without
+logging tokens or request URLs. The full Go suite passes, but this change
+has not been uploaded or deployed because automatic approval review rejected
+another private-source push to GitHub without explicit authorization.
+
+An additional local change makes the event-stream connection metric report
+its true state. It has passed the full Go suite but is not deployed: automatic
+approval review rejected uploading that private source change to GitHub
+without separate authorization.
 
 ## Evidence sequence
 

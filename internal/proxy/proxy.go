@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/LJAM96/replx/internal/artwork"
@@ -846,6 +848,7 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 		h.metrics.ObserveOrigin(time.Since(originStart), err != nil)
 	}
 	if err != nil {
+		h.logOriginFailure(id, err)
 		h.writeBadGateway(w, r, id, o, routeClass, start)
 		return
 	}
@@ -875,6 +878,37 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 		h.metrics.ObserveHTTP(routeClass, resp.StatusCode, time.Since(start))
 	}
 	h.emit(r, id, o, routeClass, resp.StatusCode, start, map[string]any{"bodyBytes": n})
+}
+
+// logOriginFailure records a bounded error category without logging the
+// origin URL, Plex token, or request headers. Those may be embedded in the
+// error text returned by net/http.
+func (h *Handler) logOriginFailure(requestID string, err error) {
+	if h.log == nil {
+		return
+	}
+	h.log.Log(logging.Entry{Level: "warn", Component: "gateway.origin", RequestID: requestID,
+		Fields: map[string]any{"errorClass": originErrorClass(err)}})
+}
+
+func originErrorClass(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "request_cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection_reset"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection_refused"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "network_timeout"
+	}
+	return "transport_other"
 }
 
 // copyBody streams the origin body to the client while tee-storing
