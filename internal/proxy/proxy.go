@@ -848,13 +848,15 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	}
 	out.Host = h.origin.Host
 
+	preOriginMs := time.Since(start).Milliseconds()
 	originStart := time.Now()
 	resp, err := h.client.Do(out) //nolint:gosec // target is admin-configured origin only
+	originHeaderMs := time.Since(originStart).Milliseconds()
 	if h.metrics != nil {
 		h.metrics.ObserveOrigin(time.Since(originStart), err != nil)
 	}
 	if err != nil {
-		h.logOriginFailure(id, err)
+		h.logOriginFailure(id, err, preOriginMs, originHeaderMs)
 		h.writeBadGateway(w, r, id, o, routeClass, start)
 		return
 	}
@@ -883,18 +885,20 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	if h.metrics != nil {
 		h.metrics.ObserveHTTP(routeClass, resp.StatusCode, time.Since(start))
 	}
-	h.emit(r, id, o, routeClass, resp.StatusCode, start, map[string]any{"bodyBytes": n})
+	h.emit(r, id, o, routeClass, resp.StatusCode, start, map[string]any{
+		"bodyBytes": n, "preOriginMs": preOriginMs, "originHeaderMs": originHeaderMs})
 }
 
 // logOriginFailure records a bounded error category without logging the
 // origin URL, Plex token, or request headers. Those may be embedded in the
 // error text returned by net/http.
-func (h *Handler) logOriginFailure(requestID string, err error) {
+func (h *Handler) logOriginFailure(requestID string, err error, preOriginMs, originHeaderMs int64) {
 	if h.log == nil {
 		return
 	}
 	h.log.Log(logging.Entry{Level: "warn", Component: "gateway.origin", RequestID: requestID,
-		Fields: map[string]any{"errorClass": originErrorClass(err)}})
+		Fields: map[string]any{"errorClass": originErrorClass(err),
+			"preOriginMs": preOriginMs, "originHeaderMs": originHeaderMs}})
 }
 
 func originErrorClass(err error) string {

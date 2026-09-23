@@ -33,9 +33,12 @@ func TestOriginFailureLogIsClassifiedWithoutCredential(t *testing.T) {
 	h.logOriginFailure("request-1", &url.Error{
 		Op: "Get", URL: "https://plex.example/hubs?X-Plex-Token=secret-value",
 		Err: context.DeadlineExceeded,
-	})
+	}, 12, 345)
 	if strings.Contains(out.String(), "secret-value") || !strings.Contains(out.String(), "deadline_exceeded") {
 		t.Fatalf("unsafe or missing origin failure category: %s", out.String())
+	}
+	if !strings.Contains(out.String(), `"preOriginMs":12`) || !strings.Contains(out.String(), `"originHeaderMs":345`) {
+		t.Fatalf("origin phase timings missing: %s", out.String())
 	}
 	if got := originErrorClass(errors.New("opaque transport failure")); got != "transport_other" {
 		t.Fatalf("unexpected category %q", got)
@@ -87,6 +90,9 @@ func TestPassthroughPreservesSemantics(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "user-secret") {
 		t.Fatalf("token leaked to logs: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), `"preOriginMs":`) || !strings.Contains(logs.String(), `"originHeaderMs":`) {
+		t.Fatalf("origin phase timings missing from request log: %s", logs.String())
 	}
 }
 
