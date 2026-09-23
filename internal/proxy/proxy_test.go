@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -711,6 +712,44 @@ func TestArtworkAccountScoped(t *testing.T) {
 	h.ServeHTTP(anonRec, anon)
 	if anonRec.Header().Get(CacheHeader) == "hit" {
 		t.Fatal("anonymous artwork must never hit account entries")
+	}
+}
+
+func TestArtworkWriteFailureIsLoggedOnce(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write([]byte("thumb-bytes"))
+	}))
+	defer origin.Close()
+	dir := t.TempDir()
+	art, err := artwork.New(dir, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, []byte("blocks cache writes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret,
+		Artwork: art, Logger: logging.New(&logs)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		req := httptest.NewRequest(http.MethodGet, "/photo/:/transcode?width=480", nil)
+		req.Header.Set("X-Plex-Token", "secret-value")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("cache failure must not break artwork: %d", rec.Code)
+		}
+	}
+	if strings.Count(logs.String(), "artwork_write_failed") != 1 || strings.Contains(logs.String(), "secret-value") {
+		t.Fatal("write failure must be logged once without credentials")
 	}
 }
 

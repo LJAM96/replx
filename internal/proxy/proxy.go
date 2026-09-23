@@ -160,8 +160,9 @@ type Handler struct {
 	// flightMu guards in-flight cacheable origin fetches for stampede
 	// control: one request refreshes an expired object while concurrent
 	// requests for the same key wait bounded for the cache to populate.
-	flightMu sync.Mutex
-	flight   map[string]struct{}
+	flightMu            sync.Mutex
+	flight              map[string]struct{}
+	artworkWriteLogOnce sync.Once
 }
 
 // New validates options and returns a Handler.
@@ -609,7 +610,12 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 		return false
 	}
 	if resp.StatusCode == http.StatusOK {
-		_ = h.artwork.Set(key, resp.Header.Get("Content-Type"), body)
+		if err := h.artwork.Set(key, resp.Header.Get("Content-Type"), body); err != nil && h.log != nil {
+			h.artworkWriteLogOnce.Do(func() {
+				h.log.Log(logging.Entry{Level: "warn", Component: "cache",
+					Fields: map[string]any{"event": "artwork_write_failed"}})
+			})
+		}
 	}
 	o.cacheState = "miss"
 	if h.metrics != nil {
