@@ -338,6 +338,10 @@ func (h *Handler) serveStale(w http.ResponseWriter, r *http.Request, id string, 
 		return false
 	}
 	o.cacheState = "stale"
+	if h.metrics != nil {
+		h.metrics.IncCacheStale()
+		h.metrics.ObserveHTTP("control", entry.Status, time.Since(start))
+	}
 	w.Header().Set(RequestIDHeader, id)
 	w.Header().Set(CacheHeader, "stale")
 	w.Header().Set("CDN-Cache-Control", "no-store")

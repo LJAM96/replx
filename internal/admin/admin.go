@@ -560,14 +560,15 @@ func (m *Mux) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
 		return
 	}
-	var hits, misses, warmed, warmErr int64
+	var hits, misses, stale, warmed, warmErr int64
 	if m.registry != nil {
 		s := m.registry.Snapshot()
-		hits, misses, warmed, warmErr = s.CacheHits, s.CacheMisses, s.CacheWarmed, s.CacheWarmErr
+		hits, misses, stale, warmed, warmErr = s.CacheHits, s.CacheMisses, s.CacheStale, s.CacheWarmed, s.CacheWarmErr
 	}
 	data := map[string]any{
 		"hits":     hits,
 		"misses":   misses,
+		"stale":    stale,
 		"warmed":   warmed,
 		"warmErrs": warmErr,
 		"policy":   "GET /library/sections 5m, /library/sections/* 60s, /library/metadata/* 5m, /library/collections/* 2m, /identity 5m, /hubs/* 10s (CW 5s, RA 15s, search 30s); collection fallback up to 15m for validated user, refreshed in background; timeline/decisions/media never; artwork via filesystem 7d (/photo/:/transcode); stampede single-flight 2s; CW invalidated on timeline/scrobble",

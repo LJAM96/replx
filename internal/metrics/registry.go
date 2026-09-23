@@ -30,6 +30,7 @@ type Registry struct {
 	mediaFailure      map[string]int64
 	cacheHits         int64
 	cacheMisses       int64
+	cacheStale        int64
 	cacheWarmed       int64
 	cacheWarmErr      int64
 	syncItems         int64
@@ -105,6 +106,12 @@ func (r *Registry) IncCacheMiss() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cacheMisses++
+}
+
+func (r *Registry) IncCacheStale() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cacheStale++
 }
 
 // IncCacheWarmed counts one background refresh stored by the owner warmer.
@@ -189,6 +196,7 @@ type Snapshot struct {
 	MediaFailure         map[string]int64
 	CacheHits            int64
 	CacheMisses          int64
+	CacheStale           int64
 	CacheWarmed          int64
 	CacheWarmErr         int64
 	SyncItems            int64
@@ -214,6 +222,7 @@ func (r *Registry) Snapshot() Snapshot {
 		MediaGateway:         r.mediaGateway,
 		CacheHits:            r.cacheHits,
 		CacheMisses:          r.cacheMisses,
+		CacheStale:           r.cacheStale,
 		CacheWarmed:          r.cacheWarmed,
 		CacheWarmErr:         r.cacheWarmErr,
 		SyncItems:            r.syncItems,
@@ -294,6 +303,8 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 		CacheHitsTotal, CacheHitsTotal, CacheHitsTotal, r.cacheHits)
 	fmt.Fprintf(w, "# HELP %s User-scoped cache misses.\n# TYPE %s counter\n%s %d\n",
 		CacheMissesTotal, CacheMissesTotal, CacheMissesTotal, r.cacheMisses)
+	fmt.Fprintf(w, "# HELP %s Validated collection responses served from fallback cache.\n# TYPE %s counter\n%s %d\n",
+		CacheStaleTotal, CacheStaleTotal, CacheStaleTotal, r.cacheStale)
 	fmt.Fprintf(w, "# HELP %s Background refreshes stored by the owner warmer.\n# TYPE %s counter\n%s %d\n",
 		CacheWarmedTotal, CacheWarmedTotal, CacheWarmedTotal, r.cacheWarmed)
 	fmt.Fprintf(w, "# HELP %s Failed background refreshes (hot keys untouched).\n# TYPE %s counter\n%s %d\n",

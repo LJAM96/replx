@@ -8,6 +8,7 @@ const (
 	HTTPRequestDurationSeconds   = "replx_edge_http_request_duration_seconds"
 	CacheHitsTotal               = "replx_edge_cache_hits_total"
 	CacheMissesTotal             = "replx_edge_cache_misses_total"
+	CacheStaleTotal              = "replx_edge_cache_stale_total"
 	CacheWarmedTotal             = "replx_edge_cache_warmed_total"
 	CacheWarmErrorsTotal         = "replx_edge_cache_warm_errors_total"
 	CacheEntries                 = "replx_edge_cache_entries"

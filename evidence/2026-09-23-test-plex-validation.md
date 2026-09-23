@@ -337,3 +337,8 @@ on its first miss, then 200 cache hits in 31ms and 1ms. A direct public
 script request received a 403 before Replx, so the internal replay is the
 valid cache measurement. The browser experience, stale fallback after TTL,
 and restricted-user behavior still need live validation.
+For the same validated user, deleting only the fresh entry in Valkey caused
+the next request to return 200 `stale` in 32ms; the following request was a
+fresh cache hit in 34ms after background refresh. This validates the
+fallback mechanism for one collection query. A separate stale-response
+counter was added to cache stats and Prometheus metrics for later monitoring.

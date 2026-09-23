@@ -508,7 +508,8 @@ func TestCollectionStaleServesImmediatelyAndRefreshesOnlyItsUser(t *testing.T) {
 	defer origin.Close()
 	defer releaseOnce.Do(func() { close(release) })
 	store := cache.NewMemory()
-	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: store})
+	var reg metrics.Registry
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: store, Metrics: &reg})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,6 +529,9 @@ func TestCollectionStaleServesImmediatelyAndRefreshesOnlyItsUser(t *testing.T) {
 	h.ServeHTTP(rec, a)
 	if rec.Header().Get(CacheHeader) != "stale" || !strings.Contains(rec.Body.String(), `"version":1`) {
 		t.Fatalf("stale response: header=%q body=%q", rec.Header().Get(CacheHeader), rec.Body.String())
+	}
+	if reg.Snapshot().CacheStale != 1 {
+		t.Fatal("stale response was not counted")
 	}
 	select {
 	case <-started:
