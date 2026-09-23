@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,15 +34,56 @@ func TestOriginFailureLogIsClassifiedWithoutCredential(t *testing.T) {
 	h.logOriginFailure("request-1", &url.Error{
 		Op: "Get", URL: "https://plex.example/hubs?X-Plex-Token=secret-value",
 		Err: context.DeadlineExceeded,
-	}, 12, 345)
+	}, 12, 7, 345)
 	if strings.Contains(out.String(), "secret-value") || !strings.Contains(out.String(), "deadline_exceeded") {
 		t.Fatalf("unsafe or missing origin failure category: %s", out.String())
 	}
-	if !strings.Contains(out.String(), `"preOriginMs":12`) || !strings.Contains(out.String(), `"originHeaderMs":345`) {
+	if !strings.Contains(out.String(), `"preOriginMs":12`) || !strings.Contains(out.String(), `"originQueueMs":7`) || !strings.Contains(out.String(), `"originHeaderMs":345`) {
 		t.Fatalf("origin phase timings missing: %s", out.String())
 	}
 	if got := originErrorClass(errors.New("opaque transport failure")); got != "transport_other" {
 		t.Fatalf("unexpected category %q", got)
+	}
+}
+
+func TestBrowseOriginConcurrencyIsBounded(t *testing.T) {
+	var active, peak atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := active.Add(1)
+		for {
+			old := peak.Load()
+			if n <= old || peak.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		defer active.Add(-1)
+		time.Sleep(40 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"MediaContainer":{}}`))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel",
+		Cache: cache.NewMemory(), Secret: "test-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := range 24 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet,
+				"/library/collections/"+strconv.Itoa(i)+"/children", nil)
+			req.Header.Set("X-Plex-Token", "owner")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Errorf("request %d: %d", i, rec.Code)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := peak.Load(); got > browseOriginConcurrency || got < 2 {
+		t.Fatalf("origin concurrency=%d, limit=%d", got, browseOriginConcurrency)
 	}
 }
 

@@ -49,6 +49,10 @@ const RequestIDHeader = "X-Replx-Edge-Request-ID"
 // responses: hit, miss or bypass. Media redirects never carry it.
 const CacheHeader = "X-Replx-Edge-Cache"
 
+// Limit simultaneous uncached browse fetches so a Plex Web collection burst
+// cannot open dozens of expensive library queries against one PMS at once.
+const browseOriginConcurrency = 8
+
 // MediaRouteUnavailable is the stable diagnostic reason for fail-closed media.
 const MediaRouteUnavailable = "MEDIA_ROUTE_UNAVAILABLE"
 
@@ -151,6 +155,7 @@ type Handler struct {
 	artwork       *artwork.Store
 	identity      *identity.Resolver
 	client        *http.Client
+	browseSlots   chan struct{}
 	mediaFallback *url.URL
 	searchDB      database.DBTX
 	// partPolicy is the playback boundary hook; see Options.PartPolicy.
@@ -201,7 +206,8 @@ func New(opts Options) (*Handler, error) {
 	return &Handler{origin: base, mode: opts.IngressMode, log: opts.Logger, secret: opts.Secret,
 		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, warmer: opts.Warmer,
 		playback: opts.Playback, artwork: opts.Artwork, identity: opts.Identity,
-		client: client, spike: opts.Spike, mediaFallback: fallback, searchDB: opts.SearchDB,
+		client: client, browseSlots: make(chan struct{}, browseOriginConcurrency),
+		spike: opts.Spike, mediaFallback: fallback, searchDB: opts.SearchDB,
 		partPolicy: opts.PartPolicy, gens: cache.NewGenerations()}, nil
 }
 
@@ -848,6 +854,17 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	}
 	out.Host = h.origin.Host
 
+	originQueueMs := int64(0)
+	if o.cacheable && h.browseSlots != nil {
+		queueStart := time.Now()
+		select {
+		case h.browseSlots <- struct{}{}:
+			defer func() { <-h.browseSlots }()
+		case <-r.Context().Done():
+			return
+		}
+		originQueueMs = time.Since(queueStart).Milliseconds()
+	}
 	preOriginMs := time.Since(start).Milliseconds()
 	originStart := time.Now()
 	resp, err := h.client.Do(out) //nolint:gosec // target is admin-configured origin only
@@ -856,7 +873,7 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 		h.metrics.ObserveOrigin(time.Since(originStart), err != nil)
 	}
 	if err != nil {
-		h.logOriginFailure(id, err, preOriginMs, originHeaderMs)
+		h.logOriginFailure(id, err, preOriginMs, originQueueMs, originHeaderMs)
 		h.writeBadGateway(w, r, id, o, routeClass, start)
 		return
 	}
@@ -886,19 +903,21 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 		h.metrics.ObserveHTTP(routeClass, resp.StatusCode, time.Since(start))
 	}
 	h.emit(r, id, o, routeClass, resp.StatusCode, start, map[string]any{
-		"bodyBytes": n, "preOriginMs": preOriginMs, "originHeaderMs": originHeaderMs})
+		"bodyBytes": n, "preOriginMs": preOriginMs, "originQueueMs": originQueueMs,
+		"originHeaderMs": originHeaderMs})
 }
 
 // logOriginFailure records a bounded error category without logging the
 // origin URL, Plex token, or request headers. Those may be embedded in the
 // error text returned by net/http.
-func (h *Handler) logOriginFailure(requestID string, err error, preOriginMs, originHeaderMs int64) {
+func (h *Handler) logOriginFailure(requestID string, err error, preOriginMs, originQueueMs, originHeaderMs int64) {
 	if h.log == nil {
 		return
 	}
 	h.log.Log(logging.Entry{Level: "warn", Component: "gateway.origin", RequestID: requestID,
 		Fields: map[string]any{"errorClass": originErrorClass(err),
-			"preOriginMs": preOriginMs, "originHeaderMs": originHeaderMs}})
+			"preOriginMs": preOriginMs, "originQueueMs": originQueueMs,
+			"originHeaderMs": originHeaderMs}})
 }
 
 func originErrorClass(err error) string {
