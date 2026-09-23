@@ -32,6 +32,18 @@ const SchemaVersion = "v2"
 // the client still receives full bytes, only caching is skipped.
 const MaxEntryBytes = 2 << 20 // 2 MiB
 
+// Collection responses keep a short-lived fallback copy. Only the proxy
+// serves it, after a fresh credential check, while a refresh runs separately.
+const CollectionStaleTTL = 15 * time.Minute
+
+func StaleKey(key string) string { return key + ":stale" }
+
+func CollectionStale(path string) bool {
+	p := strings.ToLower(path)
+	return strings.HasPrefix(p, "/library/collections/") ||
+		(strings.HasPrefix(p, "/library/sections/") && strings.HasSuffix(p, "/collections"))
+}
+
 // secretParams are stripped from keys (case-insensitive).
 var secretParams = map[string]bool{
 	"x-plex-token": true, "token": true, "authtoken": true,
@@ -54,8 +66,8 @@ var ttlByPrefix = []struct {
 
 // hubTTL refines /hubs/ by feed: Continue Watching and Recently Added
 // change faster than structural hubs. Values match the spec table; the
-// owner warmer renews hot entries at TTL/2. There is no stale serving:
-// expiry is a hard miss.
+// owner warmer renews hot entries at TTL/2. Hub expiry is a hard miss;
+// collection fallbacks are handled separately by the proxy.
 func hubTTL(path string) (time.Duration, bool) {
 	p := strings.ToLower(path)
 	if !strings.HasPrefix(p, "/hubs/") {

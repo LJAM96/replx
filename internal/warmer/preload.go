@@ -2,6 +2,7 @@ package warmer
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
@@ -14,9 +15,10 @@ import (
 )
 
 const (
-	maxPreloadSections = 8
-	maxPreloadArtwork  = 96
-	preloadAccept      = "application/json, text/plain, */*"
+	maxPreloadSections        = 8
+	maxPreloadArtwork         = 96
+	maxPreloadCollectionPages = 4
+	preloadAccept             = "application/json, text/plain, */*"
 )
 
 // PreloadResult counts work done by one bounded owner-only pass.
@@ -102,7 +104,11 @@ func (w *Warmer) PreloadOnce(ctx context.Context) PreloadResult {
 				w.Track(key, s)
 				continue
 			}
-			requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			timeout := 8 * time.Second
+			if cache.CollectionStale(path) {
+				timeout = 90 * time.Second
+			}
+			requestCtx, cancel := context.WithTimeout(ctx, timeout)
 			err := w.refresh(requestCtx, key, s, owner)
 			cancel()
 			if err != nil {
@@ -112,6 +118,71 @@ func (w *Warmer) PreloadOnce(ctx context.Context) PreloadResult {
 			w.Track(key, s)
 			result.Pages++
 		}
+	}
+	// Collection lists contain the child endpoints Plex Web opens next.
+	// Walk them in small rotating batches; never fan out across all
+	// collections when PMS is already under load.
+	var children []string
+	for _, path := range paths {
+		if !strings.HasSuffix(path, "/collections") {
+			continue
+		}
+		s := Snapshot{Method: http.MethodGet, Path: path, Accept: preloadAccept,
+			Scope: scope, Class: cache.ClassOf(path)}
+		entry, ok, err := w.store.Get(ctx, w.KeyFunc(s))
+		if err == nil && ok {
+			children = append(children, collectionChildren(entry.Body)...)
+		}
+	}
+	if len(children) > 0 {
+		profiles := []string{""}
+		if w.PreloadCollectionQuery != "" {
+			profiles = profiles[:0]
+			for _, raw := range strings.Split(w.PreloadCollectionQuery, "||") {
+				if len(profiles) >= 4 {
+					break
+				}
+				if profile := stripSecrets(strings.TrimSpace(raw)); profile != "" && len(profile) <= 4096 {
+					profiles = append(profiles, profile)
+				}
+			}
+			if len(profiles) == 0 {
+				profiles = []string{""}
+			}
+		}
+		workSize := len(children) * len(profiles)
+		w.mu.Lock()
+		cursor := w.collectionCursor % workSize
+		w.mu.Unlock()
+		for i := 0; i < maxPreloadCollectionPages && i < workSize; i++ {
+			workIndex := (cursor + i) % workSize
+			path := children[workIndex/len(profiles)]
+			query := profiles[workIndex%len(profiles)]
+			ttl, _ := cache.Cacheable(http.MethodGet, path)
+			s := Snapshot{Method: http.MethodGet, Path: path, RawQuery: query,
+				Accept: preloadAccept, Scope: scope, Class: cache.ClassOf(path), TTL: ttl}
+			key := w.KeyFunc(s)
+			if key == "" {
+				result.Errors++
+				continue
+			}
+			if _, hit, err := w.store.Get(ctx, key); err == nil && hit {
+				w.Track(key, s)
+				continue
+			}
+			requestCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+			err := w.refresh(requestCtx, key, s, owner)
+			cancel()
+			if err != nil {
+				result.Errors++
+				continue
+			}
+			w.Track(key, s)
+			result.Pages++
+		}
+		w.mu.Lock()
+		w.collectionCursor = (cursor + maxPreloadCollectionPages) % workSize
+		w.mu.Unlock()
 	}
 	if w.Artwork != nil && w.PreloadArtworkPaths != nil {
 		thumbs, err := w.PreloadArtworkPaths(ctx)
@@ -143,6 +214,29 @@ func (w *Warmer) PreloadOnce(ctx context.Context) PreloadResult {
 	w.lastPreloadUnix = w.now().Unix()
 	w.mu.Unlock()
 	return result
+}
+
+func collectionChildren(body []byte) []string {
+	var data struct {
+		MediaContainer struct {
+			Metadata []struct {
+				RatingKey string `json:"ratingKey"`
+			} `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+	if json.Unmarshal(body, &data) != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var paths []string
+	for _, item := range data.MediaContainer.Metadata {
+		if !safeSectionID(item.RatingKey) || seen[item.RatingKey] {
+			continue
+		}
+		seen[item.RatingKey] = true
+		paths = append(paths, "/library/collections/"+item.RatingKey+"/children")
+	}
+	return paths
 }
 
 func safeSectionID(id string) bool {

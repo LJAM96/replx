@@ -91,6 +91,7 @@ services:
       REPLX_EDGE_MEDIA_PORT: ${REPLX_EDGE_MEDIA_PORT:-443}
       REPLX_EDGE_SPIKE_ROUTING: ${REPLX_EDGE_SPIKE_ROUTING:-false}
       REPLX_EDGE_PRELOAD_HUB_QUERY: ${REPLX_EDGE_PRELOAD_HUB_QUERY:-}
+      REPLX_EDGE_PRELOAD_COLLECTION_QUERY: ${REPLX_EDGE_PRELOAD_COLLECTION_QUERY:-}
     volumes:
       - replx_edge_cache:/data/cache
       - replx_edge_artwork:/data/artwork

@@ -127,3 +127,45 @@ func TestPreloadUsesConfiguredHubQueryForBrowserKey(t *testing.T) {
 		t.Fatal("browser's exact Continue Watching query was not preloaded")
 	}
 }
+
+func TestPreloadWalksCollectionChildrenInBoundedBatches(t *testing.T) {
+	seen := map[string]int{}
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("X-Plex-Token") {
+			t.Error("preload must not replay a query token")
+		}
+		seen[r.URL.Path]++
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/library/sections/23/collections" {
+			_, _ = w.Write([]byte(`{"MediaContainer":{"Metadata":[{"ratingKey":"101"},{"ratingKey":"102"},{"ratingKey":"103"},{"ratingKey":"104"},{"ratingKey":"105"}]}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"MediaContainer":{}}`))
+	}))
+	defer origin.Close()
+	store := cache.NewMemory()
+	w := withOwnerAccount(New(store, origin.URL, testSecret, ownerProvider("owner-token"), nil, nil), 7)
+	w.PreloadSections = func(context.Context) ([]string, error) { return []string{"23"}, nil }
+	w.PreloadCollectionQuery = "includeMeta=1&X-Plex-Token=must-strip"
+	w.KeyFunc = func(s Snapshot) string {
+		q, _ := url.ParseQuery(s.RawQuery)
+		return cache.ResponseKey(s.Scope, s.Method, s.Path, q, s.Accept)
+	}
+	first := w.PreloadOnce(context.Background())
+	if first.Errors != 0 || first.Pages != 10 { // six base pages and four children
+		t.Fatalf("first preload: %+v", first)
+	}
+	if seen["/library/collections/105/children"] != 0 {
+		t.Fatal("preload exceeded the bounded collection batch")
+	}
+	second := w.PreloadOnce(context.Background())
+	if second.Errors != 0 || seen["/library/collections/105/children"] != 1 {
+		t.Fatalf("rotating batch missed remaining collection: %+v", second)
+	}
+	path := "/library/collections/105/children"
+	key := w.KeyFunc(Snapshot{Method: http.MethodGet, Path: path,
+		RawQuery: "includeMeta=1", Accept: preloadAccept, Scope: "acct:7"})
+	if _, ok, _ := store.Get(context.Background(), cache.StaleKey(key)); !ok {
+		t.Fatal("preloaded child must have a stale fallback")
+	}
+}

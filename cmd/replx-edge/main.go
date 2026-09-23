@@ -302,6 +302,7 @@ func runServe() error {
 	}
 	warm.Artwork = artworkStore
 	warm.PreloadHubQuery = os.Getenv("REPLX_EDGE_PRELOAD_HUB_QUERY")
+	warm.PreloadCollectionQuery = os.Getenv("REPLX_EDGE_PRELOAD_COLLECTION_QUERY")
 	warm.PreloadSections = func(ctx context.Context) ([]string, error) {
 		rows, err := db.Raw().Query(ctx, `SELECT plex_section_id FROM libraries
 			WHERE server_id=(SELECT id FROM plex_servers WHERE enabled ORDER BY created_at DESC LIMIT 1)

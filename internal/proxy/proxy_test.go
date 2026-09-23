@@ -491,6 +491,67 @@ func TestCacheHitServesWithoutOrigin(t *testing.T) {
 	}
 }
 
+func TestCollectionStaleServesImmediatelyAndRefreshesOnlyItsUser(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"user":"` + r.Header.Get("X-Plex-Token") + `","version":2}`))
+	}))
+	defer origin.Close()
+	defer releaseOnce.Do(func() { close(release) })
+	store := cache.NewMemory()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(token string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/library/collections/101/children?includeMeta=1", nil)
+		r.Header.Set("X-Plex-Token", token)
+		return r
+	}
+	a := request("user-a")
+	key := h.observe(a).cacheKey
+	if err := store.Set(context.Background(), cache.StaleKey(key), cache.Entry{
+		Status: 200, ContentType: "application/json", Body: []byte(`{"user":"user-a","version":1}`),
+	}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, a)
+	if rec.Header().Get(CacheHeader) != "stale" || !strings.Contains(rec.Body.String(), `"version":1`) {
+		t.Fatalf("stale response: header=%q body=%q", rec.Header().Get(CacheHeader), rec.Body.String())
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background refresh did not start")
+	}
+	if _, ok, _ := store.Get(context.Background(), h.observe(request("user-b")).cacheKey); ok {
+		t.Fatal("another user's cache must remain separate")
+	}
+	releaseOnce.Do(func() { close(release) })
+	deadline := time.After(2 * time.Second)
+	for {
+		entry, ok, _ := store.Get(context.Background(), key)
+		if ok && strings.Contains(string(entry.Body), `"version":2`) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("background refresh did not replace the fresh entry")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // TestCacheIsolation is the acceptance gate: one user's watched state,
 // Continue Watching and restricted libraries must never appear in another
 // user's cached response.

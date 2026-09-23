@@ -306,3 +306,21 @@ activity observed together.
 8. Restore a database and secret backup into a separate clean stack, then verify onboarding state, policies, and library index. Test one upgrade and a documented rollback path.
 
 Production release requires complete client traces, user isolation, a stable index, a successful restore drill, and measured speed improvements. A healthy container alone does not satisfy these gates.
+
+## Collection cache implementation after Plex log review
+
+The next test build preloads collection-child responses from Plex's section
+collection lists in rotating batches of four per pass. Collection preload
+and owner refresh allow up to 90 seconds for slow Plex responses. A
+successfully fetched collection response also has a 15-minute fallback
+copy under the same user, query and invalidation generation key. When the
+normal two-minute entry expires, Replx can serve that copy immediately to
+a recently validated user while at most two background refreshes run.
+Continue Watching is excluded and retains its short TTL and watch-state
+invalidation. The owner preloader never writes its response into another
+user's cache scope. A collection query profile can be configured with
+`REPLX_EDGE_PRELOAD_COLLECTION_QUERY`; query tokens are removed before
+fetching or key construction. Collection preloading remains gradual, not
+instantaneous, and other users' first requests are still cold until their
+own cache is filled. The build requires a live browser test before any
+speed or production claim.

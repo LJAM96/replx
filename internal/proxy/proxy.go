@@ -142,22 +142,23 @@ type Options struct {
 
 // Handler proxies Plex requests to the origin PMS.
 type Handler struct {
-	origin        *url.URL
-	mode          string
-	spike         SpikeResolver
-	log           *logging.Logger
-	secret        string
-	metrics       *metrics.Registry
-	capture       *capture.Store
-	cache         cache.Store
-	warmer        *warmer.Warmer
-	playback      PlaybackEngine
-	artwork       *artwork.Store
-	identity      *identity.Resolver
-	client        *http.Client
-	browseSlots   chan struct{}
-	mediaFallback *url.URL
-	searchDB      database.DBTX
+	origin            *url.URL
+	mode              string
+	spike             SpikeResolver
+	log               *logging.Logger
+	secret            string
+	metrics           *metrics.Registry
+	capture           *capture.Store
+	cache             cache.Store
+	warmer            *warmer.Warmer
+	playback          PlaybackEngine
+	artwork           *artwork.Store
+	identity          *identity.Resolver
+	client            *http.Client
+	browseSlots       chan struct{}
+	staleRefreshSlots chan struct{}
+	mediaFallback     *url.URL
+	searchDB          database.DBTX
 	// partPolicy is the playback boundary hook; see Options.PartPolicy.
 	partPolicy func(r *http.Request, partID, sessionID string) (string, bool, string)
 	// gens implements namespace cache invalidation; see cache.Generations.
@@ -207,7 +208,8 @@ func New(opts Options) (*Handler, error) {
 		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, warmer: opts.Warmer,
 		playback: opts.Playback, artwork: opts.Artwork, identity: opts.Identity,
 		client: client, browseSlots: make(chan struct{}, browseOriginConcurrency),
-		spike: opts.Spike, mediaFallback: fallback, searchDB: opts.SearchDB,
+		staleRefreshSlots: make(chan struct{}, 2),
+		spike:             opts.Spike, mediaFallback: fallback, searchDB: opts.SearchDB,
 		partPolicy: opts.PartPolicy, gens: cache.NewGenerations()}, nil
 }
 
@@ -323,6 +325,65 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 	return true
 }
 
+// serveStale keeps an already visited collection responsive while Plex is
+// slow. A validated credential and the exact user/query cache key are
+// required; Continue Watching and playback state never use this path.
+func (h *Handler) serveStale(w http.ResponseWriter, r *http.Request, id string, o *obs, start time.Time) bool {
+	if !o.cacheable || !cache.CollectionStale(r.URL.Path) || o.invalid ||
+		(h.identity != nil && !o.fresh) {
+		return false
+	}
+	entry, ok, err := h.cache.Get(r.Context(), cache.StaleKey(o.cacheKey))
+	if err != nil || !ok || entry.Status != http.StatusOK {
+		return false
+	}
+	o.cacheState = "stale"
+	w.Header().Set(RequestIDHeader, id)
+	w.Header().Set(CacheHeader, "stale")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	if entry.ContentType != "" {
+		w.Header().Set("Content-Type", entry.ContentType)
+	}
+	for k, v := range entry.Headers {
+		w.Header().Set(k, v)
+	}
+	w.WriteHeader(entry.Status)
+	_, _ = w.Write(entry.Body)
+	h.emit(r, id, *o, "control", entry.Status, start, map[string]any{"bodyBytes": len(entry.Body)})
+	h.refreshStale(r, *o)
+	return true
+}
+
+func (h *Handler) refreshStale(r *http.Request, o obs) {
+	if !h.tryBeginFlight(o.cacheKey) {
+		return
+	}
+	select {
+	case h.staleRefreshSlots <- struct{}{}:
+	default:
+		h.endFlight(o.cacheKey)
+		return
+	}
+	go func() {
+		defer h.endFlight(o.cacheKey)
+		defer func() { <-h.staleRefreshSlots }()
+		ctx, cancel := context.WithTimeout(context.Background(), 55*time.Second)
+		defer cancel()
+		request := r.Clone(ctx)
+		request.Body = nil // stale refreshes are GET/HEAD only
+		refresh := o
+		refresh.cacheState = "miss"
+		h.proxy(&discardResponseWriter{header: make(http.Header)}, request, requestid.New(), refresh, "control", time.Now())
+	}()
+}
+
+type discardResponseWriter struct{ header http.Header }
+
+func (w *discardResponseWriter) Header() http.Header         { return w.header }
+func (w *discardResponseWriter) WriteHeader(int)             {}
+func (w *discardResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	id := requestid.New()
@@ -426,6 +487,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if routeClass == "control" && h.serveCache(w, r, id, &o, start) {
+		return
+	}
+	if routeClass == "control" && h.serveStale(w, r, id, &o, start) {
 		return
 	}
 	// Watch-state invalidation runs for every state mutation, whether or
@@ -963,12 +1027,16 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 		return n + rest
 	}
 	body := buf.Bytes()
-	_ = h.cache.Set(r.Context(), o.cacheKey, cache.Entry{
+	entry := cache.Entry{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
 		Headers:     cache.SafeHeaders(resp.Header),
 		Body:        body,
-	}, o.cacheTTL)
+	}
+	_ = h.cache.Set(r.Context(), o.cacheKey, entry, o.cacheTTL)
+	if cache.CollectionStale(r.URL.Path) {
+		_ = h.cache.Set(r.Context(), cache.StaleKey(o.cacheKey), entry, cache.CollectionStaleTTL)
+	}
 	if h.warmer != nil {
 		h.warmer.Track(o.cacheKey, warmer.Snapshot{
 			Method:   r.Method,

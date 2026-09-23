@@ -85,11 +85,14 @@ type Warmer struct {
 	// PreloadHubQuery is an optional browser query profile for section hubs
 	// and Continue Watching; credentials are stripped before storage.
 	PreloadHubQuery string
-	Artwork         *artwork.Store
-	log             *logging.Logger
-	metrics         *metrics.Registry
-	client          *http.Client
-	now             func() time.Time
+	// PreloadCollectionQuery holds up to four collection-child request
+	// profiles separated by ||. Credentials are stripped before fetch.
+	PreloadCollectionQuery string
+	Artwork                *artwork.Store
+	log                    *logging.Logger
+	metrics                *metrics.Registry
+	client                 *http.Client
+	now                    func() time.Time
 
 	mu               sync.Mutex
 	tracked          map[string]tracked
@@ -100,6 +103,7 @@ type Warmer struct {
 	preloadedArtwork int64
 	preloadErrors    int64
 	lastPreloadUnix  int64
+	collectionCursor int
 }
 
 type tracked struct {
@@ -124,10 +128,10 @@ func New(store cache.Store, origin, secret string,
 // originClientFor binds refreshes to the configured origin: redirects
 // leaving it are refused rather than followed with the owner credential.
 func originClientFor(originBase string) *http.Client {
-	if c, err := origin.APIClient(originBase, 30*time.Second); err == nil {
+	if c, err := origin.APIClient(originBase, 120*time.Second); err == nil {
 		return c
 	}
-	return origin.TransparentClient(30 * time.Second)
+	return origin.TransparentClient(120 * time.Second)
 }
 
 // Track records a freshly stored entry for future refresh. Snapshots with
@@ -227,7 +231,11 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 			w.mu.Unlock()
 			continue
 		}
-		requestCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		timeout := 8 * time.Second
+		if cache.CollectionStale(t.snap.Path) {
+			timeout = 90 * time.Second
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, timeout)
 		err := w.refresh(requestCtx, k, t.snap, owner)
 		cancel()
 		if err != nil {
@@ -368,12 +376,18 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 			storeKey = nk
 		}
 	}
-	if err := w.store.Set(ctx, storeKey, cache.Entry{
+	entry := cache.Entry{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
 		Body:        body,
-	}, s.TTL); err != nil {
+	}
+	if err := w.store.Set(ctx, storeKey, entry, s.TTL); err != nil {
 		return err
+	}
+	if cache.CollectionStale(s.Path) {
+		if err := w.store.Set(ctx, cache.StaleKey(storeKey), entry, cache.CollectionStaleTTL); err != nil {
+			return err
+		}
 	}
 	if storeKey != key {
 		type deleter interface {

@@ -570,7 +570,7 @@ func (m *Mux) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 		"misses":   misses,
 		"warmed":   warmed,
 		"warmErrs": warmErr,
-		"policy":   "GET /library/sections 5m, /library/sections/* 60s, /library/metadata/* 5m, /library/collections/* 2m, /identity 5m, /hubs/* 10s (CW 5s, RA 15s, search 30s); timeline/decisions/media never; artwork via filesystem 7d (/photo/:/transcode); stampede single-flight 2s; CW invalidated on timeline/scrobble",
+		"policy":   "GET /library/sections 5m, /library/sections/* 60s, /library/metadata/* 5m, /library/collections/* 2m, /identity 5m, /hubs/* 10s (CW 5s, RA 15s, search 30s); collection fallback up to 15m for validated user, refreshed in background; timeline/decisions/media never; artwork via filesystem 7d (/photo/:/transcode); stampede single-flight 2s; CW invalidated on timeline/scrobble",
 	}
 	if m.warmerStats != nil {
 		data["warmer"] = m.warmerStats()
