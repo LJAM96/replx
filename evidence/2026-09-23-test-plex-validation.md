@@ -419,3 +419,27 @@ were 200 cache misses with a 2.57-second maximum. All captured requests
 were concentrated in one minute. This is evidence of improved routing and
 cache eligibility, but not yet evidence of fast repeat browsing or a reliable
 Home experience. Browser retest feedback is pending.
+
+## Repeat Luke browse and structural Home fallback
+
+A repeat Luke visit about four minutes after the first showed 27 collection
+child responses served stale in a median 1ms; three other collection child
+requests missed (0.8–2.9s). The slow path was Home: two `/hubs/promoted`
+requests repeated exactly the earlier non-secret query signatures, but were
+misses after 22.3s and a 30.0s 502 respectively. The earlier successful
+Home response had a one-minute fallback TTL, which had expired before the
+repeat visit. Continue Watching returned live in 363ms; it remains outside
+fallback caching. This isolates the repeat-view delay to structural Home
+requests rather than collection child cache throughput.
+
+Commit `176eaea` extends the structural Home fallback (`/hubs/promoted` and
+`/hubs/sections/*`) to 15 minutes. Fresh cache TTL stays ten seconds;
+validated users get the last successful exact-user, exact-query structural
+Home response immediately while a bounded refresh runs in the background.
+Continue Watching and Recently Added are unchanged. The full Go test suite
+passed. Test image `ghcr.io/ljam96/replx-edge:0.4.0-176eaea-test` (image ID
+`sha256:a7260c63ad1129c1e56fa7d2a180d0975373105fab41a4456a3d94d14b6bd17e`)
+was deployed to `oi-2`; the container is healthy with zero restarts, and its
+initial owner preload reported eight pages and zero errors. Luke browser
+validation after this build is pending. The first new Home variant remains
+dependent on an origin success before a fallback can exist.
