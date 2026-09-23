@@ -119,11 +119,16 @@ artwork volume. Replx ignored `Store.Set` errors, so the unwritable volume
 caused every poster to be fetched again. The same ownership mismatch affected
 the cache and diagnostics volume roots, although browse metadata uses Valkey.
 
-The pending correction adds a one-shot Compose permissions service before
-Replx starts and checks artwork write access at startup. This addresses the
-measured repeated-poster cache failure; it does not prove first-load speed or
-resolve browser request cancellations. Re-test cold and warm collection loads
-after deployment before claiming a speed improvement.
+Commit `751567d` adds a one-shot Compose permissions service before Replx
+starts and checks artwork write access at startup. It was deployed as
+`ghcr.io/ljam96/replx-edge:0.4.0-751567d-test` (image ID
+`sha256:1437cd23f73c0787dc379bdf0e24ef129aa7665ca450c27ecd5616a0e8327c02`).
+The container is healthy with zero restarts. All three volume roots are now
+mode 0700 and owned by UID/GID 65532; startup reports the Valkey cache enabled
+and no artwork degradation. The artwork cache was empty immediately after
+deployment. This addresses the measured repeated-poster cache failure; it
+does not prove first-load speed or resolve browser request cancellations.
+Re-test cold and warm collection loads before claiming a speed improvement.
 
 ## Evidence sequence
 
