@@ -93,6 +93,18 @@ func New(dir string, maxGB int) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("artwork: mkdir: %w", err)
 	}
+	probe, err := os.CreateTemp(dir, ".artwork-write-check-*")
+	if err != nil {
+		return nil, fmt.Errorf("artwork: directory is not writable: %w", err)
+	}
+	name := probe.Name()
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(name)
+		return nil, fmt.Errorf("artwork: close write check: %w", err)
+	}
+	if err := os.Remove(name); err != nil {
+		return nil, fmt.Errorf("artwork: remove write check: %w", err)
+	}
 	return &Store{dir: dir, maxBytes: int64(maxGB) << 30}, nil
 }
 

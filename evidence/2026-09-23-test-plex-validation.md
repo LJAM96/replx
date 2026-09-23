@@ -94,15 +94,36 @@ test, process counters reached 762 misses, 37 hits, 406 control 502s, and
 single-page failure rate. The operator reported that collections eventually
 appeared but were very slow.
 
-A local diagnostic change now categorizes origin transport failures without
-logging tokens or request URLs. The full Go suite passes, but this change
-has not been uploaded or deployed because automatic approval review rejected
-another private-source push to GitHub without explicit authorization.
+A diagnostic change categorizes origin transport failures without logging
+tokens or request URLs. An additional change makes the event-stream
+connection metric report its true state. Automatic approval review initially
+rejected uploading these private-source changes; the operator explicitly
+authorized a retry, and both were then deployed to the test stack.
 
-An additional local change makes the event-stream connection metric report
-its true state. It has passed the full Go suite but is not deployed: automatic
-approval review rejected uploading that private source change to GitHub
-without separate authorization.
+## Artwork cache root cause and correction
+
+After the operator explicitly authorized retrying the GitHub upload, commits
+`7670954` and `e0cddb8` were pushed and deployed to the test stack as image
+`ghcr.io/ljam96/replx-edge:0.4.0-e0cddb8-test` (image ID
+`sha256:c9d8e49cf695869f1e4c3a6f3c1937266afcf729b4f80b56bfcfd831ba44e168`).
+The container was healthy with zero restarts. Safe error classes show browser
+request cancellation on slow collection/hub requests and an unexpected EOF
+on the notification WebSocket; they do not establish that the PMS origin
+itself failed.
+
+The Firefox retest still felt slow, including the repeated collection opening.
+Recent logs showed 137 successful artwork transcodes, all cache misses.
+The `replx-edge` container runs as UID/GID 65532, while the named artwork
+volume root was mode 0755 and owned by root. There were zero files in the
+artwork volume. Replx ignored `Store.Set` errors, so the unwritable volume
+caused every poster to be fetched again. The same ownership mismatch affected
+the cache and diagnostics volume roots, although browse metadata uses Valkey.
+
+The pending correction adds a one-shot Compose permissions service before
+Replx starts and checks artwork write access at startup. This addresses the
+measured repeated-poster cache failure; it does not prove first-load speed or
+resolve browser request cancellations. Re-test cold and warm collection loads
+after deployment before claiming a speed improvement.
 
 ## Evidence sequence
 

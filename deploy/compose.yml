@@ -34,6 +34,19 @@ services:
       timeout: 5s
       retries: 5
 
+  cache-permissions:
+    image: busybox:1.37
+    restart: "no"
+    user: "0:0"
+    command: ["sh", "-c", "chown 65532:65532 /data/cache /data/artwork /data/diagnostics && chmod 0700 /data/cache /data/artwork /data/diagnostics"]
+    volumes:
+      - replx_edge_cache:/data/cache
+      - replx_edge_artwork:/data/artwork
+      - replx_edge_diagnostics:/data/diagnostics
+    network_mode: "none"
+    security_opt:
+      - no-new-privileges:true
+
   replx-edge:
     container_name: replx-edge
     image: ghcr.io/${REPLX_EDGE_IMAGE_OWNER}/replx-edge:${REPLX_EDGE_VERSION}
@@ -44,6 +57,8 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
+      cache-permissions:
+        condition: service_completed_successfully
     # Explicit environment: the app never receives TUNNEL_TOKEN.
     # Only cloudflared below gets the Tunnel credential.
     environment:

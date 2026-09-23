@@ -53,6 +53,20 @@ func TestRoundTripAndExpiry(t *testing.T) {
 	}
 }
 
+func TestNewRejectsUnwritableDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write despite directory permissions")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+	if _, err := New(dir, 1); err == nil {
+		t.Fatal("unwritable artwork cache must be reported at startup")
+	}
+}
+
 func TestSweepBudget(t *testing.T) {
 	dir := t.TempDir()
 	s, err := New(dir, 0) // zero budget anyone exceeds after insert
