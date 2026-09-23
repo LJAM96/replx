@@ -36,6 +36,7 @@ const MaxEntryBytes = 2 << 20 // 2 MiB
 // serves it, after a fresh credential check, while a refresh runs separately.
 const CollectionStaleTTL = 15 * time.Minute
 const StructuralHubStaleTTL = 15 * time.Minute
+const LibraryPageStaleTTL = 5 * time.Minute
 
 func StaleKey(key string) string { return key + ":stale" }
 
@@ -51,6 +52,9 @@ func FallbackTTL(path string) (time.Duration, bool) {
 		return CollectionStaleTTL, true
 	}
 	p := strings.ToLower(path)
+	if strings.HasPrefix(p, "/library/sections/") && strings.HasSuffix(p, "/all") {
+		return LibraryPageStaleTTL, true
+	}
 	if p == "/hubs/promoted" || strings.HasPrefix(p, "/hubs/sections/") {
 		return StructuralHubStaleTTL, true
 	}

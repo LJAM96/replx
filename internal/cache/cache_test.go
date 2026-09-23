@@ -48,6 +48,9 @@ func TestFallbackPolicyKeepsWatchStateLive(t *testing.T) {
 	if ttl, ok := FallbackTTL("/library/collections/101/children"); !ok || ttl != CollectionStaleTTL {
 		t.Fatalf("collection fallback: %v %v", ttl, ok)
 	}
+	if ttl, ok := FallbackTTL("/library/sections/23/all"); !ok || ttl != LibraryPageStaleTTL {
+		t.Fatalf("library page fallback: %v %v", ttl, ok)
+	}
 	for _, path := range []string{"/hubs/continueWatching", "/hubs/home/recentlyAdded", "/:/timeline"} {
 		if _, ok := FallbackTTL(path); ok {
 			t.Fatalf("watch-state path must not use fallback: %s", path)
