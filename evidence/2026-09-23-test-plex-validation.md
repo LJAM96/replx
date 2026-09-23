@@ -198,6 +198,29 @@ captured collection query replayed through Replx returned 200 miss in about
 requests through Replx is therefore a release blocker; a Replx page URL
 alone does not prove that the Plex app selected Replx for data traffic.
 
+## Zen forced-route failure and notification correction
+
+After temporarily blocking `plex.direct` in Zen, the operator saw fast
+initial content followed by Lukeflix libraries toggling offline. The test
+container stayed healthy with zero restarts. The Replx gateway received
+real browser traffic: cached section hubs were sub-10ms inside the server,
+but many uncached collection-child requests were canceled by the browser
+after about 30 seconds, and `/media/providers` was canceled repeatedly.
+`/status/sessions` returned the deliberate 403 specified by the protocol
+matrix. The live notification request used `/:/websockets/notifications`
+(plural), while the streaming dispatcher recognized only the singular
+form, causing generic proxy failures.
+
+Commit `0982f96` recognizes both notification paths as raw WebSocket
+tunnels. The regression test failed on the plural form before the change
+and passed afterward; full Go tests, vet and Compose validation passed.
+The fix is deployed as `0.4.0-0982f96-test` (image ID
+`sha256:9ebf8566329796aa5d7c5529a66774cdeb31c0faa1531c0f6fcffd17a11f568b`);
+the container is healthy with zero restarts. A browser-shaped handshake using the captured Plex options
+returned `101 Switching Protocols` through both direct Plex and Replx.
+This proves the route protocol fix, but the Zen offline behavior and
+collection burst still need a fresh browser retest before release.
+
 1. Deploy a versioned build containing the correction. Record its image digest and commit.
 2. Trigger a full owner sync. Require four completed section cursors, a plausible nonzero item count, and no new sync errors. Confirm the event stream remains connected while idle for at least 15 minutes.
 3. In Plex Web through the Replx connection, open Home, one large library, and one collection twice. Record screen load time and Replx cache counters before and after each repeat load.
