@@ -400,3 +400,22 @@ Lukeflix `/library/sections` endpoint. On a PMS 200 it marks the token
 after five minutes. PMS 401/403 or an uncertain transport result cannot
 authorize cached data. It does not make the first slow Luke collection
 request fast; its effect on repeat loads needs a live browser retest.
+
+## Managed-user validation test deployment
+
+Commit `f7267fb` was deployed to `oi-2` as the local test image
+`ghcr.io/ljam96/replx-edge:0.4.0-f7267fb-test` (image ID
+`sha256:ae17dd96db5f6e94bece978c64e02749c54caae1a90477073b1d69129574abcc`).
+The container became healthy with zero restarts. Its first owner preload pass
+reported 11 pages and zero errors.
+
+During Luke's first observed session after deployment, the identity table had
+one `pms_valid` token and three account-valid tokens. Replx received 26
+collection-child 200 cache misses and one 200 cache hit, establishing that
+Luke's collection requests now traverse Replx under the PMS-validated scope.
+The misses reached 16.1 seconds. Three Home hub requests returned 200 as
+cache misses; another returned 502 after 30.0 seconds. 192 image requests
+were 200 cache misses with a 2.57-second maximum. All captured requests
+were concentrated in one minute. This is evidence of improved routing and
+cache eligibility, but not yet evidence of fast repeat browsing or a reliable
+Home experience. Browser retest feedback is pending.
