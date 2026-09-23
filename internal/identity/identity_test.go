@@ -19,6 +19,17 @@ type fakeTV struct {
 	code  int // when set, err becomes a typed plex.tv StatusError
 }
 
+type fakePMSValidator struct {
+	valid bool
+	err   error
+	calls atomic.Int64
+}
+
+func (f *fakePMSValidator) ValidateToken(context.Context, string) (bool, error) {
+	f.calls.Add(1)
+	return f.valid, f.err
+}
+
 func (f *fakeTV) GetUser(ctx context.Context, token string) (int64, string, error) {
 	f.calls.Add(1)
 	if f.code != 0 {
@@ -98,6 +109,37 @@ func TestLiveInvalidBackoff(t *testing.T) {
 	}
 	if tv.calls.Load() != 1 {
 		t.Fatalf("401 earns the one-hour negative cache, calls=%d", tv.calls.Load())
+	}
+}
+
+func TestLivePMSOnlyTokenUsesPrivateCacheScope(t *testing.T) {
+	tv := &fakeTV{code: 401}
+	r, _ := liveResolver(t, tv)
+	pms := &fakePMSValidator{valid: true}
+	r.PMS = pms
+	ctx := context.Background()
+	got := r.Resolve(ctx, "fp-managed", "managed-token", Client{})
+	if !got.Fresh || got.Invalid || got.Known || got.IdentityID != "" || got.Scope != "tok:fp-managed" {
+		t.Fatalf("PMS-only token must stay token scoped: %+v", got)
+	}
+	var status string
+	if err := r.DB.QueryRow(ctx, `SELECT token_status FROM plex_token_identities WHERE token_fingerprint='fp-managed'`).Scan(&status); err != nil || status != "pms_valid" {
+		t.Fatalf("PMS status: %q %v", status, err)
+	}
+	r2 := New(r.DB, tv)
+	r2.PMS = pms
+	got2 := r2.Resolve(ctx, "fp-managed", "managed-token", Client{})
+	if !got2.Fresh || got2.Scope != got.Scope || tv.calls.Load() != 1 || pms.calls.Load() != 1 {
+		t.Fatalf("reloaded PMS-only token: %+v tv=%d pms=%d", got2, tv.calls.Load(), pms.calls.Load())
+	}
+}
+
+func TestLivePMSRejectKeepsCacheClosed(t *testing.T) {
+	r, _ := liveResolver(t, &fakeTV{code: 401})
+	r.PMS = &fakePMSValidator{valid: false}
+	got := r.Resolve(context.Background(), "fp-revoked", "revoked-token", Client{})
+	if !got.Invalid || got.Fresh || got.Scope != "tok:fp-revoked" {
+		t.Fatalf("rejected token served locally: %+v", got)
 	}
 }
 

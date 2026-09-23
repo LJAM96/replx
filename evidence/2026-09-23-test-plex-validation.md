@@ -377,3 +377,26 @@ with no slow-query warnings. At 11:56–12:09, 324 requests took a median
 49.52s and Plex recorded 392 slow-query warnings. The burst, rather than
 metadata updates alone, tracks the severe origin slowdown. The archive
 cannot diagnose the later Luke session directly.
+
+## Luke managed-user cache bypass
+
+The next Luke test, after the structural Home preload deployment, still
+showed slow loading and "No Content Available". Replx recorded no
+collection-child requests in that window. Luke's Home and Continue
+Watching requests did reach Replx, but were marked `bypass`; two Home
+requests were canceled after about 30 seconds. The token fingerprint's
+identity row had status `invalid` with no linked identity. A Luke Continue
+Watching request returned 200 from Lukeflix under that fingerprint, while
+an intentionally invalid token returned 401 for both the same feed and
+`/library/sections`. Thus plex.tv account validation alone was an
+incorrect authority for this PMS-accepted token. Managed Plex Home users
+cannot sign in directly to a Plex account, which is consistent with the
+observed account API rejection; the exact plex.tv status is inferred from
+Replx's invalid-token handling, not captured as raw response in this log.
+
+The correction verifies a plex.tv-rejected token against the configured
+Lukeflix `/library/sections` endpoint. On a PMS 200 it marks the token
+`pms_valid`, serves only its own fingerprint cache scope, and revalidates
+after five minutes. PMS 401/403 or an uncertain transport result cannot
+authorize cached data. It does not make the first slow Luke collection
+request fast; its effect on repeat loads needs a live browser retest.

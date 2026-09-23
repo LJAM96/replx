@@ -55,6 +55,13 @@ type Account interface {
 	GetUser(ctx context.Context, token string) (id int64, username string, err error)
 }
 
+// TokenValidator checks whether the configured PMS accepts a token. A Plex
+// Home managed-user token can be valid for PMS while plex.tv's account API
+// rejects it. Such tokens are cached only in their own fingerprint scope.
+type TokenValidator interface {
+	ValidateToken(ctx context.Context, token string) (bool, error)
+}
+
 // Client is the Plex client identity for instance recording.
 type Client struct {
 	Identifier string
@@ -93,6 +100,7 @@ type Resolved struct {
 type Resolver struct {
 	DB     database.DBTX
 	TV     Account
+	PMS    TokenValidator
 	mu     sync.Mutex
 	acct   map[string]acctEntry
 	cli    map[string]cliEntry
@@ -186,7 +194,7 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 	if r.DB == nil {
 		return fallback, true
 	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	serverID := r.enabledServer(cctx)
 	if serverID == "" {
@@ -204,12 +212,15 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 		WHERE t.server_id=$1 AND t.token_fingerprint=$2`, serverID, fingerprint).
 		Scan(&identityID, &accountID, &status, &validatedAt)
 	linked := err == nil && identityID != nil && *identityID != "" && accountID != nil
+	if status == "pms_valid" && validatedAt != nil && time.Since(*validatedAt) < memTTL {
+		return Resolved{Scope: fallback.Scope, Fresh: true}, true
+	}
 	if status == "invalid" {
 		// Definitive rejection on record: never known. Revalidate at
 		// most hourly so a revoked credential cannot hammer plex.tv
 		// back into validity through request volume.
 		if validatedAt != nil && time.Since(*validatedAt) < revalidateAfter {
-			return Resolved{Scope: fallback.Scope, Invalid: true}, true
+			return r.resolvePMS(cctx, serverID, fingerprint, token)
 		}
 	} else if linked {
 		fresh := validatedAt != nil && time.Since(*validatedAt) < credentialValidityPeriod
@@ -239,7 +250,7 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 			// Definitively rejected: break the association as well as
 			// the validity so the stale identity cannot linger.
 			r.markInvalid(cctx, serverID, fingerprint)
-			return Resolved{Scope: fallback.Scope, Invalid: true}, true
+			return r.resolvePMS(cctx, serverID, fingerprint, token)
 		}
 		// Transport/5xx: keep the association for scoping and policy
 		// but mark it unfresh so long lived local responses fall
@@ -257,7 +268,7 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 	if err != nil {
 		if isAuthFailure(err) {
 			r.markInvalid(cctx, serverID, fingerprint)
-			return Resolved{Scope: fallback.Scope, Invalid: true}, true
+			return r.resolvePMS(cctx, serverID, fingerprint, token)
 		}
 		// Transport/5xx/decode: degrade without persisting anything.
 		// Established links above keep resolving; cold tokens retry.
@@ -302,6 +313,28 @@ func isAuthFailure(err error) bool {
 		return se.StatusCode == 401 || se.StatusCode == 403
 	}
 	return false
+}
+
+func (r *Resolver) resolvePMS(ctx context.Context, serverID, fingerprint, token string) (Resolved, bool) {
+	fallback := Resolved{Scope: "tok:" + fingerprint, Invalid: true}
+	if r.PMS == nil || token == "" {
+		return fallback, true
+	}
+	valid, err := r.PMS.ValidateToken(ctx, token)
+	if err != nil {
+		// Uncertain validation never authorizes a cached response. Retry
+		// after the process-local negative cache expires.
+		fallback.Degraded = true
+		return fallback, true
+	}
+	if !valid {
+		return fallback, true
+	}
+	_, _ = r.DB.Exec(ctx, `INSERT INTO plex_token_identities(server_id, token_fingerprint, token_status, last_seen_at, last_validated_at)
+		VALUES($1,$2,'pms_valid',now(),now())
+		ON CONFLICT (server_id, token_fingerprint) DO UPDATE SET
+			identity_id=NULL, token_status='pms_valid', last_seen_at=now(), last_validated_at=now()`, serverID, fingerprint)
+	return Resolved{Scope: "tok:" + fingerprint, Fresh: true}, true
 }
 
 func (r *Resolver) enabledServer(ctx context.Context) string {

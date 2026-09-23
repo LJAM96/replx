@@ -200,6 +200,11 @@ func runServe() error {
 		BaseURL: cfg.PlexTVBase, ClientIdentifier: "replx-edge-identity",
 		Product: "Replx Edge", Version: version, Platform: "Linux",
 	}})
+	pmsValidator, err := identity.NewPMSValidator(cfg.OriginInternalURL)
+	if err != nil {
+		return err
+	}
+	idResolver.PMS = pmsValidator
 	ownerAccount := func(ctx context.Context) (int64, bool) {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
