@@ -160,6 +160,29 @@ timed out twice at 12 seconds via Replx, then returned `200 miss` in about
 0.59 seconds from `oi-2`. The intermittent slow path is not resolved or
 explained by the preload; keep it as a production release blocker.
 
+## Firefox hub profile preload on test
+
+Commit `4d94c24` adds an optional token-stripped Plex Web hub query profile
+to the owner preloader. The Firefox capture's collection request carried
+options absent from the previous plain preload, so it mapped to a different
+cache key. The profile preloads section hubs and Continue Watching under the
+owner scope without merging users or dropping response-shaping options.
+
+The commit passed `go test ./... -count=1`, `go vet ./...`, and Compose
+configuration validation. It is deployed on `oi-2` as
+`ghcr.io/ljam96/replx-edge:0.4.0-4d94c24-test` (image ID
+`sha256:aa054cf36dad851872a10a2572475c9edaaa9c91f13eac2e5f9081f1a9187690`).
+The container is healthy with zero restarts. The first preload pass stored
+8 pages and reported 4 errors; the artwork cache was already warm.
+
+Replaying the exact captured Firefox `/hubs/sections/23` request through the
+public hostname yielded `200 hit` twice, at about 0.21 and 0.11 seconds.
+The same query profile on `/hubs/continueWatching` yielded `200 hit` in
+0.08 seconds. After more than a hub TTL, both routes still yielded hits
+at about 0.07 and 0.23 seconds. This proves the captured owner query is
+preloaded and refreshed. It does not prove other clients or Plex users get
+the same result, nor explain the earlier intermittent 12-second timeout.
+
 ## Evidence sequence
 
 1. Deploy a versioned build containing the correction. Record its image digest and commit.
