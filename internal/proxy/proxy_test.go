@@ -552,6 +552,32 @@ func TestCollectionStaleServesImmediatelyAndRefreshesOnlyItsUser(t *testing.T) {
 	}
 }
 
+func TestCollectionStaleRequiresValidatedCredential(t *testing.T) {
+	const secret = "test-secret-key-for-beta-slice-0123456789"
+	hits := 0
+	origin := httptest.NewServer(cacheTestHandler(&hits, func(*http.Request) string { return "fresh" }))
+	defer origin.Close()
+	store := cache.NewMemory()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret,
+		Cache: store, Identity: identity.New(nil, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/collections/101/children", nil)
+	req.Header.Set("X-Plex-Token", "unvalidated-user")
+	key := h.observe(req).cacheKey
+	if err := store.Set(context.Background(), cache.StaleKey(key), cache.Entry{
+		Status: 200, Body: []byte("old"),
+	}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if hits != 1 || rec.Body.String() != "fresh" || rec.Header().Get(CacheHeader) != "miss" {
+		t.Fatalf("unvalidated user received stale data: hits=%d body=%q cache=%q", hits, rec.Body.String(), rec.Header().Get(CacheHeader))
+	}
+}
+
 // TestCacheIsolation is the acceptance gate: one user's watched state,
 // Continue Watching and restricted libraries must never appear in another
 // user's cached response.

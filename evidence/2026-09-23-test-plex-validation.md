@@ -324,3 +324,16 @@ fetching or key construction. Collection preloading remains gradual, not
 instantaneous, and other users' first requests are still cold until their
 own cache is filled. The build requires a live browser test before any
 speed or production claim.
+
+Commit `528039f` was deployed to the `oi-2` test container as
+`0.4.0-528039f-test` (image ID
+`sha256:1ae93bc5e937049e93241a9fcd2ef65b97b95b875c5524b3ca0b89824f74556a`).
+Two token-free collection request profiles from the Zen capture were
+configured. The container became healthy with zero restarts. Its first
+preload pass stored 17 pages and reported three errors; eight collection
+fallback keys were present shortly afterward. A captured collection-child
+request replayed through the internal Replx listener returned 200 in 4.7s
+on its first miss, then 200 cache hits in 31ms and 1ms. A direct public
+script request received a 403 before Replx, so the internal replay is the
+valid cache measurement. The browser experience, stale fallback after TTL,
+and restricted-user behavior still need live validation.
