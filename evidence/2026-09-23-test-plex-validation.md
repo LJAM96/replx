@@ -568,3 +568,10 @@ The test server now runs `0.4.0-03e9b50-test`, initially healthy with zero
 restarts. Background rebuilding started with repeated four-page passes and zero
 reported errors. Browser confirmation and full rebuilt-window coverage remain
 pending; this is not a production gate result.
+
+The rebuilt window count reached 440 keys: 220 retained old-profile keys plus
+220 new normalized keys (55 collections × two profiles × two user scopes).
+The warmer reported 220 newly fetched pages and zero errors. The container
+remained healthy with zero restarts. Luke's post-fix Zen retest is requested
+and still pending, so the server-side coverage does not establish browser
+latency yet.
