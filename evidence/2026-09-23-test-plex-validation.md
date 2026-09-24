@@ -598,3 +598,15 @@ legacy gzip entries. The full `go test ./...` suite passed. Image
 `sha256:7d429a178d9b28cadd7ec7b6a7ffaa176d90129f0af41f689f44bc3fe862b643`)
 was deployed to `oi-2`; it became healthy with zero restarts. Browser poster
 confirmation is pending.
+
+Luke's browser retest confirmed Monster (2022) and Neagley posters now display.
+The follow-up server logs showed 35/35 collection-child requests served from
+complete `window` cache entries, median 57 ms and maximum 122 ms. Artwork had
+214 hits, median under 1 ms, plus 51 successful misses, median 135 ms. The
+container remained healthy with zero restarts. Luke still perceived a slight
+slowdown; the remaining delay was in Home hub requests: three 200 misses took
+7–11 seconds, and one `/hubs/promoted` miss timed out at about 30 seconds with
+502. The browser's Home hub query differs from the owner-only preloader profile
+in account/sidebar context fields. No unsafe cross-user hub normalization was
+applied. Home first-visit performance and Plex origin timeout resilience remain
+open production gates.
