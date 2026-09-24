@@ -575,3 +575,26 @@ The warmer reported 220 newly fetched pages and zero errors. The container
 remained healthy with zero restarts. Luke's post-fix Zen retest is requested
 and still pending, so the server-side coverage does not establish browser
 latency yet.
+
+## 2026-09-25: Luke browser result and compressed poster fix
+
+Luke reported substantially faster collections but missing posters for
+Monster (2022) and Neagley. The corresponding session had 52 collection-child
+requests, all served as `window` hits (median 87 ms, maximum 186 ms). Artwork
+had 338 cache hits at a median 3 ms. The two named poster requests returned
+HTTP 200 from the artwork cache, with 61,118 and 66,341 byte bodies. Inspecting
+those two cached bodies on the test host found gzip headers; decompressing them
+produced valid JPEG headers. The artwork hit path had returned the stored gzip
+bytes without a Content-Encoding header, explaining blank images despite 200s.
+Three other poster requests returned Plex-origin 404s for different titles;
+those are separate source failures and were not attributed to the named titles.
+
+Commit `fb20242` normalizes gzip artwork to image bytes before saving, and
+decodes legacy gzip cache entries on read. Unsupported encodings are not
+cached. A proxy test reproduces a gzip origin image and verifies the cache hit
+returns JPEG bytes with no Content-Encoding header. Storage tests cover new and
+legacy gzip entries. The full `go test ./...` suite passed. Image
+`0.4.0-fb20242-test` (ID
+`sha256:7d429a178d9b28cadd7ec7b6a7ffaa176d90129f0af41f689f44bc3fe862b643`)
+was deployed to `oi-2`; it became healthy with zero restarts. Browser poster
+confirmation is pending.
