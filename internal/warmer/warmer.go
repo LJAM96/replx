@@ -57,6 +57,8 @@ type Stats struct {
 	UserWindowPages  int64 `json:"userWindowPages"`
 	UserWindowErrors int64 `json:"userWindowErrors"`
 	LastPreloadUnix  int64 `json:"lastPreloadUnix"`
+	LastWindowUnix   int64 `json:"lastWindowUnix"`
+	LastRefreshUnix  int64 `json:"lastRefreshUnix"`
 }
 
 // Warmer refreshes due owner-scoped entries against the origin.
@@ -98,6 +100,8 @@ type Warmer struct {
 	preloadedArtwork  int64
 	preloadErrors     int64
 	lastPreloadUnix   int64
+	lastWindowUnix    int64
+	lastRefreshUnix   int64
 	collectionCursor  int
 	windowCursors     map[string]int
 	windowScopeCursor int
@@ -259,6 +263,7 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 			w.tracked[k] = cur
 		}
 		w.refreshed++
+		w.lastRefreshUnix = w.now().Unix()
 		w.mu.Unlock()
 		if w.metrics != nil {
 			w.metrics.IncCacheWarmed()
@@ -320,7 +325,8 @@ func (w *Warmer) Stats() Stats {
 		OwnerWarming: w.warming, PreloadPages: w.preloadPages,
 		PreloadArtwork: w.preloadedArtwork, PreloadErrors: w.preloadErrors,
 		UserWindowPages: w.userWindowPages, UserWindowErrors: w.userWindowErrors,
-		LastPreloadUnix: w.lastPreloadUnix}
+		LastPreloadUnix: w.lastPreloadUnix, LastWindowUnix: w.lastWindowUnix,
+		LastRefreshUnix: w.lastRefreshUnix}
 }
 
 func (w *Warmer) owner(ctx context.Context) (string, bool) {

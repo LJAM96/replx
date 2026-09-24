@@ -561,6 +561,11 @@ func (m *Mux) handleStorage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{"cache": "valkey-best-effort", "artwork": "filesystem", "diagnostics": "filesystem"}
+	if m.storageUsage != nil {
+		for k, v := range m.storageUsage() {
+			out[k] = v
+		}
+	}
 	if m.svc != nil {
 		var items, sessions, decisions, traces, audits int64
 		_ = m.svc.DB.QueryRow(r.Context(), `SELECT count(*) FROM library_items`).Scan(&items)

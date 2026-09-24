@@ -103,6 +103,9 @@ func (w *Warmer) PreloadCollectionWindowsOnce(ctx context.Context) (pages, failu
 	w.windowCursors[scope] = (cursor + maxWindowsPerPass) % workSize
 	w.userWindowPages += int64(pages)
 	w.userWindowErrors += int64(failures)
+	if pages > 0 {
+		w.lastWindowUnix = w.now().Unix()
+	}
 	w.mu.Unlock()
 	if w.log != nil && (pages > 0 || failures > 0) {
 		w.log.Log(logging.Entry{Level: "info", Component: "cache",

@@ -84,6 +84,24 @@ func TestBrowserLoginThenCookieAuth(t *testing.T) {
 	}
 }
 
+func TestDashboardRequiresSessionAndShowsControls(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	unauth := httptest.NewRecorder()
+	m.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/admin", nil))
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("private dashboard returned %d without a session", unauth.Code)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.AddCookie(loginCookie(t, m))
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "People &amp; playback quality") ||
+		!strings.Contains(rec.Body.String(), "X-CSRF-Token") || !strings.Contains(rec.Body.String(), "/api/v1/storage") ||
+		strings.Contains(rec.Body.String(), "Alpha placeholder") {
+		t.Fatalf("dashboard response invalid: %d", rec.Code)
+	}
+}
+
 func TestCookieMutationNeedsCSRF(t *testing.T) {
 	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
 	cookie := loginCookie(t, m)

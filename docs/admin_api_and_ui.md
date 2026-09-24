@@ -125,6 +125,20 @@ The audit record stores before and after state where appropriate.
 
 ## Overview page
 
+The private `/admin` page now provides an operator dashboard after sign-in:
+cache hit and warmer counters, aggregate cache inventory by class, measured
+Valkey memory and key count, artwork and diagnostics disk use, and the latest
+completed warm activity. It edits per-user source resolution, source and
+streaming bitrate, 4K/HDR and transcode rules through the existing audited
+policy API. Playback and audit retention use the live settings API. All
+mutations use the browser session's CSRF token. The page does not expose
+tokens, cache keys or cached media metadata. Cache memory is capped by the
+Valkey Compose `maxmemory` setting; artwork is bounded by its janitor.
+
+The page intentionally labels its Home and Continue Watching inventory as
+short lived; it does not claim every Home variant is warm. Access remains on
+the private admin listener, never the public Plex hostname.
+
 Show:
 
 ```text

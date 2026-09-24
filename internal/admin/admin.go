@@ -53,19 +53,21 @@ type Mux struct {
 	// setupConsumed permanently disables bootstrap authentication once
 	// the administrator account is created. The setup capability is
 	// single use: creation consumes it in the same process lifetime.
-	setupConsumed bool
-	requireAuth   bool
-	sessions      *sessionStore
-	registry      *metrics.Registry
-	cap           *capture.Store
-	warmerStats   func() warmer.Stats
-	syncWorker    syncpkgWorker
-	syncMu        sync.Mutex
-	lastSyncFull  time.Time
-	lastSyncJob   string
-	checks        health.Checks
-	rateMu        sync.Mutex
-	rate          map[string][]time.Time
+	setupConsumed  bool
+	requireAuth    bool
+	sessions       *sessionStore
+	registry       *metrics.Registry
+	cap            *capture.Store
+	warmerStats    func() warmer.Stats
+	storageUsage   func() map[string]any
+	cacheInventory func() map[string]any
+	syncWorker     syncpkgWorker
+	syncMu         sync.Mutex
+	lastSyncFull   time.Time
+	lastSyncJob    string
+	checks         health.Checks
+	rateMu         sync.Mutex
+	rate           map[string][]time.Time
 	// invalidator retires cache namespaces (wired to the proxy
 	// generations in production). Nil keeps audit-only behaviour.
 	invalidator func(scope, class string)
@@ -102,6 +104,7 @@ func NewMux(checks health.Checks, svc *onboarding.Service, setupToken string, re
 	m.mux.HandleFunc("/api/v1/onboarding/select", m.auth(m.handleSelect))
 	m.mux.HandleFunc("/api/v1/onboarding/verify", m.auth(m.handleVerify))
 	m.mux.HandleFunc("/admin/onboarding", m.auth(m.handlePanel))
+	m.mux.HandleFunc("/admin", m.auth(m.handleDashboard))
 	m.mux.HandleFunc("/api/v1/spike/events", m.auth(m.handleSpikeEvents))
 	m.mux.HandleFunc("/api/v1/spike/observations", m.auth(m.handleSpikeObservations))
 	m.mux.HandleFunc("/api/v1/spike/report", m.auth(m.handleSpikeReport))
@@ -146,6 +149,17 @@ func (m *Mux) SetCapture(store *capture.Store) {
 // stats omit the warmer block until wired.
 func (m *Mux) SetWarmer(stats func() warmer.Stats) {
 	m.warmerStats = stats
+}
+
+// SetStorageUsage attaches measured private-cache usage to the admin API.
+func (m *Mux) SetStorageUsage(stats func() map[string]any) {
+	m.storageUsage = stats
+}
+
+// SetCacheInventory attaches aggregate key counts without exposing private
+// cache keys or user identifiers.
+func (m *Mux) SetCacheInventory(stats func() map[string]any) {
+	m.cacheInventory = stats
 }
 
 func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) { m.mux.ServeHTTP(w, r) }
@@ -270,7 +284,7 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			setSessionCookieTTL(w, id, ttl)
-			http.Redirect(w, r, "/admin/onboarding", http.StatusSeeOther)
+			http.Redirect(w, r, "/admin", http.StatusSeeOther)
 			return
 		}
 		username, password := r.FormValue("username"), r.FormValue("password")
@@ -302,7 +316,7 @@ func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setSessionCookie(w, id)
-		http.Redirect(w, r, "/admin/onboarding", http.StatusSeeOther)
+		http.Redirect(w, r, "/admin", http.StatusSeeOther)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET or POST")
 	}
@@ -575,6 +589,9 @@ func (m *Mux) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 	}
 	if m.warmerStats != nil {
 		data["warmer"] = m.warmerStats()
+	}
+	if m.cacheInventory != nil {
+		data["inventory"] = m.cacheInventory()
 	}
 	writeData(w, http.StatusOK, data)
 }

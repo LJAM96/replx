@@ -23,7 +23,7 @@ services:
     container_name: replx-edge-valkey
     image: valkey/valkey:${VALKEY_VERSION}
     restart: unless-stopped
-    command: ["valkey-server", "--appendonly", "yes"]
+    command: ["valkey-server", "--appendonly", "yes", "--maxmemory", "${REPLX_EDGE_CACHE_MAX_GB:-20}gb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
       - valkey_data:/data
     networks:

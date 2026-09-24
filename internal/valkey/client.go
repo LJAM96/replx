@@ -144,6 +144,88 @@ func (c *Client) Del(key string) error {
 	return nil
 }
 
+// Usage returns the cache process's memory use and key count. It exposes no
+// keys or values, and remains a best-effort operator metric.
+func (c *Client) Usage() (bytes int64, keys int64, err error) {
+	reply, err := c.roundTrip("INFO", "memory")
+	if err != nil {
+		return 0, 0, err
+	}
+	info, ok := reply.([]byte)
+	if !ok {
+		return 0, 0, fmt.Errorf("valkey: unexpected INFO reply %T", reply)
+	}
+	for _, line := range strings.Split(string(info), "\n") {
+		if strings.HasPrefix(line, "used_memory:") {
+			bytes, _ = strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "used_memory:")), 10, 64)
+			break
+		}
+	}
+	reply, err = c.roundTrip("DBSIZE")
+	if err != nil {
+		return bytes, 0, err
+	}
+	keys, ok = reply.(int64)
+	if !ok {
+		return bytes, 0, fmt.Errorf("valkey: unexpected DBSIZE reply %T", reply)
+	}
+	return bytes, keys, nil
+}
+
+// Inventory counts Replx cache keys by namespace without returning user
+// scopes, paths, or values. The scan is bounded so admin reads cannot hold
+// the cache connection indefinitely on a large installation.
+func (c *Client) Inventory(limit int) (map[string]int, int, error) {
+	if limit <= 0 {
+		limit = 20000
+	}
+	counts := map[string]int{}
+	cursor := "0"
+	seen := 0
+	for {
+		reply, err := c.roundTrip("SCAN", cursor, "MATCH", "replx_edge:*:default:*", "COUNT", "500")
+		if err != nil {
+			return nil, seen, err
+		}
+		parts, ok := reply.([]any)
+		if !ok || len(parts) != 2 {
+			return nil, seen, fmt.Errorf("valkey: unexpected SCAN reply")
+		}
+		switch next := parts[0].(type) {
+		case []byte:
+			cursor = string(next)
+		case string:
+			cursor = next
+		default:
+			return nil, seen, fmt.Errorf("valkey: unexpected SCAN cursor")
+		}
+		keys, ok := parts[1].([]any)
+		if !ok {
+			return nil, seen, fmt.Errorf("valkey: unexpected SCAN keys")
+		}
+		for _, item := range keys {
+			key, ok := item.([]byte)
+			if !ok {
+				continue
+			}
+			segments := strings.SplitN(string(key), ":", 5)
+			if len(segments) >= 4 {
+				counts[segments[3]]++
+				if strings.HasSuffix(string(key), ":window") {
+					counts["fullCollectionWindows"]++
+				}
+			}
+			seen++
+			if seen >= limit {
+				return counts, seen, nil
+			}
+		}
+		if cursor == "0" {
+			return counts, seen, nil
+		}
+	}
+}
+
 // SetNX stores val only when key is absent with a TTL (refresh lock
 // primitive for stampede control). Reports true when the lock was acquired.
 func (c *Client) SetNX(key string, val []byte, ttl time.Duration) (bool, error) {

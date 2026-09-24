@@ -33,6 +33,20 @@ func serveFake(t *testing.T, conn net.Conn) {
 		switch strings.ToUpper(cmd[0]) {
 		case "PING":
 			out = "+PONG\r\n"
+		case "INFO":
+			out = "$21\r\nused_memory:1048576\r\n\r\n"
+		case "DBSIZE":
+			out = ":" + strconv.Itoa(len(s.data)) + "\r\n"
+		case "SCAN":
+			var entries strings.Builder
+			count := 0
+			for key := range s.data {
+				if strings.HasPrefix(key, "replx_edge:") {
+					entries.WriteString("$" + strconv.Itoa(len(key)) + "\r\n" + key + "\r\n")
+					count++
+				}
+			}
+			out = "*2\r\n$1\r\n0\r\n*" + strconv.Itoa(count) + "\r\n" + entries.String()
 		case "GET":
 			v, ok := s.data[cmd[1]]
 			if ok {
@@ -124,6 +138,23 @@ func TestRoundTripSetGetDel(t *testing.T) {
 	}
 	if _, ok, err := c.Get("k1"); err != nil || ok {
 		t.Fatalf("want miss after del, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestUsageAndInventoryOnlyReturnAggregateCounts(t *testing.T) {
+	c := dialFake(t)
+	for _, key := range []string{"replx_edge:v2:default:collections:user-a:json:0:0:aaa:window", "replx_edge:v2:default:hubs:user-a:json:0:0:bbb", "other"} {
+		if err := c.Set(key, []byte("secret"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	used, keys, err := c.Usage()
+	if err != nil || used != 1048576 || keys != 3 {
+		t.Fatalf("usage: %d %d %v", used, keys, err)
+	}
+	counts, scanned, err := c.Inventory(20)
+	if err != nil || scanned != 2 || counts["collections"] != 1 || counts["hubs"] != 1 || counts["fullCollectionWindows"] != 1 {
+		t.Fatalf("inventory: %v %d %v", counts, scanned, err)
 	}
 }
 

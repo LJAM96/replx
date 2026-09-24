@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -395,6 +396,38 @@ func runServe() error {
 	adminMux.SetMetrics(registry)
 	adminMux.SetCapture(captureStore)
 	adminMux.SetWarmer(warm.Stats)
+	adminMux.SetCacheInventory(func() map[string]any {
+		counts, scanned, err := cacheClient.Inventory(20000)
+		if err != nil {
+			return map[string]any{"available": false}
+		}
+		return map[string]any{"available": true, "counts": counts, "scanned": scanned}
+	})
+	adminMux.SetStorageUsage(func() map[string]any {
+		out := map[string]any{"cacheBudgetBytes": int64(cfg.CacheMaxGB) << 30,
+			"artworkBudgetBytes":     int64(cfg.ArtworkMaxGB) << 30,
+			"diagnosticsBudgetBytes": int64(cfg.DiagnosticsMaxGB) << 30}
+		if used, keys, err := cacheClient.Usage(); err == nil {
+			out["cacheBytes"] = used
+			out["cacheEntries"] = keys
+		}
+		for name, dir := range map[string]string{"artworkBytes": cfg.ArtworkDir,
+			"diagnosticsBytes": "/data/diagnostics"} {
+			var total int64
+			if err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+				if err != nil || entry.IsDir() {
+					return nil
+				}
+				if info, err := entry.Info(); err == nil {
+					total += info.Size()
+				}
+				return nil
+			}); err == nil {
+				out[name] = total
+			}
+		}
+		return out
+	})
 	adminMux.SetSync(syncWorker)
 	adminMux.SetCacheInvalidator(proxyHandler.InvalidateCache)
 	// Diagnostics gauge: active targeted captures.
