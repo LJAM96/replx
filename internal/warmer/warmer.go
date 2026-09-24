@@ -1,16 +1,9 @@
-// Package warmer keeps hot owner-scoped browse entries fresh.
+// Package warmer keeps hot user-scoped browse entries fresh.
 //
 // The proxy tracks freshly stored cache entries; the warmer re-fetches the
-// ones due (past TTL/2) with the owner credential before they expire, so
-// active paths rarely miss. Only entries fingerprinted to the CURRENT owner
-// token are ever refreshed: anything else is dropped from tracking, which
-// is what keeps one user's refreshed response from ever landing in another
-// user's cache slot. Owner token rotation therefore re-baselines tracking
-// instead of poisoning it.
-//
-// Raw user tokens never enter the warmer: tracked snapshots carry the
-// fingerprint and a secret-stripped query, and refreshes run under the
-// owner token fetched per cycle from the encrypted credential store.
+// ones due (past TTL/2) with the matching user's validated credential.
+// Tracked snapshots contain only the scope and a secret-stripped query;
+// credentials are decrypted just for a refresh and never logged.
 package warmer
 
 import (
@@ -26,7 +19,9 @@ import (
 
 	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/cache"
+	"github.com/LJAM96/replx/internal/crypto"
 	"github.com/LJAM96/replx/internal/database"
+	"github.com/LJAM96/replx/internal/identity"
 	"github.com/LJAM96/replx/internal/logging"
 	"github.com/LJAM96/replx/internal/metrics"
 	"github.com/LJAM96/replx/internal/origin"
@@ -72,9 +67,7 @@ type Warmer struct {
 	// Refresh compares snapshot scopes against
 	// the canonical owner scope: account identity, never token material.
 	OwnerAccount func(ctx context.Context) (int64, bool)
-	// DB resolves the owner account to its identity UUID for the
-	// canonical "user:<uuid>" scope. Unset (tests) keeps the legacy
-	// "acct:<id>" comparison.
+	// DB resolves the owner scope and encrypted non-owner credentials.
 	DB database.DBTX
 	// KeyFunc recomputes a snapshot's cache key under current
 	// invalidation generations. Unset keeps the tracked key as-is.
@@ -207,12 +200,9 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 	w.mu.Lock()
 	w.warming = ok
 	w.mu.Unlock()
-	if !ok {
-		return
-	}
-	ownerScope := w.ownerScope(ctx)
-	if ownerScope == "" {
-		return
+	ownerScope := ""
+	if ok {
+		ownerScope = w.ownerScope(ctx)
 	}
 	for _, item := range due {
 		k := item.key
@@ -222,10 +212,14 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 		if !exists {
 			continue
 		}
-		if t.snap.Scope != ownerScope {
-			// Not owner-scoped (different account): drop rather than
-			// refresh under the wrong identity. It re-tracks on its
-			// next store if current.
+		token := ""
+		if t.snap.Scope == ownerScope && ownerScope != "" {
+			token = owner
+		} else {
+			token = w.userToken(ctx, t.snap.Scope)
+		}
+		if token == "" {
+			// No validated credential for this exact scope.
 			w.mu.Lock()
 			delete(w.tracked, k)
 			w.mu.Unlock()
@@ -236,7 +230,7 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 			timeout = 90 * time.Second
 		}
 		requestCtx, cancel := context.WithTimeout(ctx, timeout)
-		err := w.refresh(requestCtx, k, t.snap, owner)
+		err := w.refresh(requestCtx, k, t.snap, token)
 		cancel()
 		if err != nil {
 			w.countErr()
@@ -253,6 +247,49 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 			w.metrics.IncCacheWarmed()
 		}
 	}
+}
+
+// userToken loads only the credential bound to this scope. A fingerprint
+// check catches corrupt or mismatched ciphertext before any origin request.
+func (w *Warmer) userToken(ctx context.Context, scope string) string {
+	if w.DB == nil || w.secret == "" {
+		return ""
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var fingerprint string
+	var ciphertext []byte
+	const selected = `SELECT t.token_fingerprint,t.token_ciphertext FROM plex_token_identities t
+		JOIN plex_servers s ON s.id=t.server_id WHERE s.enabled AND t.token_ciphertext IS NOT NULL
+		AND t.last_seen_at > now() - make_interval(days => 30) AND t.token_status IN ('valid','pms_valid')`
+	var err error
+	switch {
+	case strings.HasPrefix(scope, "tok:"):
+		fingerprint = strings.TrimPrefix(scope, "tok:")
+		err = w.DB.QueryRow(cctx, selected+` AND t.token_fingerprint=$1 AND t.token_status='pms_valid'
+			ORDER BY t.last_seen_at DESC LIMIT 1`, fingerprint).Scan(&fingerprint, &ciphertext)
+	case strings.HasPrefix(scope, "user:"):
+		id := strings.TrimPrefix(scope, "user:")
+		err = w.DB.QueryRow(cctx, selected+` AND t.identity_id::text=$1 AND t.token_status='valid'
+			ORDER BY t.last_seen_at DESC LIMIT 1`, id).Scan(&fingerprint, &ciphertext)
+	default:
+		return ""
+	}
+	if err != nil {
+		return ""
+	}
+	plain, err := crypto.Decrypt(w.secret, identity.PurposeUserToken, ciphertext)
+	if err != nil {
+		return ""
+	}
+	token := string(plain)
+	for i := range plain {
+		plain[i] = 0
+	}
+	if crypto.Fingerprint(w.secret, token) != fingerprint {
+		return ""
+	}
+	return token
 }
 
 // Stats snapshots operator state.

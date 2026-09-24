@@ -15,8 +15,8 @@
 //
 // Scope strings key the response cache: "acct:<accountID>" when resolved
 // (all devices of one user share entries), "tok:<fingerprint>" otherwise.
-// User token ciphertext is deliberately never stored: the link table keeps
-// fingerprints plus identity links, nothing that replays an account.
+// Validated user tokens may be encrypted for user-scoped cache refreshes.
+// Invalid tokens are never retained.
 //
 // Client instances and identity bindings are recorded on resolution for
 // administration and capability precedence; they never gate traffic.
@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LJAM96/replx/internal/crypto"
 	"github.com/LJAM96/replx/internal/database"
 	"github.com/LJAM96/replx/internal/plextv"
 	"github.com/LJAM96/replx/internal/trace"
@@ -101,6 +102,7 @@ type Resolver struct {
 	DB     database.DBTX
 	TV     Account
 	PMS    TokenValidator
+	Secret string // enables encrypted, validated token retention for warming
 	mu     sync.Mutex
 	acct   map[string]acctEntry
 	cli    map[string]cliEntry
@@ -213,6 +215,7 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 		Scan(&identityID, &accountID, &status, &validatedAt)
 	linked := err == nil && identityID != nil && *identityID != "" && accountID != nil
 	if status == "pms_valid" && validatedAt != nil && time.Since(*validatedAt) < memTTL {
+		r.persistToken(cctx, serverID, fingerprint, token)
 		return Resolved{Scope: fallback.Scope, Fresh: true}, true
 	}
 	if status == "invalid" {
@@ -232,6 +235,9 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 				IdentityID: *identityID, AccountID: *accountID, Known: true, Fresh: fresh}
 			res.ClientID = r.recordClient(cctx, serverID, *identityID, client)
 			r.touchLink(cctx, serverID, fingerprint)
+			if fresh {
+				r.persistToken(cctx, serverID, fingerprint, token)
+			}
 			return res, true
 		}
 		// Stale proof: revalidate the credential now.
@@ -239,6 +245,7 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 		if verr == nil && id != 0 {
 			iid := r.upsertIdentity(cctx, serverID, id, username)
 			r.upsertLink(cctx, serverID, fingerprint, iid)
+			r.persistToken(cctx, serverID, fingerprint, token)
 			if iid == "" {
 				return fallback, true
 			}
@@ -279,6 +286,7 @@ func (r *Resolver) resolveCold(ctx context.Context, fingerprint, token string, c
 	}
 	iid := r.upsertIdentity(cctx, serverID, id, username)
 	r.upsertLink(cctx, serverID, fingerprint, iid)
+	r.persistToken(cctx, serverID, fingerprint, token)
 	if iid == "" {
 		// Account proven by plex.tv but not persistable: stay
 		// token-scoped rather than claim an identity we cannot bind.
@@ -328,13 +336,37 @@ func (r *Resolver) resolvePMS(ctx context.Context, serverID, fingerprint, token 
 		return fallback, true
 	}
 	if !valid {
+		r.clearStoredToken(ctx, serverID, fingerprint)
 		return fallback, true
 	}
 	_, _ = r.DB.Exec(ctx, `INSERT INTO plex_token_identities(server_id, token_fingerprint, token_status, last_seen_at, last_validated_at)
 		VALUES($1,$2,'pms_valid',now(),now())
 		ON CONFLICT (server_id, token_fingerprint) DO UPDATE SET
 			identity_id=NULL, token_status='pms_valid', last_seen_at=now(), last_validated_at=now()`, serverID, fingerprint)
+	r.persistToken(ctx, serverID, fingerprint, token)
 	return Resolved{Scope: "tok:" + fingerprint, Fresh: true}, true
+}
+
+const PurposeUserToken = "user-token-warming"
+
+func (r *Resolver) persistToken(ctx context.Context, serverID, fingerprint, token string) {
+	if r.Secret == "" || token == "" || r.DB == nil || crypto.Fingerprint(r.Secret, token) != fingerprint {
+		return
+	}
+	ciphertext, err := crypto.Encrypt(r.Secret, PurposeUserToken, []byte(token))
+	if err != nil {
+		return
+	}
+	_, _ = r.DB.Exec(ctx, `UPDATE plex_token_identities SET token_ciphertext=$3
+		WHERE server_id=$1 AND token_fingerprint=$2 AND token_ciphertext IS NULL
+		AND token_status IN ('valid','pms_valid')`, serverID, fingerprint, ciphertext)
+}
+
+func (r *Resolver) clearStoredToken(ctx context.Context, serverID, fingerprint string) {
+	if r.DB != nil {
+		_, _ = r.DB.Exec(ctx, `UPDATE plex_token_identities SET token_ciphertext=NULL
+			WHERE server_id=$1 AND token_fingerprint=$2`, serverID, fingerprint)
+	}
 }
 
 func (r *Resolver) enabledServer(ctx context.Context) string {
@@ -413,7 +445,7 @@ func (r *Resolver) markInvalid(ctx context.Context, serverID, fingerprint string
 	_, _ = r.DB.Exec(ctx, `INSERT INTO plex_token_identities(server_id, token_fingerprint, token_status, last_seen_at, last_validated_at)
 		VALUES($1,$2,'invalid',now(),now())
 		ON CONFLICT (server_id, token_fingerprint) DO UPDATE SET
-			identity_id=NULL, token_status='invalid', last_seen_at=now(), last_validated_at=now()`,
+			identity_id=NULL, token_ciphertext=NULL, token_status='invalid', last_seen_at=now(), last_validated_at=now()`,
 		serverID, fingerprint)
 }
 

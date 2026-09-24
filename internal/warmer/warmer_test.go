@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/LJAM96/replx/internal/cache"
+	"github.com/LJAM96/replx/internal/crypto"
+	"github.com/LJAM96/replx/internal/identity"
+	"github.com/LJAM96/replx/internal/testdb"
 )
 
 const testSecret = "warmer-test-secret-0123456789abcdef"
@@ -94,6 +97,49 @@ func TestDropsNonOwnerEntry(t *testing.T) {
 	}
 	if st := w.Stats(); st.Tracked != 0 {
 		t.Fatalf("non-owner entry must be dropped, tracked=%d", st.Tracked)
+	}
+}
+
+func TestLiveRefreshesOnlyMatchingValidatedUserToken(t *testing.T) {
+	ctx, db := testdb.Begin(t)
+	const token = "managed-a-token"
+	fingerprint := crypto.Fingerprint(testSecret, token)
+	ciphertext, err := crypto.Encrypt(testSecret, identity.PurposeUserToken, []byte(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var serverID string
+	if err := db.QueryRow(ctx, `INSERT INTO plex_servers(name,internal_origin_url,machine_identifier,enabled)
+		VALUES('Warmer Box','http://test.invalid:32400','test-warmer-box',true) RETURNING id`).Scan(&serverID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO plex_token_identities(server_id,token_fingerprint,token_ciphertext,token_status,last_validated_at)
+		VALUES($1,$2,$3,'pms_valid',now())`, serverID, fingerprint, ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	hits := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.Header.Get("X-Plex-Token") != token {
+			t.Error("wrong user's credential used")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"user":"a"}`))
+	}))
+	defer origin.Close()
+	store := cache.NewMemory()
+	w := New(store, origin.URL, testSecret, ownerProvider(""), nil, nil)
+	w.DB = db
+	w.Track("user-a-page", Snapshot{Method: "GET", Path: "/library/collections/101/children", Scope: "tok:" + fingerprint, TTL: time.Minute})
+	w.now = func() time.Time { return time.Now().Add(40 * time.Second) }
+	w.RefreshOnce(ctx)
+	entry, ok, err := store.Get(ctx, "user-a-page")
+	if err != nil || !ok || string(entry.Body) != `{"user":"a"}` || hits != 1 {
+		t.Fatalf("per-user refresh: entry=%q ok=%v err=%v hits=%d", entry.Body, ok, err, hits)
+	}
+	if got := w.userToken(ctx, "tok:"+crypto.Fingerprint(testSecret, "other-user")); got != "" {
+		t.Fatal("another scope obtained a credential")
 	}
 }
 

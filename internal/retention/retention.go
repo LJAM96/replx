@@ -27,10 +27,36 @@ type Policy struct {
 
 // Result counts one purge pass.
 type Result struct {
-	Sessions  int64 `json:"sessions"`
-	Decisions int64 `json:"decisions"`
-	Traces    int64 `json:"traces"`
-	Audits    int64 `json:"audits"`
+	Sessions      int64 `json:"sessions"`
+	Decisions     int64 `json:"decisions"`
+	Traces        int64 `json:"traces"`
+	Audits        int64 `json:"audits"`
+	TokensCleared int64 `json:"tokensCleared"`
+}
+
+func clearOldUserTokens(ctx context.Context, db database.DBTX, batch int) (int64, error) {
+	var total int64
+	for {
+		var n int64
+		err := db.QueryRow(ctx, `WITH cleared AS (
+			UPDATE plex_token_identities SET token_ciphertext=NULL
+			WHERE ctid IN (SELECT ctid FROM plex_token_identities
+				WHERE token_ciphertext IS NOT NULL
+				AND (token_status NOT IN ('valid','pms_valid')
+					OR last_seen_at < now() - make_interval(days => 30))
+				LIMIT $1)
+			RETURNING 1) SELECT count(*) FROM cleared`, batch).Scan(&n)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < int64(batch) {
+			return total, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+	}
 }
 
 func batchSize(p Policy) int {
@@ -102,6 +128,9 @@ func PurgeOnce(ctx context.Context, db database.DBTX, p Policy) (Result, error) 
 			return out, fmt.Errorf("retention: audits: %w", err)
 		}
 	}
+	if out.TokensCleared, err = clearOldUserTokens(cctx, db, batch); err != nil {
+		return out, fmt.Errorf("retention: user tokens: %w", err)
+	}
 	return out, nil
 }
 
@@ -143,7 +172,8 @@ func purgeAndLog(ctx context.Context, db database.DBTX, p Policy, logger *loggin
 	}
 	logger.Log(logging.Entry{Level: "info", Component: "retention",
 		Fields: map[string]any{"event": "purged", "sessions": res.Sessions,
-			"decisions": res.Decisions, "traces": res.Traces, "audits": res.Audits}})
+			"decisions": res.Decisions, "traces": res.Traces, "audits": res.Audits,
+			"tokensCleared": res.TokensCleared}})
 }
 
 // livePolicy reloads retention bounds from the runtime settings table so

@@ -195,7 +195,8 @@ func runServe() error {
 	cacheStore := cache.NewValkeyStore(cacheClient)
 	// Identity pipeline: fingerprint to Plex account resolution with
 	// account-scoped cache sharing across a user's devices. plex.tv is
-	// consulted on cold fingerprints only; user tokens are never stored.
+	// consulted on cold fingerprints only; validated user tokens are
+	// encrypted for per-user cache refreshes.
 	idResolver := identity.New(db.Raw(), tvAccount{client: &plextv.Client{
 		BaseURL: cfg.PlexTVBase, ClientIdentifier: "replx-edge-identity",
 		Product: "Replx Edge", Version: version, Platform: "Linux",
@@ -205,6 +206,7 @@ func runServe() error {
 		return err
 	}
 	idResolver.PMS = pmsValidator
+	idResolver.Secret = cfg.SecretKey
 	ownerAccount := func(ctx context.Context) (int64, bool) {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()

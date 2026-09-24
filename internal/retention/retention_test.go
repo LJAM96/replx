@@ -58,6 +58,13 @@ func TestLivePurge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, err = db.Exec(ctx, `INSERT INTO plex_token_identities(server_id, token_fingerprint, token_ciphertext,
+		token_status, last_seen_at) VALUES
+		($1,'old-user-token',decode('abcd','hex'),'valid',now()-make_interval(days => 31)),
+		($1,'active-user-token',decode('abcd','hex'),'pms_valid',now())`, serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	res, err := PurgeOnce(ctx, db, Policy{PlaybackDays: 30, AuditDays: 180})
 	if err != nil {
@@ -65,8 +72,13 @@ func TestLivePurge(t *testing.T) {
 	}
 	// Exactly the expired rows go: the fresh sessionless denial is
 	// retained, the old session (and its cascaded decision) is not.
-	if res.Sessions != 1 || res.Decisions != 1 || res.Traces != 1 || res.Audits != 1 {
+	if res.Sessions != 1 || res.Decisions != 1 || res.Traces != 1 || res.Audits != 1 || res.TokensCleared != 1 {
 		t.Fatalf("purge counts: %+v", res)
+	}
+	var retained int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM plex_token_identities
+		WHERE server_id=$1 AND token_ciphertext IS NOT NULL`, serverID).Scan(&retained); err != nil || retained != 1 {
+		t.Fatalf("active user credential was cleared: %v count=%d", err, retained)
 	}
 	var n int
 	if err := db.QueryRow(ctx, `SELECT count(*) FROM playback_sessions WHERE id=$1`, liveID).Scan(&n); err != nil || n != 1 {

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/LJAM96/replx/internal/crypto"
 	"github.com/LJAM96/replx/internal/plextv"
 	"github.com/LJAM96/replx/internal/testdb"
 )
@@ -131,6 +132,47 @@ func TestLivePMSOnlyTokenUsesPrivateCacheScope(t *testing.T) {
 	got2 := r2.Resolve(ctx, "fp-managed", "managed-token", Client{})
 	if !got2.Fresh || got2.Scope != got.Scope || tv.calls.Load() != 1 || pms.calls.Load() != 1 {
 		t.Fatalf("reloaded PMS-only token: %+v tv=%d pms=%d", got2, tv.calls.Load(), pms.calls.Load())
+	}
+}
+
+func TestLiveValidatedTokenEncryptedAndRevoked(t *testing.T) {
+	const secret = "user-token-storage-test-secret-0123456789"
+	const token = "managed-user-secret-token"
+	r, serverID := liveResolver(t, &fakeTV{code: 401})
+	r.Secret = secret
+	pms := &fakePMSValidator{valid: true}
+	r.PMS = pms
+	fingerprint := crypto.Fingerprint(secret, token)
+	got := r.Resolve(context.Background(), fingerprint, token, Client{})
+	if !got.Fresh || got.Scope != "tok:"+fingerprint {
+		t.Fatalf("managed identity: %+v", got)
+	}
+	var ciphertext []byte
+	if err := r.DB.QueryRow(context.Background(), `SELECT token_ciphertext FROM plex_token_identities
+		WHERE server_id=$1 AND token_fingerprint=$2`, serverID, fingerprint).Scan(&ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	if string(ciphertext) == token || len(ciphertext) == 0 {
+		t.Fatal("validated token was not encrypted")
+	}
+	plain, err := crypto.Decrypt(secret, PurposeUserToken, ciphertext)
+	if err != nil || string(plain) != token {
+		t.Fatalf("stored token cannot be recovered with the correct purpose: %v", err)
+	}
+	r2 := New(r.DB, &fakeTV{code: 401})
+	r2.PMS = &fakePMSValidator{valid: false}
+	r2.Secret = secret
+	if _, err := r.DB.Exec(context.Background(), `UPDATE plex_token_identities SET last_validated_at=now()-make_interval(minutes => 10)
+		WHERE server_id=$1 AND token_fingerprint=$2`, serverID, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if result := r2.Resolve(context.Background(), fingerprint, token, Client{}); !result.Invalid {
+		t.Fatalf("revoked token authorized: %+v", result)
+	}
+	var retained bool
+	if err := r.DB.QueryRow(context.Background(), `SELECT token_ciphertext IS NOT NULL FROM plex_token_identities
+		WHERE server_id=$1 AND token_fingerprint=$2`, serverID, fingerprint).Scan(&retained); err != nil || retained {
+		t.Fatalf("revoked token retained: %v %v", retained, err)
 	}
 }
 
