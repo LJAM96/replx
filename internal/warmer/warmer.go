@@ -234,6 +234,14 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 		cancel()
 		if err != nil {
 			w.countErr()
+			// A slow or failing PMS must not be retried every two seconds.
+			// Keep the old cache entry and wait until the next refresh interval.
+			w.mu.Lock()
+			if cur, exists := w.tracked[k]; exists {
+				cur.last = w.now()
+				w.tracked[k] = cur
+			}
+			w.mu.Unlock()
 			continue
 		}
 		w.mu.Lock()
@@ -366,7 +374,7 @@ func (w *Warmer) countErr() {
 	}
 }
 
-// refresh re-fetches one entry under the owner token and stores 200s
+// refresh re-fetches one entry under its scoped token and stores 200s
 // within the entry cap. Anything else is an error (no negative caching:
 // a flapping origin must not poison hot keys). The store key is
 // recomputed under current invalidation generations so a refresh never

@@ -172,6 +172,10 @@ func TestErrorStatusNotStored(t *testing.T) {
 	if st := w.Stats(); st.Errors != 1 {
 		t.Fatalf("errors: %+v", st)
 	}
+	w.RefreshOnce(context.Background())
+	if fx.hits != 1 {
+		t.Fatalf("failed refresh retried immediately: hits=%d", fx.hits)
+	}
 }
 
 func TestStripSecrets(t *testing.T) {

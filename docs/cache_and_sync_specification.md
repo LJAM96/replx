@@ -69,12 +69,12 @@ Raw Plex tokens never appear in keys.
 | --- | ---: | ---: |
 | PMS identity | 5 minutes | 30 minutes |
 | Library list | 5 minutes | 30 minutes |
-| Browse page | 60 seconds | 10 minutes |
+| Library browse page | 60 seconds | 5 minutes after one successful response |
 | Item metadata | 5 minutes | 30 minutes |
-| Collections | 2 minutes | 15 minutes |
-| Home hubs | 10 seconds | 30 seconds |
-| Continue Watching | 5 seconds | 30 seconds |
-| Recently Added | 15 seconds | 2 minutes |
+| Collections | 2 minutes | 15 minutes after one successful response |
+| Structural Home hubs | 10 seconds | 15 minutes after one successful response |
+| Continue Watching | 5 seconds | none |
+| Recently Added | 15 seconds | none |
 | Search response | 30 seconds | 2 minutes |
 | Artwork | 7 days | 30 days |
 
@@ -119,13 +119,19 @@ directly from PMS.
 The pass does not delay readiness, and failed requests are not cached. Cached
 responses and artwork use the canonical owner scope. Other users still need
 their own authorized requests before their responses can be cached.
+After Plex validates a user token, Replx stores it encrypted under a separate
+key purpose and refreshes that user's previously requested pages in the same
+cache scope. Rejected tokens are cleared, and tokens unused for 30 days are
+cleared by retention. Raw tokens are never logged or used in cache keys. This
+refresh does not populate unseen scroll positions.
 The admin cache statistics expose cumulative preload page, artwork, and error
 counts plus the time of the last completed pass.
 
 The response key includes non-secret query parameters and representation.
 Preloaded pages only hit when a client makes the same request variant; a Plex
 Web request with extra parameters may still be a first miss. The warmer
-refreshes owner entries that clients actually request. Artwork keys remove a
+refreshes entries that clients actually request under the matching user's
+credential. Artwork keys remove a
 Plex token nested inside the transcode URL, so the owner preloaded poster can
 match the same transform after token rotation without crossing user scopes.
 
