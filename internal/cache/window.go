@@ -13,18 +13,26 @@ import (
 const CollectionWindowTTL = 2 * time.Hour
 
 // CollectionWindowKeyGen shares one cached collection response across its
-// pagination requests while retaining every other query field, the user
+// pagination requests while retaining content-shaping fields, the user
 // scope, representation and invalidation generations.
 func CollectionWindowKeyGen(scope, class, method, path string, query url.Values, accept string, scopeGen, globalGen uint64) string {
+	return ResponseKeyGen(scope, class, method, path, CollectionWindowQuery(query), accept, scopeGen, globalGen) + ":window"
+}
+
+// CollectionWindowQuery removes page coordinates and two Plex Web context
+// hints that do not select collection children. Both vary with the browser
+// window or pinned sidebar, even while the collection itself stays the same.
+func CollectionWindowQuery(query url.Values) url.Values {
 	q := url.Values{}
 	for k, values := range query {
 		lower := strings.ToLower(k)
-		if lower == "x-plex-container-start" || lower == "x-plex-container-size" {
+		if lower == "x-plex-container-start" || lower == "x-plex-container-size" ||
+			lower == "x-plex-device-screen-resolution" || lower == "pinnedcontentdirectoryid" {
 			continue
 		}
 		q[k] = append([]string(nil), values...)
 	}
-	return ResponseKeyGen(scope, class, method, path, q, accept, scopeGen, globalGen) + ":window"
+	return q
 }
 
 // CollectionWindowPage slices a JSON collection response fetched from offset

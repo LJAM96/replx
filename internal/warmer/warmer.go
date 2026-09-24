@@ -442,13 +442,8 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 	if collectionWindowRequest(s) && strings.Contains(strings.ToLower(entry.ContentType), "json") {
 		if _, valid := cache.CollectionWindowPage(body, 0, 1); valid {
 			q, _ := url.ParseQuery(s.RawQuery)
-			for k := range q {
-				if strings.EqualFold(k, "X-Plex-Container-Start") || strings.EqualFold(k, "X-Plex-Container-Size") {
-					q.Del(k)
-				}
-			}
 			windowSnap := s
-			windowSnap.RawQuery = q.Encode()
+			windowSnap.RawQuery = cache.CollectionWindowQuery(q).Encode()
 			windowKey := ""
 			if w.KeyFunc != nil {
 				windowKey = w.KeyFunc(windowSnap) + ":window"

@@ -80,9 +80,7 @@ func (w *Warmer) PreloadCollectionWindowsOnce(ctx context.Context) (pages, failu
 		}
 		windowSnap := snap
 		q, _ := url.ParseQuery(query)
-		q.Del("X-Plex-Container-Start")
-		q.Del("X-Plex-Container-Size")
-		windowSnap.RawQuery = q.Encode()
+		windowSnap.RawQuery = cache.CollectionWindowQuery(q).Encode()
 		windowKey := w.KeyFunc(windowSnap) + ":window"
 		if _, hit, err := w.store.Get(ctx, windowKey); err == nil && hit {
 			continue
