@@ -542,3 +542,29 @@ with collection sizes from 0 to 347 items; none exceeded the requested
 coverage for the configured Zen profiles at that moment. It does not prove
 that Plex Web will request only those profiles, nor that image loading and
 library browsing are fast. Operator scroll feedback is pending.
+
+## 2026-09-24: Luke browser profile mismatch and test correction
+
+Luke reported a slow collection opening in Zen with `plex.direct` blocked.
+Sanitized edge logs from the session showed 25 collection-child requests, all
+cache misses, median 13.45 seconds and maximum 21.65 seconds. Two hub requests
+also took more than 21 seconds and a third timed out at 30 seconds. This
+confirmed the user-visible delay was upstream collection and hub work, not
+merely poster delivery. Comparing query key names and values without printing
+credentials showed every collection-child request differed from the two
+configured warmer profiles only in `X-Plex-Device-Screen-Resolution` and
+`pinnedContentDirectoryID`. The former changed with the browser window, and
+the latter changed with the Plex sidebar context. User, path, content-shaping
+query fields and JSON representation matched.
+
+Commit `03e9b50` normalizes those two context fields in the *collection window*
+key only. The same normalization is used by the preloader and refresh path.
+User scope, all other query fields, representation and invalidation generations
+remain in the key; the proxy still revalidates credentials and slices only
+complete JSON windows. The added test checks different display and sidebar
+values share one window, while different users and `includeMeta` values do not.
+Focused cache, warmer and proxy tests and the full `go test ./...` suite passed.
+The test server now runs `0.4.0-03e9b50-test`, initially healthy with zero
+restarts. Background rebuilding started with repeated four-page passes and zero
+reported errors. Browser confirmation and full rebuilt-window coverage remain
+pending; this is not a production gate result.
