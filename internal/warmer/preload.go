@@ -313,7 +313,7 @@ func (w *Warmer) preloadArtwork(ctx context.Context, scope, token, thumb string)
 	if len(body) == 0 || len(body) > artwork.MaxBodyBytes {
 		return false, errTooLarge()
 	}
-	if err := w.Artwork.Set(key, resp.Header.Get("Content-Type"), body); err != nil {
+	if err := w.Artwork.Set(key, resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), body); err != nil {
 		return false, err
 	}
 	return true, nil

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"io"
@@ -27,6 +28,38 @@ import (
 	"github.com/LJAM96/replx/internal/trace"
 	"github.com/LJAM96/replx/internal/warmer"
 )
+
+func TestArtworkCacheHitServesDecodedGzipImage(t *testing.T) {
+	jpeg := []byte{0xff, 0xd8, 0xff, 0xe0, 1, 2, 3}
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	_, _ = zw.Write(jpeg)
+	_ = zw.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(compressed.Bytes())
+	}))
+	defer origin.Close()
+	art, err := artwork.New(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: "test-secret-key-for-beta-slice-0123456789", Artwork: art})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/photo/:/transcode?width=480&url=%2Flibrary%2Fmetadata%2F1%2Fthumb", nil)
+		req.Header.Set("X-Plex-Token", "token-a")
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if i == 1 && (rec.Header().Get(CacheHeader) != "hit" || rec.Header().Get("Content-Encoding") != "" || !bytes.Equal(rec.Body.Bytes(), jpeg)) {
+			t.Fatalf("cached JPEG is not directly renderable: status=%d cache=%q encoding=%q", rec.Code, rec.Header().Get(CacheHeader), rec.Header().Get("Content-Encoding"))
+		}
+	}
+}
 
 func TestOriginFailureLogIsClassifiedWithoutCredential(t *testing.T) {
 	var out bytes.Buffer

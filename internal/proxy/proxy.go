@@ -746,7 +746,7 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 		return false
 	}
 	if resp.StatusCode == http.StatusOK {
-		if err := h.artwork.Set(key, resp.Header.Get("Content-Type"), body); err != nil && h.log != nil {
+		if err := h.artwork.Set(key, resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), body); err != nil && h.log != nil {
 			h.artworkWriteLogOnce.Do(func() {
 				h.log.Log(logging.Entry{Level: "warn", Component: "cache",
 					Fields: map[string]any{"event": "artwork_write_failed"}})

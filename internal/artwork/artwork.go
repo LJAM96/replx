@@ -8,11 +8,14 @@
 package artwork
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -165,6 +168,16 @@ func (s *Store) Get(key string) (string, []byte, bool) {
 	if err != nil {
 		return "", nil, false
 	}
+	// Entries written before compressed responses were normalized contain
+	// gzip bytes without a saved Content-Encoding header. Decode them on read.
+	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+		body, err = decodeGzip(body)
+		if err != nil {
+			_ = os.Remove(metaPath)
+			_ = os.Remove(bodyPath)
+			return "", nil, false
+		}
+	}
 	return m.ContentType, body, true
 }
 
@@ -175,9 +188,20 @@ func (s *Store) Get(key string) (string, []byte, bool) {
 // body lands before the metadata so a crash can only leave an orphaned
 // body, which reads as a miss and is reclaimed by the sweeper — never a
 // metadata record pointing at a torn body. Files are owner-only.
-func (s *Store) Set(key, contentType string, body []byte) error {
+func (s *Store) Set(key, contentType, contentEncoding string, body []byte) error {
 	if s == nil || key == "" {
 		return fmt.Errorf("artwork: empty key")
+	}
+	switch strings.ToLower(strings.TrimSpace(contentEncoding)) {
+	case "", "identity":
+	case "gzip":
+		var err error
+		body, err = decodeGzip(body)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("artwork: unsupported content encoding")
 	}
 	if len(body) > MaxBodyBytes {
 		return fmt.Errorf("artwork: body exceeds entry cap")
@@ -212,6 +236,19 @@ func (s *Store) Set(key, contentType string, body []byte) error {
 	}
 	ok = true
 	return nil
+}
+
+func decodeGzip(body []byte) ([]byte, error) {
+	r, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	decoded, err := io.ReadAll(io.LimitReader(r, MaxBodyBytes+1))
+	if err != nil || len(decoded) > MaxBodyBytes {
+		return nil, fmt.Errorf("artwork: invalid or oversized gzip body")
+	}
+	return decoded, nil
 }
 
 // writeTemp Durably writes b to a unique 0600 file in dir and returns its

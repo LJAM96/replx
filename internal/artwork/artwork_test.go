@@ -1,12 +1,41 @@
 package artwork
 
 import (
+	"bytes"
+	"compress/gzip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestCompressedArtworkReturnsImageBytes(t *testing.T) {
+	s, err := New(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jpeg := []byte{0xff, 0xd8, 0xff, 0xe0, 1, 2, 3}
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	_, _ = zw.Write(jpeg)
+	_ = zw.Close()
+	if err := s.Set("new", "image/jpeg", "gzip", compressed.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	_, body, ok := s.Get("new")
+	if !ok || !bytes.Equal(body, jpeg) {
+		t.Fatal("new compressed artwork was not normalized")
+	}
+	// A cached gzip entry from the previous release must also render.
+	if err := s.Set("legacy", "image/jpeg", "", compressed.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	_, body, ok = s.Get("legacy")
+	if !ok || !bytes.Equal(body, jpeg) {
+		t.Fatal("legacy compressed artwork was not decoded")
+	}
+}
 
 func TestKeyScopes(t *testing.T) {
 	q1, _ := url.ParseQuery("X-Plex-Token=aaa&width=480&height=720")
@@ -46,7 +75,7 @@ func TestRoundTripAndExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Set("k1", "image/jpeg", []byte("bytes")); err != nil {
+	if err := s.Set("k1", "image/jpeg", "", []byte("bytes")); err != nil {
 		t.Fatal(err)
 	}
 	ct, body, ok := s.Get("k1")
@@ -85,8 +114,8 @@ func TestSweepBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.maxBytes = 10
-	_ = s.Set("a", "image/jpeg", []byte("12345678"))
-	_ = s.Set("b", "image/jpeg", []byte("12345678"))
+	_ = s.Set("a", "image/jpeg", "", []byte("12345678"))
+	_ = s.Set("b", "image/jpeg", "", []byte("12345678"))
 	removed, freed := s.Sweep()
 	if removed == 0 || freed == 0 {
 		t.Fatalf("over-budget must evict: %d %d", removed, freed)
