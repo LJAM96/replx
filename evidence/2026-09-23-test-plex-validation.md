@@ -485,3 +485,40 @@ by fallback. Full Go tests passed. The test image
 `sha256:74d7cc80bfd2e9b2fb62fbd53ea9996a75e8210f709d1b096ad5baca98c2c85b`)
 is deployed and healthy with zero restarts. This improves repeat library loads
 after one successful response; it does not cover uncached deeper offsets.
+
+## User-scoped full collection windows (24 September)
+
+The operator confirmed that blank deeper items occurred across all
+collections, so a fix limited to named collections would not address the
+pattern. Replx previously warmed only two exact first-page profiles
+(start 12, size 24); Plex Web requested other starts and sizes as the
+operator scrolled. Aggregarr's 55 active promoted collections make that
+mismatch repeat across the catalogue.
+
+The operator approved encrypted retention of validated user tokens for
+per-user background warming. Commit `9ce2d56` stores a validated token only
+as AES-GCM ciphertext under a separate key purpose, clears it after a
+confirmed rejection, and uses it to refresh tracked pages in the matching
+user scope. Daily retention clears tokens unused for 30 days. Commit
+`161df4d` backs off failed refreshes to avoid retrying a slow PMS every two
+seconds. The live PostgreSQL tests for encryption, revocation, scope
+isolation, and retention passed on an isolated `replx_edge_test` database.
+Image `0.4.0-161df4d-test` was deployed healthy with zero restarts.
+
+Commit `603443f` adds a per-user complete JSON collection window. A bounded
+background pass rotates through the collection catalogue and exact browser
+query profiles, fetching up to four windows for one user at a time with that
+user's credential. The cache key removes only the two pagination parameters;
+it retains user scope, all other query fields, response representation, and
+invalidation generations. Replx slices a covered window into the requested
+page while preserving Plex's `totalSize`; incomplete windows fall through to
+Plex. Unit tests and live PostgreSQL tests passed. Test image
+`0.4.0-603443f-test` (image ID
+`sha256:7d57546caaff5c7a0b798330afc0c4ce205310babd98688c7aa6c64162399857`)
+was deployed healthy with zero restarts. The first four reported window
+passes fetched four pages each with zero errors. Cached window keys were
+present for both the owner and managed-user scopes. A direct request for
+a managed-user deep page (start 36, size 39) returned HTTP 200 with Replx's
+`window` cache state and 39 items in 0.75 seconds including token validation.
+That is a server-side proof for one page, not yet a complete browser proof
+for all 55 collections. Background coverage is still filling.

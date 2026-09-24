@@ -235,6 +235,9 @@ func (w *Warmer) RefreshOnce(ctx context.Context) {
 		if _, ok := cache.FallbackTTL(t.snap.Path); ok {
 			timeout = 90 * time.Second
 		}
+		if collectionWindowRequest(t.snap) {
+			timeout = 45 * time.Second
+		}
 		requestCtx, cancel := context.WithTimeout(ctx, timeout)
 		err := w.refresh(requestCtx, k, t.snap, token)
 		cancel()

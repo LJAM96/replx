@@ -123,7 +123,26 @@ After Plex validates a user token, Replx stores it encrypted under a separate
 key purpose and refreshes that user's previously requested pages in the same
 cache scope. Rejected tokens are cleared, and tokens unused for 30 days are
 cleared by retention. Raw tokens are never logged or used in cache keys. This
-refresh does not populate unseen scroll positions.
+Tracked-page refresh alone does not populate unseen scroll positions.
+
+## Collection scroll windows
+
+For JSON collection-child requests, a background pass fetches up to four
+complete windows for one recently active user every 30 seconds. It rotates
+through collection IDs found in the owner's collection lists and the
+configured browser query profiles. Every fetch uses the target user's own
+validated credential; Plex enforces that user's visibility. The resulting
+window is cached under that user's scope, non-pagination query fields,
+representation and invalidation generations. A later page request can be
+served locally only when the requested range is fully covered by the window.
+The proxy preserves Plex's `totalSize`, returns the requested `offset` and
+`size`, and never uses a window for a different user or query profile.
+
+Windows remain available for two hours while successful warm refreshes
+replace them. A collection that has not completed its first full fetch, a
+response larger than the cache limit, and a range beyond the fetched window
+still go to Plex. This preloading is bounded to avoid flooding Plex and may
+take several passes to cover a large collection catalogue.
 The admin cache statistics expose cumulative preload page, artwork, and error
 counts plus the time of the last completed pass.
 
