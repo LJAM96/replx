@@ -522,3 +522,13 @@ a managed-user deep page (start 36, size 39) returned HTTP 200 with Replx's
 `window` cache state and 39 items in 0.75 seconds including token validation.
 That is a server-side proof for one page, not yet a complete browser proof
 for all 55 collections. Background coverage is still filling.
+
+The first window rollout used a 30-second pause between bounded passes.
+Cached entries reached both scopes (28 owner and 24 managed-user windows)
+without reported preload errors. Commit `5e3523a` reduced that pause to ten
+seconds after each pass and limited full-window refreshes to 45 seconds.
+The test image `0.4.0-5e3523a-test` (image ID
+`sha256:b730d2d8b88495c24b5b7ec4a0230dcdde41c674a6b0640c429044177c405b10`)
+was deployed healthy with zero restarts. Two subsequent full-window passes
+reported four pages and zero errors each; user-specific window count continued
+to rise. This is still a staged test, not a production reliability gate.
