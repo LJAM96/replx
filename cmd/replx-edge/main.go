@@ -348,6 +348,7 @@ func runServe() error {
 		return thumbs, rows.Err()
 	}
 	go warm.RunPreload(ctx, 5*time.Minute)
+	go warm.RunCollectionWindows(ctx, 30*time.Second)
 
 	onboard := &onboarding.Service{
 		DB:          db.Raw(),

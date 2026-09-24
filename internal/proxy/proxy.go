@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -325,6 +326,64 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 	return true
 }
 
+// serveCollectionWindow answers a paged collection request from a complete
+// user-scoped JSON window. The exact user, non-pagination query, response
+// format and invalidation generations must match. PMS permissions are
+// revalidated by the identity resolver before any local response is used.
+func (h *Handler) serveCollectionWindow(w http.ResponseWriter, r *http.Request, id string, o *obs, start time.Time) bool {
+	if h.cache == nil || !o.cacheable || o.invalid || !o.fresh || r.Method != http.MethodGet ||
+		!strings.HasPrefix(r.URL.Path, "/library/collections/") || !strings.HasSuffix(r.URL.Path, "/children") ||
+		!strings.Contains(strings.ToLower(r.Header.Get("Accept")), "json") {
+		return false
+	}
+	var offset, count int
+	var haveOffset, haveCount bool
+	for k, values := range r.URL.Query() {
+		if len(values) == 0 {
+			continue
+		}
+		switch strings.ToLower(k) {
+		case "x-plex-container-start":
+			offset, haveOffset = parseWindowNumber(values[0])
+		case "x-plex-container-size":
+			count, haveCount = parseWindowNumber(values[0])
+		}
+	}
+	if !haveOffset || !haveCount {
+		return false
+	}
+	class := cache.ClassOf(r.URL.Path)
+	sg, gg := h.gens.Get(o.scope, class)
+	key := cache.CollectionWindowKeyGen(o.scope, class, r.Method, r.URL.Path, r.URL.Query(), r.Header.Get("Accept"), sg, gg)
+	entry, ok, err := h.cache.Get(r.Context(), key)
+	if err != nil || !ok || entry.Status != http.StatusOK || !strings.Contains(strings.ToLower(entry.ContentType), "json") {
+		return false
+	}
+	body, ok := cache.CollectionWindowPage(entry.Body, offset, count)
+	if !ok {
+		return false
+	}
+	o.cacheState = "window"
+	if h.metrics != nil {
+		h.metrics.IncCacheHit()
+		h.metrics.ObserveHTTP("control", http.StatusOK, time.Since(start))
+	}
+	w.Header().Set(RequestIDHeader, id)
+	w.Header().Set(CacheHeader, "window")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.Header().Set("Content-Type", entry.ContentType)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	h.emit(r, id, *o, "control", http.StatusOK, start, map[string]any{"bodyBytes": len(body)})
+	return true
+}
+
+func parseWindowNumber(s string) (int, bool) {
+	n, err := strconv.Atoi(s)
+	return n, err == nil && n >= 0
+}
+
 // serveStale keeps an already visited structural page responsive while Plex
 // is slow. A validated credential and the exact user/query cache key are
 // required; Continue Watching and playback state never use this path.
@@ -491,6 +550,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if routeClass == "control" && h.serveCache(w, r, id, &o, start) {
+		return
+	}
+	if routeClass == "control" && h.serveCollectionWindow(w, r, id, &o, start) {
 		return
 	}
 	if routeClass == "control" && h.serveStale(w, r, id, &o, start) {

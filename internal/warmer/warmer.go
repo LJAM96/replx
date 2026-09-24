@@ -47,14 +47,16 @@ type Snapshot struct {
 
 // Stats is the operator-visible warmer state.
 type Stats struct {
-	Tracked         int   `json:"tracked"`
-	Refreshed       int64 `json:"refreshed"`
-	Errors          int64 `json:"errors"`
-	OwnerWarming    bool  `json:"ownerWarming"`
-	PreloadPages    int64 `json:"preloadPages"`
-	PreloadArtwork  int64 `json:"preloadArtwork"`
-	PreloadErrors   int64 `json:"preloadErrors"`
-	LastPreloadUnix int64 `json:"lastPreloadUnix"`
+	Tracked          int   `json:"tracked"`
+	Refreshed        int64 `json:"refreshed"`
+	Errors           int64 `json:"errors"`
+	OwnerWarming     bool  `json:"ownerWarming"`
+	PreloadPages     int64 `json:"preloadPages"`
+	PreloadArtwork   int64 `json:"preloadArtwork"`
+	PreloadErrors    int64 `json:"preloadErrors"`
+	UserWindowPages  int64 `json:"userWindowPages"`
+	UserWindowErrors int64 `json:"userWindowErrors"`
+	LastPreloadUnix  int64 `json:"lastPreloadUnix"`
 }
 
 // Warmer refreshes due owner-scoped entries against the origin.
@@ -87,16 +89,20 @@ type Warmer struct {
 	client                 *http.Client
 	now                    func() time.Time
 
-	mu               sync.Mutex
-	tracked          map[string]tracked
-	refreshed        int64
-	errors           int64
-	warming          bool
-	preloadPages     int64
-	preloadedArtwork int64
-	preloadErrors    int64
-	lastPreloadUnix  int64
-	collectionCursor int
+	mu                sync.Mutex
+	tracked           map[string]tracked
+	refreshed         int64
+	errors            int64
+	warming           bool
+	preloadPages      int64
+	preloadedArtwork  int64
+	preloadErrors     int64
+	lastPreloadUnix   int64
+	collectionCursor  int
+	windowCursors     map[string]int
+	windowScopeCursor int
+	userWindowPages   int64
+	userWindowErrors  int64
 }
 
 type tracked struct {
@@ -114,7 +120,7 @@ func New(store cache.Store, origin, secret string,
 		ownerToken: ownerToken, log: logger, metrics: reg,
 		client:  originClientFor(origin),
 		now:     time.Now,
-		tracked: map[string]tracked{},
+		tracked: map[string]tracked{}, windowCursors: map[string]int{},
 	}
 }
 
@@ -310,6 +316,7 @@ func (w *Warmer) Stats() Stats {
 	return Stats{Tracked: len(w.tracked), Refreshed: w.refreshed, Errors: w.errors,
 		OwnerWarming: w.warming, PreloadPages: w.preloadPages,
 		PreloadArtwork: w.preloadedArtwork, PreloadErrors: w.preloadErrors,
+		UserWindowPages: w.userWindowPages, UserWindowErrors: w.userWindowErrors,
 		LastPreloadUnix: w.lastPreloadUnix}
 }
 
@@ -429,6 +436,27 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 	if err := w.store.Set(ctx, storeKey, entry, s.TTL); err != nil {
 		return err
 	}
+	if collectionWindowRequest(s) && strings.Contains(strings.ToLower(entry.ContentType), "json") {
+		if _, valid := cache.CollectionWindowPage(body, 0, 1); valid {
+			q, _ := url.ParseQuery(s.RawQuery)
+			for k := range q {
+				if strings.EqualFold(k, "X-Plex-Container-Start") || strings.EqualFold(k, "X-Plex-Container-Size") {
+					q.Del(k)
+				}
+			}
+			windowSnap := s
+			windowSnap.RawQuery = q.Encode()
+			windowKey := ""
+			if w.KeyFunc != nil {
+				windowKey = w.KeyFunc(windowSnap) + ":window"
+			} else {
+				windowKey = cache.CollectionWindowKeyGen(s.Scope, s.Class, s.Method, s.Path, q, s.Accept, 0, 0)
+			}
+			if err := w.store.Set(ctx, windowKey, entry, cache.CollectionWindowTTL); err != nil {
+				return err
+			}
+		}
+	}
 	if ttl, ok := cache.FallbackTTL(s.Path); ok {
 		if err := w.store.Set(ctx, cache.StaleKey(storeKey), entry, ttl); err != nil {
 			return err
@@ -443,6 +471,30 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 		}
 	}
 	return nil
+}
+
+func collectionWindowRequest(s Snapshot) bool {
+	if !strings.HasPrefix(s.Path, "/library/collections/") || !strings.HasSuffix(s.Path, "/children") {
+		return false
+	}
+	q, err := url.ParseQuery(s.RawQuery)
+	if err != nil {
+		return false
+	}
+	start, size := "", ""
+	for k, values := range q {
+		if len(values) == 0 {
+			continue
+		}
+		switch strings.ToLower(k) {
+		case "x-plex-container-start":
+			start = values[0]
+		case "x-plex-container-size":
+			size = values[0]
+		}
+	}
+	n, err := strconv.Atoi(size)
+	return start == "0" && err == nil && n >= 350
 }
 
 // stripSecrets drops token-bearing params from a raw query so snapshots

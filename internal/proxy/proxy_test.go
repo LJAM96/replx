@@ -556,6 +556,40 @@ func TestCollectionStaleServesImmediatelyAndRefreshesOnlyItsUser(t *testing.T) {
 	}
 }
 
+func TestCollectionWindowServesDeepPageOnlyToValidatedUser(t *testing.T) {
+	const secret = "collection-window-test-secret-0123456789"
+	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("window hit reached origin")
+	}))
+	defer origin.Close()
+	store := cache.NewMemory()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct", Secret: secret, Cache: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/collections/101/children?includeMeta=1&X-Plex-Container-Start=1&X-Plex-Container-Size=2", nil)
+	req.Header.Set("Accept", "application/json")
+	class := cache.ClassOf(req.URL.Path)
+	key := cache.CollectionWindowKeyGen("tok:user-a", class, req.Method, req.URL.Path, req.URL.Query(), req.Header.Get("Accept"), 0, 0)
+	if err := store.Set(context.Background(), key, cache.Entry{Status: 200, ContentType: "application/json",
+		Body: []byte(`{"MediaContainer":{"offset":0,"size":3,"totalSize":3,"Metadata":[{"title":"a"},{"title":"b"},{"title":"c"}]}}`)}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	userA := obs{scope: "tok:user-a", cacheable: true, fresh: true}
+	rec := httptest.NewRecorder()
+	if !h.serveCollectionWindow(rec, req, "request-a", &userA, time.Now()) || rec.Code != 200 || rec.Header().Get(CacheHeader) != "window" || !strings.Contains(rec.Body.String(), `"title":"b"`) || strings.Contains(rec.Body.String(), `"title":"a"`) {
+		t.Fatalf("deep page not served correctly: status=%d cache=%q body=%q", rec.Code, rec.Header().Get(CacheHeader), rec.Body.String())
+	}
+	other := obs{scope: "tok:user-b", cacheable: true, fresh: true}
+	if h.serveCollectionWindow(httptest.NewRecorder(), req, "request-b", &other, time.Now()) {
+		t.Fatal("another user read the first user's window")
+	}
+	unvalidated := obs{scope: "tok:user-a", cacheable: true}
+	if h.serveCollectionWindow(httptest.NewRecorder(), req, "request-c", &unvalidated, time.Now()) {
+		t.Fatal("unvalidated token read local window")
+	}
+}
+
 func TestCollectionStaleRequiresValidatedCredential(t *testing.T) {
 	const secret = "test-secret-key-for-beta-slice-0123456789"
 	hits := 0
