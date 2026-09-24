@@ -19,7 +19,7 @@ const maxWindowsPerPass = 4
 // never hold process readiness or other cache maintenance hostage.
 func (w *Warmer) RunCollectionWindows(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
-		interval = 30 * time.Second
+		interval = 10 * time.Second
 	}
 	for {
 		w.PreloadCollectionWindowsOnce(ctx)

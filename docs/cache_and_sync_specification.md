@@ -128,7 +128,8 @@ Tracked-page refresh alone does not populate unseen scroll positions.
 ## Collection scroll windows
 
 For JSON collection-child requests, a background pass fetches up to four
-complete windows for one recently active user every 30 seconds. It rotates
+complete windows for one recently active user every 10 seconds after the
+previous pass completes. It rotates
 through collection IDs found in the owner's collection lists and the
 configured browser query profiles. Every fetch uses the target user's own
 validated credential; Plex enforces that user's visibility. The resulting
