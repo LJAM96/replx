@@ -162,7 +162,7 @@ func TestLiveValidatedTokenEncryptedAndRevoked(t *testing.T) {
 	r2 := New(r.DB, &fakeTV{code: 401})
 	r2.PMS = &fakePMSValidator{valid: false}
 	r2.Secret = secret
-	if _, err := r.DB.Exec(context.Background(), `UPDATE plex_token_identities SET last_validated_at=now()-make_interval(minutes => 10)
+	if _, err := r.DB.Exec(context.Background(), `UPDATE plex_token_identities SET last_validated_at=now()-make_interval(mins => 10)
 		WHERE server_id=$1 AND token_fingerprint=$2`, serverID, fingerprint); err != nil {
 		t.Fatal(err)
 	}
