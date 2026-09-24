@@ -532,3 +532,13 @@ The test image `0.4.0-5e3523a-test` (image ID
 was deployed healthy with zero restarts. Two subsequent full-window passes
 reported four pages and zero errors each; user-specific window count continued
 to rise. This is still a staged test, not a production reliability gate.
+
+After the accelerated pass completed, Replx held 110 owner and 110 managed-user
+collection windows. A check against Aggregarr's 55 active collection IDs and
+the two configured browser profiles found all 110 Luke variants present.
+Every Luke window was complete (`Metadata` count equaled Plex `totalSize`),
+with collection sizes from 0 to 347 items; none exceeded the requested
+350-item window. Recent pass logs reported zero errors. This proves cache
+coverage for the configured Zen profiles at that moment. It does not prove
+that Plex Web will request only those profiles, nor that image loading and
+library browsing are fast. Operator scroll feedback is pending.
