@@ -610,3 +610,35 @@ slowdown; the remaining delay was in Home hub requests: three 200 misses took
 in account/sidebar context fields. No unsafe cross-user hub normalization was
 applied. Home first-visit performance and Plex origin timeout resilience remain
 open production gates.
+
+## 2026-09-25: Home promotion reduction and private Home warmer
+
+At the operator's request, Aggregarr's Home promotion flags were reduced from 55
+active collections to 35. The 20 hidden from Home remain active and available
+in Collections and library recommendations. IMDb Top 250 was removed from Home;
+Horror and Romance movie and TV rows were restored. The Aggregarr settings and
+Plex's live Home hub flags were verified to agree for all 20 changed rows.
+Aggregarr's full sync stalled loading its shared library cache, so the 20 Plex
+flags were changed through the same Plex hub management endpoint Aggregarr uses.
+Backups of the Aggregarr settings and prior Plex flags were saved on oi-2.
+
+A direct Plex origin probe after the reduction still took 26.2 seconds for one
+promoted TV Home section, so the lower row count by itself does not establish
+fast Home loads. Commit `bd2e41a` adds persistent, secret-stripped per-user Home
+query profiles and a bounded separate warmer for active users' pinned sections.
+Each refresh uses that user's validated retained token and exact user cache
+scope. Promoted Home cache keys ignore viewport size while preserving user,
+section, pinned sections, other query fields, representation, and invalidation
+namespaces. Continue Watching keeps its separate short-refresh policy. The
+admin dashboard now displays Home warming counts and time alongside collection
+warming. A focused managed-user test checked exact token use and absence of
+owner-scope leakage. `go vet ./...`, `go test ./...`, and dashboard JavaScript
+syntax checks passed.
+
+Image `0.4.0-bd2e41a-test` (ID
+`sha256:6533c142b2d1859cfe6fd5ea8227b1eb25da498efbbc401f4eb7c954397ab8ed`)
+was deployed to oi-2. Docker reported healthy and zero restarts;
+`/health/ready` returned 200, `/admin` without a session returned 401, and
+`/admin/login` returned 200. One Home profile had been saved shortly after
+deployment. Luke's browser latency and completeness retest is pending, so this
+remains a staged test, not a production reliability gate result.
