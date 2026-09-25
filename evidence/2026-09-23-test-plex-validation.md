@@ -808,3 +808,12 @@ each with one CORS origin value. Luke reported 4K TV Shows opened almost
 immediately; its first hub request was still a 1.43-second cache miss, and
 some deeper library page requests took 3–7 seconds. Warm coverage for every
 user and library remains to be measured before production readiness.
+
+Commit `ca961f2` adds per-user library hub warm counts, errors and the last
+warm time to the admin dashboard and logs successful or failed warm passes
+without user identifiers. The full Go suite, `go vet ./...` and a JavaScript
+syntax check passed. Test image `0.4.0-ca961f2-test` (ID
+`sha256:825549f44ceb220bddcf72cb1f1d8d731f8bbf7ad584ca0c8fdb66314786b321`)
+was deployed healthy with zero restarts; `/health/ready` returned 200 and a
+public `/media/providers` probe returned 200 with one CORS origin value.
+The Luke 4K Movies first-visit retest is pending.
