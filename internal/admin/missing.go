@@ -182,8 +182,10 @@ func (m *Mux) handleUsers(w http.ResponseWriter, r *http.Request) {
 	m.usersMu.Unlock()
 	limit, offset := parseCursor(r, 50, 200)
 	rows, err := m.svc.DB.Query(r.Context(), `SELECT i.id::text, COALESCE(i.plex_account_id,0), COALESCE(i.username,''),
-		COALESCE(i.friendly_name,''), i.identity_type, COALESCE(i.restricted,false)
+		COALESCE(i.friendly_name,''), i.identity_type, COALESCE(i.restricted,false),
+		COALESCE(i.plex_account_id=c.plex_account_id,false)
 		FROM plex_identities i JOIN plex_servers s ON s.id=i.server_id
+		LEFT JOIN plex_owner_credentials c ON c.server_id=s.id
 		WHERE s.enabled ORDER BY i.created_at DESC LIMIT $1 OFFSET $2`, limit+1, offset)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "USERS_FAILED", err.Error())
@@ -197,11 +199,12 @@ func (m *Mux) handleUsers(w http.ResponseWriter, r *http.Request) {
 		Name       string `json:"friendlyName,omitempty"`
 		Type       string `json:"type"`
 		Restricted bool   `json:"restricted,omitempty"`
+		Owner      bool   `json:"owner"`
 	}
 	var out []u
 	for rows.Next() {
 		var rr u
-		if err := rows.Scan(&rr.ID, &rr.Account, &rr.Username, &rr.Name, &rr.Type, &rr.Restricted); err != nil {
+		if err := rows.Scan(&rr.ID, &rr.Account, &rr.Username, &rr.Name, &rr.Type, &rr.Restricted, &rr.Owner); err != nil {
 			writeError(w, http.StatusBadGateway, "USERS_FAILED", err.Error())
 			return
 		}
