@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,67 @@ import (
 	"strings"
 	"time"
 )
+
+// SharedUser is a Plex account with accepted access to the selected server.
+type SharedUser struct {
+	AccountID    int64
+	Username     string
+	FriendlyName string
+	Restricted   bool
+}
+
+// ListUsersWithServerAccess reads the owner's Plex sharing list, including
+// friends outside Plex Home. Matching the machine identifier prevents users
+// shared only with another server from appearing in this server's dashboard.
+func (c *Client) ListUsersWithServerAccess(ctx context.Context, token, machineID string) ([]SharedUser, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/api/users", token)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/xml")
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("plex.tv users: HTTP %d", resp.StatusCode)
+	}
+	var document struct {
+		Users []struct {
+			ID           int64  `xml:"id,attr"`
+			Username     string `xml:"username,attr"`
+			Title        string `xml:"title,attr"`
+			FriendlyName string `xml:"friendlyName,attr"`
+			Restricted   bool   `xml:"restricted,attr"`
+			Servers      []struct {
+				MachineID    string `xml:"machineIdentifier,attr"`
+				NumLibraries int    `xml:"numLibraries,attr"`
+				Pending      bool   `xml:"pending,attr"`
+			} `xml:"Server"`
+		} `xml:"User"`
+	}
+	if err := xml.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&document); err != nil {
+		return nil, fmt.Errorf("plex.tv users: decode: %w", err)
+	}
+	users := make([]SharedUser, 0, len(document.Users))
+	for _, user := range document.Users {
+		if user.ID <= 0 {
+			continue
+		}
+		for _, server := range user.Servers {
+			if server.MachineID == machineID && server.NumLibraries > 0 && !server.Pending {
+				name := user.FriendlyName
+				if name == "" {
+					name = user.Title
+				}
+				users = append(users, SharedUser{AccountID: user.ID, Username: user.Username, FriendlyName: name, Restricted: user.Restricted})
+				break
+			}
+		}
+	}
+	return users, nil
+}
 
 // Client talks to plex.tv (or a test double via BaseURL).
 type Client struct {

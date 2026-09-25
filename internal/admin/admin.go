@@ -69,6 +69,8 @@ type Mux struct {
 	checks         health.Checks
 	rateMu         sync.Mutex
 	rate           map[string][]time.Time
+	usersMu        sync.Mutex
+	lastUsersSync  time.Time
 	// invalidator retires cache namespaces (wired to the proxy
 	// generations in production). Nil keeps audit-only behaviour.
 	invalidator func(scope, class string)

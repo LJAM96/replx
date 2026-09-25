@@ -318,6 +318,46 @@ func (s *Service) ownerTokenForAdmin(ctx context.Context) (string, bool) {
 	return string(pt), true
 }
 
+// SyncSharedUsers adds Plex accounts with accepted library access to the
+// selected server, even if they have never opened Replx. Tokens remain in
+// process memory and are never included in the admin response.
+func (s *Service) SyncSharedUsers(ctx context.Context) error {
+	var clientID, machineID string
+	if err := s.DB.QueryRow(ctx, `SELECT c.replx_edge_client_identifier, sv.machine_identifier
+		FROM plex_owner_credentials c JOIN plex_servers sv ON sv.id=c.server_id
+		WHERE sv.enabled ORDER BY sv.created_at DESC LIMIT 1`).Scan(&clientID, &machineID); err != nil {
+		return fmt.Errorf("shared users: no selected server: %w", err)
+	}
+	token, ok := s.ownerTokenForAdmin(ctx)
+	if !ok {
+		return fmt.Errorf("shared users: owner credential unavailable")
+	}
+	defer zero(&token)
+	client, ok := s.NewTV(clientID).(interface {
+		ListUsersWithServerAccess(context.Context, string, string) ([]plextv.SharedUser, error)
+	})
+	if !ok {
+		return fmt.Errorf("shared users: Plex client does not support user listing")
+	}
+	users, err := client.ListUsersWithServerAccess(ctx, token, machineID)
+	if err != nil {
+		return err
+	}
+	for _, user := range users {
+		if _, err := s.DB.Exec(ctx, `INSERT INTO plex_identities(server_id, plex_account_id, username, friendly_name, identity_type, restricted)
+			SELECT id, $1, $2, $3, 'user', $4 FROM plex_servers WHERE enabled
+			ON CONFLICT DO NOTHING`, user.AccountID, user.Username, user.FriendlyName, user.Restricted); err != nil {
+			return fmt.Errorf("shared users: insert identity: %w", err)
+		}
+		if _, err := s.DB.Exec(ctx, `UPDATE plex_identities SET username=$2, friendly_name=$3, restricted=$4, updated_at=now()
+			WHERE plex_account_id=$1 AND server_id IN (SELECT id FROM plex_servers WHERE enabled)`,
+			user.AccountID, user.Username, user.FriendlyName, user.Restricted); err != nil {
+			return fmt.Errorf("shared users: update identity: %w", err)
+		}
+	}
+	return nil
+}
+
 // SelectResource binds exactly one PMS resource: it verifies the internal
 // origin reports the same machineIdentifier, picks the client reachable
 // media origin, then creates the single enabled server row and its owner

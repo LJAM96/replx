@@ -169,6 +169,17 @@ func (m *Mux) handleUsers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "USERS_DISABLED", "no database wired")
 		return
 	}
+	// The local identity table is populated as users visit Replx. Refresh
+	// Plex's sharing list so people with library access appear before they
+	// visit; retain the last good table if plex.tv is temporarily unavailable.
+	m.usersMu.Lock()
+	if time.Since(m.lastUsersSync) >= 5*time.Minute {
+		m.lastUsersSync = time.Now()
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		_ = m.svc.SyncSharedUsers(ctx)
+		cancel()
+	}
+	m.usersMu.Unlock()
 	limit, offset := parseCursor(r, 50, 200)
 	rows, err := m.svc.DB.Query(r.Context(), `SELECT id::text, COALESCE(plex_account_id,0), COALESCE(username,''),
 		COALESCE(friendly_name,''), identity_type, COALESCE(restricted,false)

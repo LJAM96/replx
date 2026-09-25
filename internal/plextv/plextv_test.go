@@ -70,6 +70,22 @@ func testClient(srv *httptest.Server) *Client {
 	return &Client{BaseURL: srv.URL, ClientIdentifier: "replx-edge-test-id", Product: "Replx Edge", Version: "dev", Platform: "Linux"}
 }
 
+func TestListUsersWithServerAccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/users" || r.Header.Get("X-Plex-Token") != "owner-token" || r.Header.Get("Accept") != "application/xml" {
+			t.Errorf("unexpected Plex request")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`<MediaContainer><User id="10" username="Billy" title="Billy" restricted="0"><Server machineIdentifier="selected" numLibraries="2" pending="0"/></User><User id="11" username="Jodie" friendlyName="Jodie" restricted="1"><Server machineIdentifier="selected" numLibraries="1" pending="0"/></User><User id="12" username="other"><Server machineIdentifier="other" numLibraries="2" pending="0"/></User><User id="13" username="pending"><Server machineIdentifier="selected" numLibraries="2" pending="1"/></User></MediaContainer>`))
+	}))
+	defer srv.Close()
+	users, err := testClient(srv).ListUsersWithServerAccess(t.Context(), "owner-token", "selected")
+	if err != nil || len(users) != 2 || users[0].Username != "Billy" || users[1].FriendlyName != "Jodie" || !users[1].Restricted {
+		t.Fatalf("shared users: %+v, %v", users, err)
+	}
+}
+
 func TestPINFlow(t *testing.T) {
 	srv, claimed := fakePlexTV(t)
 	c := testClient(srv)
