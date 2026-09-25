@@ -150,10 +150,11 @@ func ResponseKeyGen(scope, class, method, path string, query url.Values, accept 
 	// Plex Web reports viewport changes on promoted Home requests. They do
 	// not select hubs, so keep the user and all Home selection parameters
 	// while sharing one response across browser window sizes.
-	if path == "/hubs/promoted" {
+	if path == "/hubs/promoted" || sectionHubPath(path) {
 		q := url.Values{}
 		for k, vals := range query {
-			if strings.EqualFold(k, "X-Plex-Device-Screen-Resolution") {
+			if strings.EqualFold(k, "X-Plex-Device-Screen-Resolution") ||
+				(sectionHubPath(path) && (strings.EqualFold(k, "X-Plex-Client-Identifier") || strings.EqualFold(k, "X-Plex-Model"))) {
 				continue
 			}
 			q[k] = vals
@@ -190,6 +191,22 @@ func ResponseKeyGen(scope, class, method, path string, query url.Values, accept 
 	}
 	return fmt.Sprintf("replx_edge:%s:%s:%s:%s:%s:%d:%d:%s",
 		SchemaVersion, "default", class, scope, rep, scopeGen, globalGen, hex.EncodeToString(sum[:])[:16])
+}
+
+func sectionHubPath(path string) bool {
+	if !strings.HasPrefix(path, "/hubs/sections/") {
+		return false
+	}
+	id := strings.TrimPrefix(path, "/hubs/sections/")
+	if id == "" {
+		return false
+	}
+	for _, c := range id {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ClassOf partitions a path into an invalidation namespace. Continue

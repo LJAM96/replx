@@ -94,26 +94,28 @@ type Warmer struct {
 	client                 *http.Client
 	now                    func() time.Time
 
-	mu                sync.Mutex
-	tracked           map[string]tracked
-	refreshed         int64
-	errors            int64
-	warming           bool
-	preloadPages      int64
-	preloadedArtwork  int64
-	preloadErrors     int64
-	lastPreloadUnix   int64
-	lastWindowUnix    int64
-	lastRefreshUnix   int64
-	collectionCursor  int
-	windowCursors     map[string]int
-	windowScopeCursor int
-	userWindowPages   int64
-	userWindowErrors  int64
-	homeScopeCursor   int
-	userHomePages     int64
-	userHomeErrors    int64
-	lastHomeUnix      int64
+	mu                 sync.Mutex
+	tracked            map[string]tracked
+	refreshed          int64
+	errors             int64
+	warming            bool
+	preloadPages       int64
+	preloadedArtwork   int64
+	preloadErrors      int64
+	lastPreloadUnix    int64
+	lastWindowUnix     int64
+	lastRefreshUnix    int64
+	collectionCursor   int
+	windowCursors      map[string]int
+	windowScopeCursor  int
+	userWindowPages    int64
+	userWindowErrors   int64
+	homeScopeCursor    int
+	sectionScopeCursor int
+	sectionCursors     map[string]int
+	userHomePages      int64
+	userHomeErrors     int64
+	lastHomeUnix       int64
 }
 
 type tracked struct {
@@ -131,7 +133,7 @@ func New(store cache.Store, origin, secret string,
 		ownerToken: ownerToken, log: logger, metrics: reg,
 		client:  originClientFor(origin),
 		now:     time.Now,
-		tracked: map[string]tracked{}, windowCursors: map[string]int{},
+		tracked: map[string]tracked{}, windowCursors: map[string]int{}, sectionCursors: map[string]int{},
 	}
 }
 
@@ -153,6 +155,9 @@ func (w *Warmer) Track(key string, s Snapshot) {
 	s.RawQuery = stripSecrets(s.RawQuery)
 	if s.Method == http.MethodGet && s.Path == "/hubs/promoted" {
 		w.saveHomeProfile(s)
+	}
+	if s.Method == http.MethodGet && sectionHubPath(s.Path) {
+		w.saveSectionHubProfile(s)
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
