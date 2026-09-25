@@ -748,3 +748,63 @@ cache or another Plex connection; the browser request hostname and repeat
 opening time are needed before attributing that 11-second delay to the edge
 cache or claiming a performance improvement. The edge container remained
 healthy with zero restarts.
+
+## 2026-09-25: library route and CORS connection failure
+
+Zen's Movies opening took roughly 30 seconds with `plex.direct` unblocked.
+The matching Replx trace had no `/library/sections/*` request, and the
+browser's Network panel confirmed a `plex.direct` hostname. A controlled
+owner `/library/sections/23/all` probe took 3.68 seconds directly against
+PMS and 0.76 seconds via Replx (a Replx cache miss). Those numbers do not
+explain the entire 30-second browser wait, but they prove this library test
+bypassed Replx.
+
+Lukeflix's custom server access URLs listed the working direct Plex address
+and Replx. Reordering them in PMS settings did not change the plex.tv
+resource order: direct remained first. The direct custom URL was removed for
+a reversible discovery test, leaving `https://replex.lukemulvaney.com:443`
+as the sole custom URL. Plex then published Replx as the first usable remote
+address. The original direct endpoint still answers when called explicitly;
+Plex's automatically detected remote address timed out. The previous settings
+were backed up on `oi-2` at
+`deploy/custom-connections.before-direct-removal-test.json`. Automatic
+direct fallback is therefore unavailable in this test configuration; this
+tradeoff needs a production decision.
+
+With Replx selected, Zen reported Lukeflix offline. Its Console identified
+the exact failure: `/media/providers` had two identical
+`Access-Control-Allow-Origin` headers, which Firefox rejected. A public
+authenticated probe confirmed two values on Replx and one on PMS. Replx had
+seeded a CORS header before proxying, then appended the origin's CORS header.
+Commit `c66d628` makes copied origin headers replace preseeded values and adds
+a regression test. Full Go tests and `go vet ./...` passed. Test image
+`0.4.0-c66d628-test` was deployed healthy with zero restarts. Public
+`/media/providers` and `/library/sections` probes then returned HTTP 200 with
+exactly one allowed-origin value. Zen subsequently sent Movies requests
+through Replx, and Home and collections appeared quickly.
+
+## 2026-09-25: cold library hub and per-user preload
+
+After the CORS fix, Luke's first Movies opening still took about 24 seconds;
+its repeat opening was immediate. The matching Movies listing request through
+Replx took 0.27 seconds, and 55 poster requests completed within two seconds
+(52 artwork hits). Those server timings leave the first-open browser delay
+unexplained. A first TV Shows opening took 13 seconds. Its cold
+`/hubs/sections/22` request took 14.04 seconds and returned about 610 KB,
+matching that delay; no edge 5xx was recorded.
+
+Commit `2e9b9a4` adds bounded, user-scoped library hub preloading, using
+retained encrypted user tokens and the observed Plex Web query shape. It
+normalizes browser client ID, model, and screen resolution for exact section
+hub keys while retaining user, section, item count and content-selection
+parameters. It derives a current Plex Web profile for users who have not yet
+opened a library. The warmer fetches up to two hubs per pass for one recent
+user, to limit PMS load. Full Go tests and `go vet ./...` passed. Test image
+`0.4.0-2e9b9a4-test` (ID
+`sha256:5c82b81bc52f91f4ced9b9fc1f7e4f9861d67f78d8137c47720352c725cc83b3`)
+was deployed healthy with zero restarts. Owner library hub probes returned
+200 `stale` in 0.21 seconds for TV and 200 `hit` in 0.12 seconds for Movies,
+each with one CORS origin value. Luke reported 4K TV Shows opened almost
+immediately; its first hub request was still a 1.43-second cache miss, and
+some deeper library page requests took 3–7 seconds. Warm coverage for every
+user and library remains to be measured before production readiness.

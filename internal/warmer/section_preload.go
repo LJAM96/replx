@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/LJAM96/replx/internal/cache"
+	"github.com/LJAM96/replx/internal/logging"
 )
 
 const maxUserSectionsPerPass = 2
@@ -112,6 +113,19 @@ func (w *Warmer) PreloadUserSectionsOnce(ctx context.Context) (pages, failures i
 	if w == nil || w.store == nil || w.KeyFunc == nil || w.PreloadSections == nil || w.DB == nil {
 		return 0, 0
 	}
+	defer func() {
+		w.mu.Lock()
+		w.userSectionPages += int64(pages)
+		w.userSectionErrors += int64(failures)
+		if pages > 0 {
+			w.lastSectionUnix = w.now().Unix()
+		}
+		w.mu.Unlock()
+		if w.log != nil && pages+failures > 0 {
+			w.log.Log(logging.Entry{Level: "info", Component: "cache",
+				Fields: map[string]any{"event": "user_section_hubs", "pages": pages, "errors": failures}})
+		}
+	}()
 	scopes := w.windowScopes(ctx)
 	if len(scopes) == 0 {
 		return 0, 0

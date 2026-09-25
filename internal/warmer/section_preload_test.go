@@ -71,6 +71,9 @@ func TestManagedSectionHubsWarmWithOwnToken(t *testing.T) {
 	if pages != 2 || failures != 0 || calls != 2 {
 		t.Fatalf("section pages=%d failures=%d calls=%d", pages, failures, calls)
 	}
+	if stats := w.Stats(); stats.UserSectionPages != 2 || stats.UserSectionErrors != 0 || stats.LastSectionUnix == 0 {
+		t.Fatalf("section warm stats: %+v", stats)
+	}
 	for _, id := range []string{"22", "23"} {
 		s := Snapshot{Method: http.MethodGet, Path: "/hubs/sections/" + id, Scope: scope,
 			Accept: preloadAccept, RawQuery: "count=12&includeMeta=1"}

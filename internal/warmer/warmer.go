@@ -47,21 +47,24 @@ type Snapshot struct {
 
 // Stats is the operator-visible warmer state.
 type Stats struct {
-	Tracked          int   `json:"tracked"`
-	Refreshed        int64 `json:"refreshed"`
-	Errors           int64 `json:"errors"`
-	OwnerWarming     bool  `json:"ownerWarming"`
-	PreloadPages     int64 `json:"preloadPages"`
-	PreloadArtwork   int64 `json:"preloadArtwork"`
-	PreloadErrors    int64 `json:"preloadErrors"`
-	UserWindowPages  int64 `json:"userWindowPages"`
-	UserWindowErrors int64 `json:"userWindowErrors"`
-	UserHomePages    int64 `json:"userHomePages"`
-	UserHomeErrors   int64 `json:"userHomeErrors"`
-	LastHomeUnix     int64 `json:"lastHomeUnix"`
-	LastPreloadUnix  int64 `json:"lastPreloadUnix"`
-	LastWindowUnix   int64 `json:"lastWindowUnix"`
-	LastRefreshUnix  int64 `json:"lastRefreshUnix"`
+	Tracked           int   `json:"tracked"`
+	Refreshed         int64 `json:"refreshed"`
+	Errors            int64 `json:"errors"`
+	OwnerWarming      bool  `json:"ownerWarming"`
+	PreloadPages      int64 `json:"preloadPages"`
+	PreloadArtwork    int64 `json:"preloadArtwork"`
+	PreloadErrors     int64 `json:"preloadErrors"`
+	UserWindowPages   int64 `json:"userWindowPages"`
+	UserWindowErrors  int64 `json:"userWindowErrors"`
+	UserHomePages     int64 `json:"userHomePages"`
+	UserHomeErrors    int64 `json:"userHomeErrors"`
+	UserSectionPages  int64 `json:"userSectionPages"`
+	UserSectionErrors int64 `json:"userSectionErrors"`
+	LastHomeUnix      int64 `json:"lastHomeUnix"`
+	LastSectionUnix   int64 `json:"lastSectionUnix"`
+	LastPreloadUnix   int64 `json:"lastPreloadUnix"`
+	LastWindowUnix    int64 `json:"lastWindowUnix"`
+	LastRefreshUnix   int64 `json:"lastRefreshUnix"`
 }
 
 // Warmer refreshes due owner-scoped entries against the origin.
@@ -116,6 +119,9 @@ type Warmer struct {
 	userHomePages      int64
 	userHomeErrors     int64
 	lastHomeUnix       int64
+	userSectionPages   int64
+	userSectionErrors  int64
+	lastSectionUnix    int64
 }
 
 type tracked struct {
@@ -341,7 +347,9 @@ func (w *Warmer) Stats() Stats {
 		PreloadArtwork: w.preloadedArtwork, PreloadErrors: w.preloadErrors,
 		UserWindowPages: w.userWindowPages, UserWindowErrors: w.userWindowErrors,
 		UserHomePages: w.userHomePages, UserHomeErrors: w.userHomeErrors,
+		UserSectionPages: w.userSectionPages, UserSectionErrors: w.userSectionErrors,
 		LastHomeUnix:    w.lastHomeUnix,
+		LastSectionUnix: w.lastSectionUnix,
 		LastPreloadUnix: w.lastPreloadUnix, LastWindowUnix: w.lastWindowUnix,
 		LastRefreshUnix: w.lastRefreshUnix}
 }
