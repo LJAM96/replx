@@ -181,9 +181,10 @@ func (m *Mux) handleUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	m.usersMu.Unlock()
 	limit, offset := parseCursor(r, 50, 200)
-	rows, err := m.svc.DB.Query(r.Context(), `SELECT id::text, COALESCE(plex_account_id,0), COALESCE(username,''),
-		COALESCE(friendly_name,''), identity_type, COALESCE(restricted,false)
-		FROM plex_identities ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit+1, offset)
+	rows, err := m.svc.DB.Query(r.Context(), `SELECT i.id::text, COALESCE(i.plex_account_id,0), COALESCE(i.username,''),
+		COALESCE(i.friendly_name,''), i.identity_type, COALESCE(i.restricted,false)
+		FROM plex_identities i JOIN plex_servers s ON s.id=i.server_id
+		WHERE s.enabled ORDER BY i.created_at DESC LIMIT $1 OFFSET $2`, limit+1, offset)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "USERS_FAILED", err.Error())
 		return
