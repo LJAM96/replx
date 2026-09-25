@@ -44,3 +44,20 @@ func TestCachedCORSUsesOnlyAnOrigin(t *testing.T) {
 		}
 	}
 }
+
+func TestBadGatewayRetainsPlexWebCORS(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	base := origin.URL
+	origin.Close()
+	h, err := New(Options{OriginBase: base, IngressMode: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/library/sections", nil)
+	req.Header.Set("Origin", "https://app.plex.tv")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway || rec.Header().Get("Access-Control-Allow-Origin") != "https://app.plex.tv" {
+		t.Fatalf("bad gateway lost browser origin: status=%d cors=%q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+}

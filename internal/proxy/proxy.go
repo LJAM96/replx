@@ -464,6 +464,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	id := requestid.New()
 	w.Header().Set(RequestIDHeader, id)
+	// Plex Web treats even an error response without CORS as a lost server
+	// connection. PMS echoes valid browser origins on its API responses.
+	setCachedCORS(w.Header(), r)
 	o := h.observe(r)
 	if o.playback != "" {
 		w.Header().Set(trace.PlaybackTraceHeader, o.playback)
@@ -1057,6 +1060,9 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	}
 	if err != nil {
 		h.logOriginFailure(id, err, preOriginMs, originQueueMs, originHeaderMs)
+		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+			return // The browser left; it cannot receive a useful 502.
+		}
 		h.writeBadGateway(w, r, id, o, routeClass, start)
 		return
 	}
