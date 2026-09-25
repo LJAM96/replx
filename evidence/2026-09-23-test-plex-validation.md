@@ -701,3 +701,30 @@ Onboarding now verifies the actual published HTTPS port and writes an explicit
 `sha256:65dfeb707f0eb54475deac1b12e5c90d0b3ea27c80a079225b4690b51772527d`)
 was deployed healthy with zero restarts. The first two window passes filled
 eight pages with zero errors; full coverage and browser retest are pending.
+
+## 2026-09-25: Plex Web could not read cached Home or error responses
+
+Luke's screenshot showed the global Home “No content available” state while
+Lukeflix appeared online. The matching edge trace showed both promoted Home
+sections returned HTTP 200 from user-specific stale entries in 1–2 ms.
+Inspection of those cached JSON bodies found 17 and 18 populated Home hubs.
+The browser console then reported CORS failures on Replx 502 responses and
+marked Lukeflix unavailable. Direct PMS probes showed it echoes a request's
+Origin and sends `Vary: Origin, X-Plex-Token`; the Replx cache hit/stale/window
+paths had omitted `Access-Control-Allow-Origin` entirely. Thus an HTTP 200
+cache hit could be unreadable to Plex Web, and a 502 without CORS could look
+like a lost server connection. Most contemporaneous 502s were requests that
+the browser had already cancelled, not proven PMS connection failures.
+
+Commit `99333f5` adds request-specific Plex-style CORS headers to user-scoped
+cache hits, stale responses, collection windows and cached artwork. Commit
+`78538f6` applies them to edge-generated error responses too and avoids
+writing a 502 after the browser cancels its request. Regression tests cover
+those cases and reject malformed Origins; `go vet ./...` and `go test ./...`
+passed. Test image `0.4.0-78538f6-test` (ID
+`sha256:1c664bc23861dd0de91765c5636a2745bae37c35e36d8811a3e39beecbf06b82`)
+was deployed healthy with zero restarts. A public owner Home probe returned
+HTTP 200 as a cache hit in 0.23 seconds and echoed
+`Access-Control-Allow-Origin: https://app.plex.tv`. Luke's browser retest is
+pending. This verifies the header fix, not full page usability or production
+reliability.
