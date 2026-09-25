@@ -739,3 +739,12 @@ After that rollout, Luke reported Home remained visible without flashing and
 the Movies library loaded in about three seconds on one attempt. Those are
 positive browser observations, but Home still felt slow and the large/deep
 collection retest is pending.
+
+Luke next opened a large collection: first appearance took about 11 seconds,
+while scrolling to deeper items worked and showed content. Neither Replx Edge
+nor the legacy Replex container recorded a collection-child or poster request
+in the corresponding observation window. The client may have used its own
+cache or another Plex connection; the browser request hostname and repeat
+opening time are needed before attributing that 11-second delay to the edge
+cache or claiming a performance improvement. The edge container remained
+healthy with zero restarts.
