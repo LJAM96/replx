@@ -32,3 +32,15 @@ func TestWebRedirectStaysOnPublicConnection(t *testing.T) {
 		}
 	}
 }
+
+func TestCachedCORSUsesOnlyAnOrigin(t *testing.T) {
+	for _, raw := range []string{"https://app.plex.tv/path", "javascript:alert(1)", "https://user@example.com"} {
+		req := httptest.NewRequest(http.MethodGet, "/hubs/promoted", nil)
+		req.Header.Set("Origin", raw)
+		header := make(http.Header)
+		setCachedCORS(header, req)
+		if header.Get("Access-Control-Allow-Origin") != "" {
+			t.Fatalf("accepted malformed origin %q", raw)
+		}
+	}
+}

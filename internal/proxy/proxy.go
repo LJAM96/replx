@@ -324,6 +324,7 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 	// Replx Edge owns cache correctness (user-scoped TTLs above).
 	w.Header().Set("CDN-Cache-Control", "no-store")
 	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	setCachedCORS(w.Header(), r)
 	if entry.ContentType != "" {
 		w.Header().Set("Content-Type", entry.ContentType)
 	}
@@ -382,6 +383,7 @@ func (h *Handler) serveCollectionWindow(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set(CacheHeader, "window")
 	w.Header().Set("CDN-Cache-Control", "no-store")
 	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	setCachedCORS(w.Header(), r)
 	w.Header().Set("Content-Type", entry.ContentType)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
@@ -415,6 +417,7 @@ func (h *Handler) serveStale(w http.ResponseWriter, r *http.Request, id string, 
 	w.Header().Set(CacheHeader, "stale")
 	w.Header().Set("CDN-Cache-Control", "no-store")
 	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	setCachedCORS(w.Header(), r)
 	if entry.ContentType != "" {
 		w.Header().Set("Content-Type", entry.ContentType)
 	}
@@ -718,6 +721,7 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 		}
 		w.Header().Set(RequestIDHeader, id)
 		w.Header().Set(CacheHeader, "hit")
+		setCachedCORS(w.Header(), r)
 		if ct != "" {
 			w.Header().Set("Content-Type", ct)
 		}
@@ -775,6 +779,21 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 	_, _ = w.Write(body)
 	h.emit(r, id, o, "control", resp.StatusCode, start, map[string]any{"bodyBytes": len(body), "artwork": true})
 	return true
+}
+
+// Cached responses need the same request-specific CORS headers as Plex's
+// origin. PMS echoes a valid Origin for authenticated API requests; the
+// cache key is user-scoped but intentionally does not vary by browser origin.
+func setCachedCORS(header http.Header, r *http.Request) {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" ||
+		u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return
+	}
+	header.Set("Access-Control-Allow-Origin", origin)
+	header.Set("Access-Control-Expose-Headers", "Location, Date")
+	header.Set("Vary", "Origin, X-Plex-Token")
 }
 
 // rewriteWebRedirect keeps Plex Web on the public Replx connection when PMS

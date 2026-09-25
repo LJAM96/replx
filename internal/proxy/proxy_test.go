@@ -500,6 +500,7 @@ func TestCacheHitServesWithoutOrigin(t *testing.T) {
 	get := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/hubs/home/recentlyAdded?contentDirectoryID=22", nil)
 		req.Header.Set("X-Plex-Token", "user-a-token")
+		req.Header.Set("Origin", "https://app.plex.tv")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		return rec
@@ -514,6 +515,9 @@ func TestCacheHitServesWithoutOrigin(t *testing.T) {
 	}
 	if second.Body.String() != first.Body.String() {
 		t.Fatal("hit body must equal miss body")
+	}
+	if second.Header().Get("Access-Control-Allow-Origin") != "https://app.plex.tv" {
+		t.Fatal("cached hit omitted Plex Web CORS permission")
 	}
 	s := reg.Snapshot()
 	if s.CacheHits != 1 || s.CacheMisses != 1 {
@@ -549,6 +553,7 @@ func TestCollectionStaleServesImmediatelyAndRefreshesOnlyItsUser(t *testing.T) {
 	request := func(token string) *http.Request {
 		r := httptest.NewRequest(http.MethodGet, "/library/collections/101/children?includeMeta=1", nil)
 		r.Header.Set("X-Plex-Token", token)
+		r.Header.Set("Origin", "https://app.plex.tv")
 		return r
 	}
 	a := request("user-a")
@@ -562,6 +567,9 @@ func TestCollectionStaleServesImmediatelyAndRefreshesOnlyItsUser(t *testing.T) {
 	h.ServeHTTP(rec, a)
 	if rec.Header().Get(CacheHeader) != "stale" || !strings.Contains(rec.Body.String(), `"version":1`) {
 		t.Fatalf("stale response: header=%q body=%q", rec.Header().Get(CacheHeader), rec.Body.String())
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://app.plex.tv" {
+		t.Fatal("stale response omitted Plex Web CORS permission")
 	}
 	if reg.Snapshot().CacheStale != 1 {
 		t.Fatal("stale response was not counted")
@@ -602,6 +610,7 @@ func TestCollectionWindowServesDeepPageOnlyToValidatedUser(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "/library/collections/101/children?includeMeta=1&X-Plex-Container-Start=1&X-Plex-Container-Size=2", nil)
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Origin", "https://app.plex.tv")
 	class := cache.ClassOf(req.URL.Path)
 	key := cache.CollectionWindowKeyGen("tok:user-a", class, req.Method, req.URL.Path, req.URL.Query(), req.Header.Get("Accept"), 0, 0)
 	if err := store.Set(context.Background(), key, cache.Entry{Status: 200, ContentType: "application/json",
@@ -612,6 +621,9 @@ func TestCollectionWindowServesDeepPageOnlyToValidatedUser(t *testing.T) {
 	rec := httptest.NewRecorder()
 	if !h.serveCollectionWindow(rec, req, "request-a", &userA, time.Now()) || rec.Code != 200 || rec.Header().Get(CacheHeader) != "window" || !strings.Contains(rec.Body.String(), `"title":"b"`) || strings.Contains(rec.Body.String(), `"title":"a"`) {
 		t.Fatalf("deep page not served correctly: status=%d cache=%q body=%q", rec.Code, rec.Header().Get(CacheHeader), rec.Body.String())
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://app.plex.tv" {
+		t.Fatal("collection window omitted Plex Web CORS permission")
 	}
 	other := obs{scope: "tok:user-b", cacheable: true, fresh: true}
 	if h.serveCollectionWindow(httptest.NewRecorder(), req, "request-b", &other, time.Now()) {
