@@ -94,6 +94,8 @@ type PlaybackEngine interface {
 type Options struct {
 	// OriginBase is the server-to-server PMS URL, e.g. https://origin:32400.
 	OriginBase string
+	// PublicBase is the advertised HTTPS connection for browser redirects.
+	PublicBase string
 	// IngressMode is cloudflare_tunnel or direct.
 	IngressMode string
 	Logger      *logging.Logger
@@ -144,6 +146,7 @@ type Options struct {
 // Handler proxies Plex requests to the origin PMS.
 type Handler struct {
 	origin            *url.URL
+	public            *url.URL
 	mode              string
 	spike             SpikeResolver
 	log               *logging.Logger
@@ -187,6 +190,13 @@ func New(opts Options) (*Handler, error) {
 	if opts.IngressMode != "cloudflare_tunnel" && opts.IngressMode != "direct" {
 		return nil, fmt.Errorf("proxy: ingress mode must be cloudflare_tunnel or direct")
 	}
+	var public *url.URL
+	if opts.PublicBase != "" {
+		public, err = url.Parse(opts.PublicBase)
+		if err != nil || public.Scheme != "https" || public.Host == "" {
+			return nil, fmt.Errorf("proxy: invalid public base")
+		}
+	}
 	client := opts.Client
 	if client == nil {
 		// Transparent by design: origin 3xx responses pass through to
@@ -205,7 +215,7 @@ func New(opts Options) (*Handler, error) {
 		}
 		fallback = fb
 	}
-	return &Handler{origin: base, mode: opts.IngressMode, log: opts.Logger, secret: opts.Secret,
+	return &Handler{origin: base, public: public, mode: opts.IngressMode, log: opts.Logger, secret: opts.Secret,
 		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, warmer: opts.Warmer,
 		playback: opts.Playback, artwork: opts.Artwork, identity: opts.Identity,
 		client: client, browseSlots: make(chan struct{}, browseOriginConcurrency),
@@ -767,6 +777,30 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 	return true
 }
 
+// rewriteWebRedirect keeps Plex Web on the public Replx connection when PMS
+// redirects /web to its own plex.direct address. Other redirect targets pass
+// through unchanged, including media routes.
+func (h *Handler) rewriteWebRedirect(raw string) string {
+	if h.public == nil || raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !strings.HasPrefix(u.Path, "/web/") {
+		return ""
+	}
+	if u.IsAbs() && !strings.EqualFold(u.Host, h.origin.Host) {
+		return ""
+	}
+	if u.IsAbs() && u.Scheme != h.origin.Scheme {
+		return ""
+	}
+	target := *h.public
+	target.Path = u.Path
+	target.RawQuery = u.RawQuery
+	target.Fragment = u.Fragment
+	return target.String()
+}
+
 // serveSearch is intentionally a PMS passthrough in Production 1.0: the
 // owner index carries no per-user library grants, so serving its
 // candidates would bypass Plex visibility controls (any token string,
@@ -1020,6 +1054,11 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	}
 
 	copyHeaders(w.Header(), resp.Header)
+	if routeClass == "control" && strings.HasPrefix(r.URL.Path, "/web") && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if location := h.rewriteWebRedirect(resp.Header.Get("Location")); location != "" {
+			w.Header().Set("Location", location)
+		}
+	}
 	w.Header().Set(RequestIDHeader, id)
 	if routeClass == "control" {
 		w.Header().Set(CacheHeader, o.cacheState)

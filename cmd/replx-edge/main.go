@@ -271,6 +271,7 @@ func runServe() error {
 	}
 	proxyHandler, err := proxy.New(proxy.Options{
 		OriginBase:  cfg.OriginInternalURL,
+		PublicBase:  cfg.PublicURL,
 		IngressMode: cfg.IngressMode,
 		Logger:      logger,
 		Secret:      cfg.SecretKey,
