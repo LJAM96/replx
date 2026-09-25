@@ -236,13 +236,14 @@ const (
 
 // reason codes (scope-prefixed at render: SCOPE_REASON).
 const (
-	RMaxSourceResolution = "MAX_SOURCE_RESOLUTION"
-	RSource4KDenied      = "SOURCE_4K_DENIED"
-	RHDRDenied           = "HDR_DENIED"
-	RDolbyVisionDenied   = "DOLBY_VISION_DENIED"
-	RSourceBitrateCeil   = "SOURCE_BITRATE_CEILING"
-	RPartUnavailable     = "PART_UNAVAILABLE"
-	RUnknownDRDenied     = "UNKNOWN_DYNAMIC_RANGE_DENIED"
+	RMaxSourceResolution     = "MAX_SOURCE_RESOLUTION"
+	RUnknownSourceResolution = "UNKNOWN_SOURCE_RESOLUTION"
+	RSource4KDenied          = "SOURCE_4K_DENIED"
+	RHDRDenied               = "HDR_DENIED"
+	RDolbyVisionDenied       = "DOLBY_VISION_DENIED"
+	RSourceBitrateCeil       = "SOURCE_BITRATE_CEILING"
+	RPartUnavailable         = "PART_UNAVAILABLE"
+	RUnknownDRDenied         = "UNKNOWN_DYNAMIC_RANGE_DENIED"
 )
 
 // Evaluate filters, ranks and selects. scope is the fallback provenance
@@ -274,6 +275,10 @@ func Evaluate(p Policy, scope string, variants []Variant) (Decision, error) {
 		}
 		if is4K(v) && p.Allow4K.Normalize() == Deny {
 			reject(v, RSource4KDenied, "allow4K")
+			continue
+		}
+		if unknownResolution(v, p) {
+			reject(v, RUnknownSourceResolution, resolutionField(v, p))
 			continue
 		}
 		if overResolution(v, p) {
@@ -322,10 +327,21 @@ func Evaluate(p Policy, scope string, variants []Variant) (Decision, error) {
 // resolutionField names the bound that overResolution fired on, so the
 // rejection carries that field's provenance.
 func resolutionField(v Variant, p Policy) string {
+	if p.MaxSourceHeight != nil && v.Height == nil {
+		return "maxSourceHeight"
+	}
+	if p.MaxSourceWidth != nil && v.Width == nil {
+		return "maxSourceWidth"
+	}
 	if p.MaxSourceHeight != nil && v.Height != nil && *v.Height > *p.MaxSourceHeight {
 		return "maxSourceHeight"
 	}
 	return "maxSourceWidth"
+}
+
+func unknownResolution(v Variant, p Policy) bool {
+	return (p.MaxSourceWidth != nil && v.Width == nil) ||
+		(p.MaxSourceHeight != nil && v.Height == nil)
 }
 
 func is4K(v Variant) bool {

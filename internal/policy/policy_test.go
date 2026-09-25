@@ -78,6 +78,26 @@ func TestJodieAcceptance(t *testing.T) {
 	}
 }
 
+func TestResolutionLimitRejectsUnknownDimensions(t *testing.T) {
+	unknown := Variant{MediaIndex: 0, Height: intp(1080), Playability: DirectPlay, PartAvailable: true}
+	v1080 := Variant{MediaIndex: 1, Width: intp(1920), Height: intp(1080), Playability: DirectPlay, PartAvailable: true}
+	eff := Effective(Policy{}, Policy{MaxSourceWidth: intp(1920), MaxSourceHeight: intp(1080)}, Policy{})
+	decision, err := Evaluate(eff, "USER", []Variant{unknown, v1080})
+	if err != nil || decision.SelectedIndex != 1 {
+		t.Fatalf("known 1080p version must win: %+v %v", decision, err)
+	}
+	if len(decision.Rejected) != 1 || RenderReason(decision.Rejected[0]) != "USER_UNKNOWN_SOURCE_RESOLUTION" {
+		t.Fatalf("unknown width must be rejected: %+v", decision.Rejected)
+	}
+	_, err = Evaluate(eff, "USER", []Variant{unknown})
+	if perr, ok := err.(*Error); !ok || perr.Code != NoAllowedVariant {
+		t.Fatalf("unknown-only source must not bypass limit: %v", err)
+	}
+	if _, err := Evaluate(Defaults(), "GLOBAL", []Variant{unknown}); err != nil {
+		t.Fatalf("unlimited policy should preserve existing playback: %v", err)
+	}
+}
+
 // TestLukeAcceptance: 4K allowed globally selects 4K on a capable client;
 // a 1080p-limited client policy still picks 1080p for the same user.
 func TestLukeAcceptance(t *testing.T) {
