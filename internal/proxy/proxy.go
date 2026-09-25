@@ -1312,6 +1312,10 @@ func copyHeaders(dst, src http.Header) {
 		if connected[strings.ToLower(k)] {
 			continue
 		}
+		// ServeHTTP seeds CORS headers so proxy-generated errors remain readable.
+		// Replace those defaults with PMS's response headers rather than
+		// appending a second Access-Control-Allow-Origin value.
+		dst.Del(k)
 		for _, v := range vv {
 			dst.Add(k, v)
 		}

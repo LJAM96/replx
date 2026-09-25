@@ -61,3 +61,29 @@ func TestBadGatewayRetainsPlexWebCORS(t *testing.T) {
 		t.Fatalf("bad gateway lost browser origin: status=%d cors=%q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
 	}
 }
+
+func TestOriginCORSDoesNotDuplicateDefault(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		w.Header().Set("Vary", "Origin, X-Plex-Token")
+		_, _ = w.Write([]byte(`{"MediaContainer":{}}`))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/media/providers", nil)
+	req.Header.Set("Origin", "https://app.plex.tv")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := rec.Header().Values("Access-Control-Allow-Origin"); len(got) != 1 || got[0] != "https://app.plex.tv" {
+		t.Fatalf("CORS origin values = %q", got)
+	}
+	if got := rec.Header().Values("Vary"); len(got) != 1 || got[0] != "Origin, X-Plex-Token" {
+		t.Fatalf("Vary values = %q", got)
+	}
+}
