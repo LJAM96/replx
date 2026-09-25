@@ -38,6 +38,22 @@ func TestCodecRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPromotedHomeKeyIgnoresScreenOnly(t *testing.T) {
+	q := url.Values{"contentDirectoryID": {"22"}, "pinnedContentDirectoryID": {"22,23"}, "X-Plex-Device-Screen-Resolution": {"800x600"}}
+	a := ResponseKey("user:luke", "GET", "/hubs/promoted", q, "application/json")
+	q.Set("X-Plex-Device-Screen-Resolution", "1920x1080")
+	if a != ResponseKey("user:luke", "GET", "/hubs/promoted", q, "application/json") {
+		t.Fatal("viewport changed promoted Home key")
+	}
+	q.Set("pinnedContentDirectoryID", "22")
+	if a == ResponseKey("user:luke", "GET", "/hubs/promoted", q, "application/json") {
+		t.Fatal("pinned Home sections must remain separate")
+	}
+	if a == ResponseKey("user:other", "GET", "/hubs/promoted", q, "application/json") {
+		t.Fatal("Home cache crossed users")
+	}
+}
+
 func TestFallbackPolicyKeepsWatchStateLive(t *testing.T) {
 	if ttl, ok := FallbackTTL("/hubs/promoted"); !ok || ttl != StructuralHubStaleTTL {
 		t.Fatalf("home fallback: %v %v", ttl, ok)

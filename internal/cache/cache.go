@@ -147,6 +147,19 @@ func ResponseKey(scope, method, path string, query url.Values, accept string) st
 
 // ResponseKeyGen is ResponseKey with explicit invalidation generations.
 func ResponseKeyGen(scope, class, method, path string, query url.Values, accept string, scopeGen, globalGen uint64) string {
+	// Plex Web reports viewport changes on promoted Home requests. They do
+	// not select hubs, so keep the user and all Home selection parameters
+	// while sharing one response across browser window sizes.
+	if path == "/hubs/promoted" {
+		q := url.Values{}
+		for k, vals := range query {
+			if strings.EqualFold(k, "X-Plex-Device-Screen-Resolution") {
+				continue
+			}
+			q[k] = vals
+		}
+		query = q
+	}
 	var b strings.Builder
 	b.WriteString(strings.ToUpper(method))
 	b.WriteByte(0)

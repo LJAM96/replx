@@ -350,6 +350,7 @@ func runServe() error {
 	}
 	go warm.RunPreload(ctx, 5*time.Minute)
 	go warm.RunCollectionWindows(ctx, 10*time.Second)
+	go warm.RunUserHome(ctx, 30*time.Second)
 
 	onboard := &onboarding.Service{
 		DB:          db.Raw(),

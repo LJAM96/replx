@@ -56,6 +56,9 @@ type Stats struct {
 	PreloadErrors    int64 `json:"preloadErrors"`
 	UserWindowPages  int64 `json:"userWindowPages"`
 	UserWindowErrors int64 `json:"userWindowErrors"`
+	UserHomePages    int64 `json:"userHomePages"`
+	UserHomeErrors   int64 `json:"userHomeErrors"`
+	LastHomeUnix     int64 `json:"lastHomeUnix"`
 	LastPreloadUnix  int64 `json:"lastPreloadUnix"`
 	LastWindowUnix   int64 `json:"lastWindowUnix"`
 	LastRefreshUnix  int64 `json:"lastRefreshUnix"`
@@ -107,6 +110,10 @@ type Warmer struct {
 	windowScopeCursor int
 	userWindowPages   int64
 	userWindowErrors  int64
+	homeScopeCursor   int
+	userHomePages     int64
+	userHomeErrors    int64
+	lastHomeUnix      int64
 }
 
 type tracked struct {
@@ -144,6 +151,9 @@ func (w *Warmer) Track(key string, s Snapshot) {
 		return
 	}
 	s.RawQuery = stripSecrets(s.RawQuery)
+	if s.Method == http.MethodGet && s.Path == "/hubs/promoted" {
+		w.saveHomeProfile(s)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(w.tracked) >= maxTracked {
@@ -325,6 +335,8 @@ func (w *Warmer) Stats() Stats {
 		OwnerWarming: w.warming, PreloadPages: w.preloadPages,
 		PreloadArtwork: w.preloadedArtwork, PreloadErrors: w.preloadErrors,
 		UserWindowPages: w.userWindowPages, UserWindowErrors: w.userWindowErrors,
+		UserHomePages: w.userHomePages, UserHomeErrors: w.userHomeErrors,
+		LastHomeUnix:    w.lastHomeUnix,
 		LastPreloadUnix: w.lastPreloadUnix, LastWindowUnix: w.lastWindowUnix,
 		LastRefreshUnix: w.lastRefreshUnix}
 }
