@@ -29,12 +29,12 @@ Configure the origin PMS Custom Server Access URL with the Replx Edge hostname.
 Example:
 
 ```text
-https://plex.example.com
+https://plex.example.com:443
 ```
 
-This causes Plex to publish that URL as a connection for the existing PMS resource. It does not create a new PMS resource.
+This causes Plex to publish that URL as a connection for the existing PMS resource. Specify `:443` explicitly: Plex may otherwise publish its own remote access port (often 32400) for the custom hostname. It does not create a new PMS resource.
 
-Onboarding must verify that the custom connection is visible through Plex resources and still resolves to the same origin `machineIdentifier` through Replx Edge.
+Onboarding must verify that the custom connection is visible through Plex resources with the correct port and still resolves to the same origin `machineIdentifier` through Replx Edge.
 
 ## No Cloudflare Access on the Plex hostname
 

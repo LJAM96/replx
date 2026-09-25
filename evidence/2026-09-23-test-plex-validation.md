@@ -670,3 +670,34 @@ redirects to `https://replex.lukemulvaney.com/web/index.html`. Owner API
 probes through the public Replx URL returned HTTP 200 with four libraries and
 27 collections as cache hits, about 0.1 seconds each. Browser retest and the
 failed request's hostname are pending; production readiness remains unproven.
+
+## 2026-09-25: wrong advertised public port and fresh Luke latency
+
+Zen's Plex Web console reported Lukeflix unavailable at
+`https://replex.lukemulvaney.com:32400/media/providers` (status 0). The
+actual Cloudflare public connection is HTTPS port 443. A fresh plex.tv
+resource lookup confirmed Plex published the Replx hostname with port 32400,
+although PMS `customConnections` held a hostname-only URL. The existing
+onboarding check matched the hostname only and had accepted the unusable
+connection. The PMS setting was backed up on oi-2 and changed to
+`https://replex.lukemulvaney.com:443`, preserving its other custom URL.
+A fresh plex.tv resource lookup then published the Replx connection on port
+443. Luke reported that content returned after a browser reload, but was
+still slow. The corrected setup is confirmed by direct resource discovery
+and browser content, not yet a complete browsing performance pass.
+
+That browser session reached Replx Edge: 176 likely browser requests in the
+sample, including 133 artwork cache hits. Collection-child requests were
+mostly misses and several took 5–10 seconds; one promoted Home request timed
+out after about 30 seconds with HTTP 502. The collection preloader used the
+Plex Web `bundled` model and a different client identifier, while the new
+browser session used `standalone`; all other content-shaping fields for the
+movie collection profile matched. Commit `087b462` ignores those two client
+context fields in the complete collection-window key while retaining user
+scope, section, content fields, representation and invalidation generations.
+Onboarding now verifies the actual published HTTPS port and writes an explicit
+`:443` while preserving other custom URLs. Focused and full Go tests and
+`go vet ./...` passed. Test image `0.4.0-087b462-test` (ID
+`sha256:65dfeb707f0eb54475deac1b12e5c90d0b3ea27c80a079225b4690b51772527d`)
+was deployed healthy with zero restarts. The first two window passes filled
+eight pages with zero errors; full coverage and browser retest are pending.
