@@ -84,6 +84,47 @@ func TestBrowserLoginThenCookieAuth(t *testing.T) {
 	}
 }
 
+func TestTailscaleLoginRequiresMatchingIdentityAndKeepsCSRF(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	m.SetTailscaleLogin("owner@example.com")
+	redirect := httptest.NewRecorder()
+	m.ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, "/admin", nil))
+	if redirect.Code != http.StatusSeeOther || redirect.Header().Get("Location") != "/admin/login" {
+		t.Fatalf("dashboard should start Tailscale sign-in, got %d", redirect.Code)
+	}
+	for _, login := range []string{"", "other@example.com"} {
+		req := httptest.NewRequest(http.MethodGet, "/admin/login", nil)
+		req.Header.Set("Tailscale-User-Login", login)
+		rec := httptest.NewRecorder()
+		m.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden || len(rec.Result().Cookies()) != 0 {
+			t.Fatalf("identity %q: status %d, cookies %d", login, rec.Code, len(rec.Result().Cookies()))
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/admin/login", nil)
+	req.Header.Set("Tailscale-User-Login", "OWNER@example.com")
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther || len(rec.Result().Cookies()) == 0 {
+		t.Fatalf("matching identity: status %d, cookies %d", rec.Code, len(rec.Result().Cookies()))
+	}
+	cookie := rec.Result().Cookies()[0]
+	req = httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.AddCookie(cookie)
+	rec = httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard status %d", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/admin/logout", nil)
+	req.AddCookie(cookie)
+	rec = httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("mutation without CSRF status %d", rec.Code)
+	}
+}
+
 func TestDashboardRequiresSessionAndShowsControls(t *testing.T) {
 	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
 	unauth := httptest.NewRecorder()

@@ -55,6 +55,7 @@ type Mux struct {
 	// single use: creation consumes it in the same process lifetime.
 	setupConsumed  bool
 	requireAuth    bool
+	tailscaleLogin string
 	sessions       *sessionStore
 	registry       *metrics.Registry
 	cap            *capture.Store
@@ -77,6 +78,13 @@ type Mux struct {
 // namespace invalidation.
 func (m *Mux) SetCacheInvalidator(fn func(scope, class string)) {
 	m.invalidator = fn
+}
+
+// SetTailscaleLogin trusts the identity header supplied by Tailscale Serve.
+// The admin port must be published on host loopback so clients cannot set
+// this header themselves; config validation enforces that deployment rule.
+func (m *Mux) SetTailscaleLogin(login string) {
+	m.tailscaleLogin = strings.TrimSpace(login)
 }
 
 // syncpkgWorker is the sync surface admin needs (narrower than *sync.Worker
@@ -228,6 +236,10 @@ func (m *Mux) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		sess, ok := m.sessionOf(r)
 		if !ok {
+			if m.tailscaleLogin != "" && r.Method == http.MethodGet && (r.URL.Path == "/admin" || strings.HasPrefix(r.URL.Path, "/admin/")) {
+				http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
+				return
+			}
 			writeError(w, http.StatusUnauthorized, "SETUP_TOKEN_REQUIRED", "provide the per-process setup token as Authorization: Bearer (valid 15m from startup), or sign in at /admin/login")
 			return
 		}
@@ -257,6 +269,22 @@ func withSession(r *http.Request, sess session) *http.Request {
 func (m *Mux) handleLogin(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		if m.tailscaleLogin != "" {
+			if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Tailscale-User-Login")), m.tailscaleLogin) {
+				http.Error(w, "Open this dashboard through its private Tailscale address using the authorised account.", http.StatusForbidden)
+				return
+			}
+			if _, ok := m.sessionOf(r); !ok {
+				id, _, err := m.sessions.createWithSubject("tailscale:" + m.tailscaleLogin)
+				if err != nil {
+					writeError(w, http.StatusInternalServerError, "SESSION_FAILED", "could not create session")
+					return
+				}
+				setSessionCookie(w, id)
+			}
+			http.Redirect(w, r, "/admin", http.StatusSeeOther)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = fmt.Fprint(w, `<!doctype html><html><head><meta charset="utf-8"><title>Replx Edge admin sign in</title></head><body>

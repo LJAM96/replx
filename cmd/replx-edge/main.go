@@ -396,6 +396,7 @@ func runServe() error {
 		ValkeyOK:           valkeyOK,
 		PMSStatus:          func() string { return pmsStatus.Load().(string) },
 	}, onboard, setupToken, true, spikeStore, &spikeObs)
+	adminMux.SetTailscaleLogin(cfg.AdminTailscaleLogin)
 	adminMux.SetMetrics(registry)
 	adminMux.SetCapture(captureStore)
 	adminMux.SetWarmer(warm.Stats)

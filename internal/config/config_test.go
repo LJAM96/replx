@@ -26,6 +26,17 @@ func TestValidateAcceptsRandomHexSecret(t *testing.T) {
 	}
 }
 
+func TestTailscaleLoginRequiresLoopbackPublication(t *testing.T) {
+	c := Config{SecretKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", PublicURL: "https://plex.example.com", IngressMode: "direct", AdminBind: "127.0.0.1", AdminPublishBind: "100.116.199.128", AdminTailscaleLogin: "owner@example.com"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("identity headers must not be trusted on a directly published port")
+	}
+	c.AdminPublishBind = "127.0.0.1"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("loopback publication should allow Tailscale Serve: %v", err)
+	}
+}
+
 func TestValidateTunnelNeedsNoToken(t *testing.T) {
 	// The Tunnel token belongs to cloudflared only; the app must not
 	// require or read it.

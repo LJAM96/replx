@@ -14,6 +14,8 @@ Default host binding:
 
 Production 1.0 supports one local administrator account using Argon2id password hashing and secure session cookies.
 
+For a private tailnet deployment, set `REPLX_EDGE_ADMIN_PUBLISH_BIND=127.0.0.1` and `REPLX_EDGE_ADMIN_TAILSCALE_LOGIN` to the authorised Tailscale login, then proxy the local admin port with Tailscale Serve. Visiting `/admin/login` through the Serve URL signs that user in automatically using Serve's verified `Tailscale-User-Login` header. The local account remains available for recovery, and mutating requests still require a session CSRF token. Do not expose the admin port directly when this mode is enabled.
+
 First-run bootstrap: when `admin_users` is empty, the server logs a single-use setup URL with a random token valid for 15 minutes. The operator opens it via the private admin path and sets the initial password through `POST /api/v1/setup`. Setup requires the bootstrap token (bearer or `setupToken` field) and runs inside one advisory-locked transaction against a database-enforced singleton administrator (at most one row). Creation consumes the bootstrap capability permanently: the bearer stops working and every setup-minted session is revoked. Browser sessions minted from the setup token never outlive the 15-minute window. No default password is shipped and no password is accepted via environment variable. Password logins are throttled per source and username; logout is POST-only with CSRF.
 
 OIDC is future work.

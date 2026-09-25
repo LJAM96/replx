@@ -41,6 +41,9 @@ type Config struct {
 	// container port. Loopback, RFC 1918/ULA private space, Tailscale
 	// CGNAT and link-local are permitted; never the wildcard.
 	AdminPublishBind string
+	// AdminTailscaleLogin enables identity-header sign-in only behind
+	// Tailscale Serve, with Docker publishing the admin port on loopback.
+	AdminTailscaleLogin string
 	// InDocker marks the container network namespace, where the
 	// unspecified listen address is safe because Docker publish controls
 	// exposure. Compose sets it; bare-metal runs must leave it false.
@@ -113,28 +116,29 @@ func intEnv(key string, def int) int {
 // supplied directly or via TUNNEL_TOKEN_FILE (Docker secret compatible).
 func Load() (Config, error) {
 	cfg := Config{
-		ImageOwner:        getenv("REPLX_EDGE_IMAGE_OWNER", ""),
-		Version:           getenv("REPLX_EDGE_VERSION", "dev"),
-		PublicURL:         getenv("REPLX_EDGE_PUBLIC_URL", ""),
-		OriginInternalURL: getenv("REPLX_EDGE_ORIGIN_INTERNAL_URL", ""),
-		IngressMode:       getenv("REPLX_EDGE_INGRESS_MODE", "cloudflare_tunnel"),
-		AdminBind:         getenv("REPLX_EDGE_ADMIN_BIND", "127.0.0.1"),
-		AdminListen:       getenv("REPLX_EDGE_ADMIN_LISTEN", ""),
-		AdminPublishBind:  getenv("REPLX_EDGE_ADMIN_PUBLISH_BIND", "127.0.0.1"),
-		InDocker:          strings.EqualFold(getenv("REPLX_EDGE_IN_DOCKER", "false"), "true"),
-		LogLevel:          getenv("REPLX_EDGE_LOG_LEVEL", "info"),
-		SecretKey:         getenv("REPLX_EDGE_SECRET_KEY", ""),
-		MediaPublicURL:    getenv("REPLX_EDGE_MEDIA_PUBLIC_URL", ""),
-		PostgresHost:      getenv("POSTGRES_HOST", "postgres"),
-		PostgresDB:        getenv("POSTGRES_DB", "replx_edge"),
-		PostgresUser:      getenv("POSTGRES_USER", "replx_edge"),
-		PostgresPass:      getenv("POSTGRES_PASSWORD", ""),
-		PostgresURL:       getenv("REPLX_EDGE_POSTGRES_URL", ""),
-		PostgresSSLMode:   strings.ToLower(strings.TrimSpace(getenv("POSTGRES_SSLMODE", ""))),
-		ValkeyAddr:        getenv("REPLX_EDGE_VALKEY_ADDR", getenv("VALKEY_ADDR", "valkey:6379")),
-		PlexTVBase:        getenv("REPLX_EDGE_PLEXTV_URL", "https://plex.tv"),
-		SpikeRouting:      strings.EqualFold(getenv("REPLX_EDGE_SPIKE_ROUTING", "false"), "true"),
-		ArtworkDir:        getenv("REPLX_EDGE_ARTWORK_DIR", "/data/artwork"),
+		ImageOwner:          getenv("REPLX_EDGE_IMAGE_OWNER", ""),
+		Version:             getenv("REPLX_EDGE_VERSION", "dev"),
+		PublicURL:           getenv("REPLX_EDGE_PUBLIC_URL", ""),
+		OriginInternalURL:   getenv("REPLX_EDGE_ORIGIN_INTERNAL_URL", ""),
+		IngressMode:         getenv("REPLX_EDGE_INGRESS_MODE", "cloudflare_tunnel"),
+		AdminBind:           getenv("REPLX_EDGE_ADMIN_BIND", "127.0.0.1"),
+		AdminListen:         getenv("REPLX_EDGE_ADMIN_LISTEN", ""),
+		AdminPublishBind:    getenv("REPLX_EDGE_ADMIN_PUBLISH_BIND", "127.0.0.1"),
+		AdminTailscaleLogin: strings.TrimSpace(getenv("REPLX_EDGE_ADMIN_TAILSCALE_LOGIN", "")),
+		InDocker:            strings.EqualFold(getenv("REPLX_EDGE_IN_DOCKER", "false"), "true"),
+		LogLevel:            getenv("REPLX_EDGE_LOG_LEVEL", "info"),
+		SecretKey:           getenv("REPLX_EDGE_SECRET_KEY", ""),
+		MediaPublicURL:      getenv("REPLX_EDGE_MEDIA_PUBLIC_URL", ""),
+		PostgresHost:        getenv("POSTGRES_HOST", "postgres"),
+		PostgresDB:          getenv("POSTGRES_DB", "replx_edge"),
+		PostgresUser:        getenv("POSTGRES_USER", "replx_edge"),
+		PostgresPass:        getenv("POSTGRES_PASSWORD", ""),
+		PostgresURL:         getenv("REPLX_EDGE_POSTGRES_URL", ""),
+		PostgresSSLMode:     strings.ToLower(strings.TrimSpace(getenv("POSTGRES_SSLMODE", ""))),
+		ValkeyAddr:          getenv("REPLX_EDGE_VALKEY_ADDR", getenv("VALKEY_ADDR", "valkey:6379")),
+		PlexTVBase:          getenv("REPLX_EDGE_PLEXTV_URL", "https://plex.tv"),
+		SpikeRouting:        strings.EqualFold(getenv("REPLX_EDGE_SPIKE_ROUTING", "false"), "true"),
+		ArtworkDir:          getenv("REPLX_EDGE_ARTWORK_DIR", "/data/artwork"),
 	}
 	artGB, err := strconv.Atoi(getenv("REPLX_EDGE_ARTWORK_MAX_GB", "50"))
 	if err != nil || artGB <= 0 || artGB > 10000 {
@@ -192,6 +196,9 @@ func (c Config) Validate() error {
 	}
 	if err := checkAdminPublishBind(c.AdminPublishBind); err != nil {
 		return err
+	}
+	if c.AdminTailscaleLogin != "" && c.AdminPublishBind != "127.0.0.1" && c.AdminPublishBind != "::1" {
+		return fmt.Errorf("REPLX_EDGE_ADMIN_TAILSCALE_LOGIN requires loopback REPLX_EDGE_ADMIN_PUBLISH_BIND")
 	}
 	if c.MediaFallbackEnabled && c.MediaPublicURL == "" {
 		return fmt.Errorf("REPLX_EDGE_MEDIA_PUBLIC_URL is required when media fallback is enabled")

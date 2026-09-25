@@ -73,6 +73,8 @@ services:
       REPLX_EDGE_ORIGIN_INTERNAL_URL: ${REPLX_EDGE_ORIGIN_INTERNAL_URL}
       REPLX_EDGE_INGRESS_MODE: ${REPLX_EDGE_INGRESS_MODE}
       REPLX_EDGE_ADMIN_PORT: ${REPLX_EDGE_ADMIN_PORT:-8080}
+      REPLX_EDGE_ADMIN_PUBLISH_BIND: ${REPLX_EDGE_ADMIN_PUBLISH_BIND:-127.0.0.1}
+      REPLX_EDGE_ADMIN_TAILSCALE_LOGIN: ${REPLX_EDGE_ADMIN_TAILSCALE_LOGIN:-}
       # In-container listen address. 0.0.0.0 is safe ONLY here, inside the
       # container network namespace, because the ports mapping below
       # controls which host interface can reach it. REPLX_EDGE_IN_DOCKER
