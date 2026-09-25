@@ -1,6 +1,8 @@
 package onboarding
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/LJAM96/replx/internal/plextv"
@@ -92,16 +94,46 @@ func TestCustomURLPresent(t *testing.T) {
 		ClientIdentifier: "pms-1",
 		Connections: []plextv.Connection{
 			{URI: "https://origin.example:32400"},
-			{URI: "https://plex.example.com"},
+			{URI: "https://plex.example.com:443"},
 		},
 	}}
-	if !CustomURLPresent(resources, "pms-1", "plex.example.com") {
+	if !CustomURLPresent(resources, "pms-1", "https://plex.example.com") {
 		t.Fatal("expected present")
 	}
-	if CustomURLPresent(resources, "pms-1", "other.example.com") {
+	if CustomURLPresent(resources, "pms-1", "https://other.example.com") {
 		t.Fatal("expected absent")
 	}
-	if CustomURLPresent(resources, "pms-2", "plex.example.com") {
+	if CustomURLPresent(resources, "pms-2", "https://plex.example.com") {
 		t.Fatal("wrong resource must not match")
+	}
+	resources[0].Connections[1].URI = "https://plex.example.com:32400"
+	if CustomURLPresent(resources, "pms-1", "https://plex.example.com") {
+		t.Fatal("wrong published port must not pass verification")
+	}
+}
+
+func TestConfigureCustomURLKeepsExistingAndAddsPublicPort(t *testing.T) {
+	var saved string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Plex-Token") != "owner-token" {
+			t.Error("missing owner credential")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<MediaContainer><Setting id="customConnections" value="https://origin.example:42442, https://replex.example"/></MediaContainer>`))
+		case http.MethodPut:
+			saved = r.URL.Query().Get("customConnections")
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+	if err := tryConfigureCustomURL(server.URL, "owner-token", "https://replex.example"); err != nil {
+		t.Fatal(err)
+	}
+	if saved != "https://origin.example:42442, https://replex.example:443" {
+		t.Fatalf("custom connections: %q", saved)
 	}
 }

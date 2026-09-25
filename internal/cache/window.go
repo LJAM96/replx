@@ -19,15 +19,17 @@ func CollectionWindowKeyGen(scope, class, method, path string, query url.Values,
 	return ResponseKeyGen(scope, class, method, path, CollectionWindowQuery(query), accept, scopeGen, globalGen) + ":window"
 }
 
-// CollectionWindowQuery removes page coordinates and two Plex Web context
-// hints that do not select collection children. Both vary with the browser
-// window or pinned sidebar, even while the collection itself stays the same.
+// CollectionWindowQuery removes page coordinates and Plex Web context hints
+// that do not select collection children. Client ID and model change when
+// Plex Web switches from bundled to standalone while viewing the same user
+// and collection; the identity scope still keeps users separate.
 func CollectionWindowQuery(query url.Values) url.Values {
 	q := url.Values{}
 	for k, values := range query {
 		lower := strings.ToLower(k)
 		if lower == "x-plex-container-start" || lower == "x-plex-container-size" ||
-			lower == "x-plex-device-screen-resolution" || lower == "pinnedcontentdirectoryid" {
+			lower == "x-plex-device-screen-resolution" || lower == "pinnedcontentdirectoryid" ||
+			lower == "x-plex-client-identifier" || lower == "x-plex-model" {
 			continue
 		}
 		q[k] = append([]string(nil), values...)

@@ -1,9 +1,10 @@
 package onboarding
 
 import (
-	"bytes"
 	"context"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -82,11 +83,17 @@ func TripleMatch(origin, resource, proxied string) bool {
 	return origin != "" && origin == resource && resource == proxied
 }
 
-// CustomURLPresent reports whether the selected resource publishes a
-// connection for the replx-edge public hostname.
-func CustomURLPresent(resources []plextv.Resource, selectedID, publicHost string) bool {
-	if publicHost == "" {
+// CustomURLPresent requires the actual public scheme, host and port. Plex
+// may publish a hostname-only custom setting with its PMS port (32400),
+// which is unusable when Replx is reachable only on HTTPS port 443.
+func CustomURLPresent(resources []plextv.Resource, selectedID, publicURL string) bool {
+	expected, err := url.Parse(publicURL)
+	if err != nil || expected.Scheme != "https" || expected.Hostname() == "" {
 		return false
+	}
+	expectedPort := expected.Port()
+	if expectedPort == "" {
+		expectedPort = "443"
 	}
 	for _, r := range resources {
 		if r.ClientIdentifier != selectedID {
@@ -94,10 +101,14 @@ func CustomURLPresent(resources []plextv.Resource, selectedID, publicHost string
 		}
 		for _, c := range r.Connections {
 			u, err := url.Parse(c.URI)
-			if err != nil {
+			if err != nil || u.Scheme != expected.Scheme {
 				continue
 			}
-			if strings.EqualFold(u.Hostname(), publicHost) {
+			port := u.Port()
+			if port == "" {
+				port = "443"
+			}
+			if strings.EqualFold(u.Hostname(), expected.Hostname()) && port == expectedPort {
 				return true
 			}
 		}
@@ -190,7 +201,7 @@ func (s *Service) Verify(ctx context.Context) (VerifyReport, error) {
 		ResourceID:       resourceID,
 		ProxiedID:        proxiedID.MachineIdentifier,
 		MediaOrigin:      mediaOrigin,
-		CustomURLPresent: CustomURLPresent(resources, resourceID, publicHost(s.PublicURL)),
+		CustomURLPresent: CustomURLPresent(resources, resourceID, s.PublicURL),
 	}
 	report.Match = TripleMatch(originID.MachineIdentifier, resourceID, proxiedID.MachineIdentifier) &&
 		originID.MachineIdentifier == machineID
@@ -213,7 +224,7 @@ func (s *Service) Verify(ctx context.Context) (VerifyReport, error) {
 				if id2, err := s.EnsureIdentity(ctx); err == nil {
 					if resources2, err := s.NewTV(id2.ClientID).ListServers(ctx, string(ownerToken)); err == nil {
 						resources = resources2
-						report.CustomURLPresent = CustomURLPresent(resources, resourceID, publicHost(s.PublicURL))
+						report.CustomURLPresent = CustomURLPresent(resources, resourceID, s.PublicURL)
 					}
 				}
 			} else {
@@ -243,34 +254,76 @@ func zeroBytes(b []byte) {
 	}
 }
 
-// tryConfigureCustomURL best-effort sets the PMS Custom Server Access URLs
-// (customConnections) to include publicURL. It never overwrites an existing
-// list that already contains the URL.
+// tryConfigureCustomURL preserves other custom URLs and publishes the Replx
+// address with an explicit port, because PMS can otherwise substitute 32400.
 func tryConfigureCustomURL(internalOrigin, pmsToken, publicURL string) error {
 	base := strings.TrimSuffix(internalOrigin, "/")
+	public, err := url.Parse(publicURL)
+	if err != nil || public.Scheme != "https" || public.Hostname() == "" {
+		return fmt.Errorf("invalid public URL")
+	}
+	if public.Port() == "" {
+		public.Host = net.JoinHostPort(public.Hostname(), "443")
+	}
 	client, err := origin.APIClient(internalOrigin, 10*time.Second)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/:/prefs?X-Plex-Token="+url.QueryEscape(pmsToken), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/:/prefs", nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/xml")
+	req.Header.Set("X-Plex-Token", pmsToken)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	// Read current customConnections if present; simplest robust path is
-	// to PUT the desired value directly (PMS merges single pref writes).
-	putURL := base + "/:/prefs?customConnections=" + url.QueryEscape(publicURL) + "&X-Plex-Token=" + url.QueryEscape(pmsToken)
-	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, bytes.NewReader(nil))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("pms prefs GET status %s", resp.Status)
+	}
+	var prefs struct {
+		Settings []struct {
+			ID    string `xml:"id,attr"`
+			Value string `xml:"value,attr"`
+		} `xml:"Setting"`
+	}
+	if err := xml.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&prefs); err != nil {
+		return err
+	}
+	var current string
+	found := false
+	for _, setting := range prefs.Settings {
+		if setting.ID == "customConnections" {
+			current, found = setting.Value, true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("pms customConnections setting missing")
+	}
+	var values []string
+	for _, value := range strings.Split(current, ",") {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		u, err := url.Parse(value)
+		if err == nil && strings.EqualFold(u.Hostname(), public.Hostname()) {
+			continue
+		}
+		values = append(values, value)
+	}
+	values = append(values, public.String())
+	putURL := base + "/:/prefs?customConnections=" + url.QueryEscape(strings.Join(values, ", "))
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, nil)
 	if err != nil {
 		return err
 	}
+	putReq.Header.Set("X-Plex-Token", pmsToken)
 	putResp, err := client.Do(putReq)
 	if err != nil {
 		return err

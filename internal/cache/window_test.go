@@ -7,8 +7,8 @@ import (
 )
 
 func TestCollectionWindowKeyPreservesUserAndFiltersPagination(t *testing.T) {
-	base := url.Values{"includeMeta": {"1"}, "X-Plex-Container-Start": {"12"}, "X-Plex-Container-Size": {"24"}, "X-Plex-Token": {"secret"}, "X-Plex-Device-Screen-Resolution": {"832x1001"}, "pinnedContentDirectoryID": {"123"}}
-	otherPage := url.Values{"includeMeta": {"1"}, "X-Plex-Container-Start": {"36"}, "X-Plex-Container-Size": {"39"}, "X-Plex-Device-Screen-Resolution": {"876x441"}, "pinnedContentDirectoryID": {"456"}}
+	base := url.Values{"includeMeta": {"1"}, "X-Plex-Container-Start": {"12"}, "X-Plex-Container-Size": {"24"}, "X-Plex-Token": {"secret"}, "X-Plex-Device-Screen-Resolution": {"832x1001"}, "pinnedContentDirectoryID": {"123"}, "X-Plex-Client-Identifier": {"bundled-browser"}, "X-Plex-Model": {"bundled"}}
+	otherPage := url.Values{"includeMeta": {"1"}, "X-Plex-Container-Start": {"36"}, "X-Plex-Container-Size": {"39"}, "X-Plex-Device-Screen-Resolution": {"876x441"}, "pinnedContentDirectoryID": {"456"}, "X-Plex-Client-Identifier": {"standalone-browser"}, "X-Plex-Model": {"standalone"}}
 	a := CollectionWindowKeyGen("tok:a", "collections", "GET", "/library/collections/1/children", base, "application/json", 2, 3)
 	b := CollectionWindowKeyGen("tok:a", "collections", "GET", "/library/collections/1/children", otherPage, "application/json", 2, 3)
 	if a != b {
