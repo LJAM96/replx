@@ -642,3 +642,31 @@ was deployed to oi-2. Docker reported healthy and zero restarts;
 `/admin/login` returned 200. One Home profile had been saved shortly after
 deployment. Luke's browser latency and completeness retest is pending, so this
 remains a staged test, not a production reliability gate result.
+
+## 2026-09-25: browser “No content available” and connection correction
+
+Luke reported “No content available” in collections and libraries, and the
+Plex admin user also saw it. Replx Edge received no browser library or hub
+requests around that report. The new Home build was rolled back to
+`0.4.0-463e75e-test` while investigating; the older image became healthy with
+zero restarts. Direct PMS checks with the owner token returned all four
+libraries, 27 collections in section 22, and Continue Watching (HTTP 200).
+The same owner token through the Replx Edge container returned the four
+libraries and 27 collections. This rules out an empty Plex library or a
+server-side cached empty response in those checks, but does not identify the
+client's failed connection.
+
+Plex resource discovery listed `replex.lukemulvaney.com` as an HTTPS
+connection for the same Lukeflix machine alongside several `plex.direct`
+connections. A public `/web` request returned a 302 to the blocked
+`plex.direct` hostname. Commit `11bbb03` rewrites only Plex Web redirects
+back to the configured public Replx URL when the destination is the same PMS
+origin. Tests cover the redirect and rejection of unrelated external/media
+redirects. `go vet ./...` and `go test ./...` passed. Image
+`0.4.0-11bbb03-test` (ID
+`sha256:c6efcb2fe4f3403f54cb9300e4dc51796ef40170a76bde390e02fc01765752b1`)
+was deployed to oi-2 healthy with zero restarts. A public `/web` probe now
+redirects to `https://replex.lukemulvaney.com/web/index.html`. Owner API
+probes through the public Replx URL returned HTTP 200 with four libraries and
+27 collections as cache hits, about 0.1 seconds each. Browser retest and the
+failed request's hostname are pending; production readiness remains unproven.
