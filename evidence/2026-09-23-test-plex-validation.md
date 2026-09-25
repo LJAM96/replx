@@ -728,3 +728,14 @@ HTTP 200 as a cache hit in 0.23 seconds and echoed
 `Access-Control-Allow-Origin: https://app.plex.tv`. Luke's browser retest is
 pending. This verifies the header fix, not full page usability or production
 reliability.
+
+A second Zen console capture showed `Access-Control-Allow-Origin` missing on
+HTTP 502 responses. Plex Web treated those as network errors, retested all
+Lukeflix connections and removed the server from its usable list, explaining
+the flash from visible collection rows to the global error page. Commit
+`78538f6` was verified through the public hostname: a cached owner Home
+response returned HTTP 200 with the expected CORS header in 0.23 seconds.
+After that rollout, Luke reported Home remained visible without flashing and
+the Movies library loaded in about three seconds on one attempt. Those are
+positive browser observations, but Home still felt slow and the large/deep
+collection retest is pending.
