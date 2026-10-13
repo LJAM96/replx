@@ -53,6 +53,7 @@ const CacheHeader = "X-Replx-Edge-Cache"
 // Limit simultaneous uncached browse fetches so a Plex Web collection burst
 // cannot open dozens of expensive library queries against one PMS at once.
 const browseOriginConcurrency = 8
+const collectionOriginConcurrency = 3
 
 // MediaRouteUnavailable is the stable diagnostic reason for fail-closed media.
 const MediaRouteUnavailable = "MEDIA_ROUTE_UNAVAILABLE"
@@ -160,6 +161,7 @@ type Handler struct {
 	identity          *identity.Resolver
 	client            *http.Client
 	browseSlots       chan struct{}
+	collectionSlots   chan struct{}
 	staleRefreshSlots chan struct{}
 	mediaFallback     *url.URL
 	searchDB          database.DBTX
@@ -219,6 +221,7 @@ func New(opts Options) (*Handler, error) {
 		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, warmer: opts.Warmer,
 		playback: opts.Playback, artwork: opts.Artwork, identity: opts.Identity,
 		client: client, browseSlots: make(chan struct{}, browseOriginConcurrency),
+		collectionSlots:   make(chan struct{}, collectionOriginConcurrency),
 		staleRefreshSlots: make(chan struct{}, 2),
 		spike:             opts.Spike, mediaFallback: fallback, searchDB: opts.SearchDB,
 		partPolicy: opts.PartPolicy, gens: cache.NewGenerations()}, nil
@@ -1043,6 +1046,17 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	originQueueMs := int64(0)
 	if o.cacheable && h.browseSlots != nil {
 		queueStart := time.Now()
+		// Cold collection children can be expensive. Limit their share of
+		// PMS capacity so a Plex Web burst cannot starve the Home hub.
+		if strings.HasPrefix(r.URL.Path, "/library/collections/") &&
+			strings.HasSuffix(r.URL.Path, "/children") && h.collectionSlots != nil {
+			select {
+			case h.collectionSlots <- struct{}{}:
+				defer func() { <-h.collectionSlots }()
+			case <-r.Context().Done():
+				return
+			}
+		}
 		select {
 		case h.browseSlots <- struct{}{}:
 			defer func() { <-h.browseSlots }()

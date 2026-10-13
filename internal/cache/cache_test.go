@@ -54,6 +54,23 @@ func TestPromotedHomeKeyIgnoresScreenOnly(t *testing.T) {
 	}
 }
 
+func TestCollectionChildKeyIgnoresBrowserContextButKeepsContentShape(t *testing.T) {
+	q := url.Values{"X-Plex-Container-Size": {"75"}, "X-Plex-Container-Start": {"0"},
+		"contentDirectoryID": {"23"}, "pinnedContentDirectoryID": {"22,23"},
+		"X-Plex-Client-Identifier": {"browser-a"}, "X-Plex-Model": {"bundled"}}
+	a := ResponseKey("user:luke", "GET", "/library/collections/101/children", q, "application/json")
+	q.Set("pinnedContentDirectoryID", "23,22,29,30")
+	q.Set("X-Plex-Client-Identifier", "browser-b")
+	q.Set("X-Plex-Model", "standalone")
+	if a != ResponseKey("user:luke", "GET", "/library/collections/101/children", q, "application/json") {
+		t.Fatal("sidebar and browser identity split the same collection page")
+	}
+	q.Set("includeMeta", "1")
+	if a == ResponseKey("user:luke", "GET", "/library/collections/101/children", q, "application/json") {
+		t.Fatal("content-shaping option must remain in the key")
+	}
+}
+
 func TestFallbackPolicyKeepsWatchStateLive(t *testing.T) {
 	if ttl, ok := FallbackTTL("/hubs/promoted"); !ok || ttl != StructuralHubStaleTTL {
 		t.Fatalf("home fallback: %v %v", ttl, ok)

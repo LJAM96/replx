@@ -222,10 +222,10 @@ func (e *Engine) enforceManifest(r *http.Request, sessionID string) (string, boo
 	defer cancel()
 	sess, ok, err := e.Store.FindActive(ctx, sessionID)
 	if err != nil || !ok {
-		// No negotiable session: manifests only exist after a decision
-		// the engine would have tracked, so PMS itself would fail this
-		// too. Deny explicitly rather than allow an untracked transcode.
-		return "", true, DecisionRequired
+		// Plex Web can request a transcode manifest without calling the
+		// decision endpoint. Reconstruct permission from the indexed source
+		// and current user policy; unknown sources remain denied.
+		return e.enforceStatelessManifest(r)
 	}
 	if deny, reason := e.checkSessionBinding(r, sess); deny {
 		return "", true, reason
@@ -270,6 +270,60 @@ func (e *Engine) enforceManifest(r *http.Request, sessionID string) (string, boo
 		return "", true, policy.OriginMismatch
 	}
 	return "", false, ""
+}
+
+func (e *Engine) enforceStatelessManifest(r *http.Request) (string, bool, string) {
+	token := trace.ExtractToken(r)
+	ratingKey := trace.ExtractRatingKey(r)
+	if token == "" || ratingKey == "" || strings.Trim(ratingKey, "0123456789") != "" {
+		return "", true, DecisionRequired
+	}
+	index := 0
+	if raw := r.URL.Query().Get("mediaIndex"); raw != "" {
+		var err error
+		index, err = strconv.Atoi(raw)
+		if err != nil || index < 0 {
+			return "", true, DecisionRequired
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	var identityID, clientUUID string
+	if e.Identity != nil {
+		res := e.Identity.Resolve(ctx, trace.Fingerprint(e.Secret, token), token,
+			identity.FromTrace(trace.ExtractClient(r)))
+		identityID, clientUUID = res.IdentityID, res.ClientID
+	}
+	load := e.LoadPolicy
+	if load == nil {
+		load = DefaultPolicyLoader(e.DB)
+	}
+	pol, scope, err := load(ctx, strOrNil(identityID), strOrNil(clientUUID))
+	if err != nil || pol.AllowTranscode.Normalize() == policy.Deny {
+		return "", true, DecisionRequired
+	}
+	// Titles absent from the owner index are read from PMS with this user's
+	// token, exactly as the normal negotiation path does.
+	d := decisionRequest{RatingKey: ratingKey, Query: map[string][]string{"path": {"/library/metadata/" + ratingKey}}}
+	sources, _ := e.variants(ctx, d, token)
+	for _, source := range sources {
+		if source.MediaIndex != index {
+			continue
+		}
+		if _, err := policy.Evaluate(pol, scope, []policy.Variant{source.toPolicy()}); err != nil {
+			return "", true, DecisionRequired
+		}
+		// A sessionless request cannot be rewritten to impose an output
+		// bitrate cap. Require the client to present an equal or tighter cap.
+		if pol.MaxStreamingBitrateKbps != nil {
+			cap, err := strconv.Atoi(r.URL.Query().Get("maxVideoBitrate"))
+			if err != nil || cap <= 0 || cap > *pol.MaxStreamingBitrateKbps {
+				return "", true, DecisionRequired
+			}
+		}
+		return "", false, ""
+	}
+	return "", true, DecisionRequired
 }
 
 // sameVariant reports whether a requested part belongs to the session's

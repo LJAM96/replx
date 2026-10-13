@@ -1,11 +1,13 @@
 package playback
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/LJAM96/replx/internal/identity"
+	"github.com/LJAM96/replx/internal/policy"
 	"github.com/LJAM96/replx/internal/testdb"
 	"github.com/LJAM96/replx/internal/trace"
 )
@@ -75,5 +77,34 @@ func TestLiveStatelessBoundary(t *testing.T) {
 	}
 	if sub, deny, _ := e.EnforcePart(part("401"), "401", "ghost-session"); deny || sub != "" {
 		t.Fatalf("Jodie 1080p part must pass: %q %v", sub, deny)
+	}
+}
+
+func TestLiveSessionlessManifestChecksIndexedSourceAndPolicy(t *testing.T) {
+	ctx, db := testdb.Begin(t)
+	seedPlaybackIndex(t, ctx, db)
+	e := &Engine{DB: db, Store: NewMemoryStore(), LoadPolicy: func(_ context.Context, _, _ *string) (policy.Policy, string, error) {
+		p := policy.Defaults()
+		p.MaxSourceHeight = intp(1080)
+		return p, "GLOBAL", nil
+	}}
+	request := func(index string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/video/:/transcode/universal/start.mpd?path=%2Flibrary%2Fmetadata%2F4242&mediaIndex="+index, nil)
+		r.Header.Set("X-Plex-Token", "user-token")
+		return r
+	}
+	if _, deny, _ := e.EnforcePart(request("0"), "", "missing-session"); deny {
+		t.Fatal("eligible indexed source should play without a decision request")
+	}
+	if _, deny, _ := e.EnforcePart(request("1"), "", "missing-session"); !deny {
+		t.Fatal("unknown source must remain denied")
+	}
+	e.LoadPolicy = func(_ context.Context, _, _ *string) (policy.Policy, string, error) {
+		p := policy.Defaults()
+		p.AllowTranscode = policy.Deny
+		return p, "GLOBAL", nil
+	}
+	if _, deny, _ := e.EnforcePart(request("0"), "", "missing-session"); !deny {
+		t.Fatal("transcode-denying policy must still block sessionless manifest")
 	}
 }

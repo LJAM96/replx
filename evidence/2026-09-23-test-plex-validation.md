@@ -817,3 +817,65 @@ syntax check passed. Test image `0.4.0-ca961f2-test` (ID
 was deployed healthy with zero restarts; `/health/ready` returned 200 and a
 public `/media/providers` probe returned 200 with one CORS origin value.
 The Luke 4K Movies first-visit retest is pending.
+
+## 2026-09-26: sessionless Plex Web playback and Home timeouts
+
+The 25 September logs showed 64 media requests rejected with
+`POLICY_DECISION_REQUIRED`. Plex Web requested transcode manifests and
+subtitles without a recorded negotiation request. The affected titles were
+absent from the owner media index. Replx now checks a sessionless manifest
+against user-scoped PMS metadata and the effective user/device policy. It
+only permits the requested source when it is eligible, transcoding is allowed,
+and any output bitrate cap is already present in the client request. Unknown
+titles, sources, identities or policy failures still fail closed. Unit tests,
+the full Go suite and `go vet ./...` passed. The live SQL test requires the CI
+test database and was skipped locally. Image `0.4.0-sessionless-web-test` was
+built on `oi-2` and deployed healthy with zero restarts; `/health/ready`
+returned 200. Browser playback retest is pending.
+
+Three `/hubs/promoted` requests timed out after 55 seconds while PMS was
+serving a large cold burst of collection and artwork requests. The operator
+wants to keep all promoted collections. Replx now permits at most three
+simultaneous cold collection-child origin fetches, reserving capacity for
+Home and other browse requests while cache hits still return immediately.
+The concurrency test proves Home reaches PMS during a blocked collection
+burst. Full Go tests and `go vet ./...` passed. Combined image
+`0.4.0-web-burst-test` was deployed on `oi-2`; browser retesting is pending.
+
+Luke's next browser pass confirmed video playback. Replx emitted successful
+307 redirects for the manifest and subtitles. Collection rows appeared after
+about 23 seconds. Most paged collection windows returned from cache in
+30–160 ms, but three uncached child requests took about 18 seconds each at
+PMS with zero Replx origin queue time. A subsequent request for the same
+collection took 32 seconds because Plex Web changed its pinned section list,
+which split the exact cache key despite selecting the same children. The
+collection key now ignores pinned section, browser ID, model and viewport
+hints while preserving content-selection fields such as `includeMeta`.
+Cache and proxy tests plus `go vet ./...` passed. Test image
+`0.4.0-collection-key-test` was deployed to `oi-2`. This prevents repeated
+cold fetches across those browser context changes; the first uncached PMS
+response can still be slow.
+
+On the next visit, three cold collection-child requests took 24.9, 25.9 and
+26.8 seconds. Their origin queue time was zero and nearly all elapsed time
+was waiting for PMS headers. Subsequent identical requests were cache hits
+within 1 ms. A trial preloader for Plex Web's no-`includeMeta` query shape
+timed out while fetching a full collection window and was rolled back to
+avoid extra PMS load. The deployed image remains `0.4.0-collection-key-test`,
+healthy with zero restarts and readiness 200. First-visit collection latency
+remains unresolved at the Plex origin.
+
+## 2026-09-26: restore direct Plex discovery during access incident
+
+Luke could not open Lukeflix. The exported PMS logs showed that Plex's
+automatically detected remote address `95.164.158.13:32400` repeatedly failed
+its reachability check. The intended server's `customConnections` setting was
+empty, leaving no working custom address published. The saved original setting
+contained `https://65.109.70.216:42442` and Replx. The empty setting was
+backed up on `oi-2` as `deploy/custom-connections.before-stability-recovery.json`.
+The direct URL alone was restored to the intended PMS, whose machine identity
+was verified before the change. Plex then advertised the corresponding
+`plex.direct` hostname; it answered from the operator's Mac with valid TLS
+and HTTP 200. The automatically detected address still timed out, but Luke
+confirmed that Lukeflix opened again. Replx remains deployed but is absent
+from the server's custom connection list during this stability period.

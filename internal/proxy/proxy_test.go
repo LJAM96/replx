@@ -115,9 +115,67 @@ func TestBrowseOriginConcurrencyIsBounded(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got := peak.Load(); got > browseOriginConcurrency || got < 2 {
-		t.Fatalf("origin concurrency=%d, limit=%d", got, browseOriginConcurrency)
+	if got := peak.Load(); got > collectionOriginConcurrency || got < 2 {
+		t.Fatalf("collection origin concurrency=%d, limit=%d", got, collectionOriginConcurrency)
 	}
+}
+
+func TestColdCollectionBurstLeavesOriginCapacityForHome(t *testing.T) {
+	collectionsStarted := make(chan struct{}, 12)
+	homeStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/library/collections/") {
+			collectionsStarted <- struct{}{}
+			<-release
+		} else if r.URL.Path == "/hubs/promoted" {
+			homeStarted <- struct{}{}
+		}
+		_, _ = w.Write([]byte(`{"MediaContainer":{}}`))
+	}))
+	defer origin.Close()
+	h, err := New(Options{OriginBase: origin.URL, IngressMode: "cloudflare_tunnel",
+		Cache: cache.NewMemory(), Secret: "test-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet,
+				"/library/collections/"+strconv.Itoa(i)+"/children", nil)
+			req.Header.Set("X-Plex-Token", "owner")
+			h.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+	}
+	for range collectionOriginConcurrency {
+		select {
+		case <-collectionsStarted:
+		case <-time.After(time.Second):
+			close(release)
+			wg.Wait()
+			t.Fatal("collection requests did not reach origin")
+		}
+	}
+	homeDone := make(chan struct{})
+	go func() {
+		defer close(homeDone)
+		req := httptest.NewRequest(http.MethodGet, "/hubs/promoted", nil)
+		req.Header.Set("X-Plex-Token", "owner")
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	select {
+	case <-homeStarted:
+	case <-time.After(time.Second):
+		close(release)
+		wg.Wait()
+		t.Fatal("cold collections starved Home origin request")
+	}
+	close(release)
+	wg.Wait()
+	<-homeDone
 }
 
 func TestPassthroughPreservesSemantics(t *testing.T) {

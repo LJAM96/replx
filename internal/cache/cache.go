@@ -150,11 +150,13 @@ func ResponseKeyGen(scope, class, method, path string, query url.Values, accept 
 	// Plex Web reports viewport changes on promoted Home requests. They do
 	// not select hubs, so keep the user and all Home selection parameters
 	// while sharing one response across browser window sizes.
-	if path == "/hubs/promoted" || sectionHubPath(path) {
+	collectionChildren := strings.HasPrefix(path, "/library/collections/") && strings.HasSuffix(path, "/children")
+	if path == "/hubs/promoted" || sectionHubPath(path) || collectionChildren {
 		q := url.Values{}
 		for k, vals := range query {
 			if strings.EqualFold(k, "X-Plex-Device-Screen-Resolution") ||
-				(sectionHubPath(path) && (strings.EqualFold(k, "X-Plex-Client-Identifier") || strings.EqualFold(k, "X-Plex-Model"))) {
+				((sectionHubPath(path) || collectionChildren) && (strings.EqualFold(k, "X-Plex-Client-Identifier") || strings.EqualFold(k, "X-Plex-Model"))) ||
+				(collectionChildren && strings.EqualFold(k, "pinnedContentDirectoryID")) {
 				continue
 			}
 			q[k] = vals

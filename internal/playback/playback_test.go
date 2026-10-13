@@ -85,6 +85,24 @@ func TestHandleDecisionSelects1080p(t *testing.T) {
 	}
 }
 
+func TestSessionlessPlexWebManifestChecksLiveSource(t *testing.T) {
+	origin := fakeOrigin(t, true)
+	defer origin.Close()
+	e := &Engine{Origin: origin.URL, Store: NewMemoryStore(), LoadPolicy: jodiePolicy}
+	request := func(index string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet,
+			"/video/:/transcode/universal/start.mpd?path=%2Flibrary%2Fmetadata%2F999&mediaIndex="+index, nil)
+		r.Header.Set("X-Plex-Token", "user-tok")
+		return r
+	}
+	if _, deny, _ := e.EnforcePart(request("1"), "", "unrecorded"); deny {
+		t.Fatal("eligible source should pass with user-scoped live metadata")
+	}
+	if _, deny, _ := e.EnforcePart(request("0"), "", "unrecorded"); !deny {
+		t.Fatal("restricted 4K source must remain denied")
+	}
+}
+
 func TestHandleDecisionDeniesTranscode(t *testing.T) {
 	origin := fakeOrigin(t, true) // PMS insists on transcoding
 	defer origin.Close()
