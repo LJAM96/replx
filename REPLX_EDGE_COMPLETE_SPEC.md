@@ -2538,6 +2538,11 @@ Responses include:
 | GET | `/api/v1/cache` | Cache statistics |
 | POST | `/api/v1/cache/invalidate` | Retire cache namespaces by scope/class via generations (audited) |
 | GET | `/api/v1/storage` | Storage use |
+| POST | `/api/v1/storage/evict-low-priority` | Evict low-priority shared artwork under storage pressure (audited, rate limited) |
+| GET | `/api/v1/warming` | Live warming configuration and queue status |
+| PATCH | `/api/v1/warming` | Pause/enable warming and tune bounded request/byte budgets |
+| GET | `/api/v1/warming/coverage` | Observed-entry warming coverage and artwork admission state |
+| POST | `/api/v1/warming/collections/{ratingKey}/rebuild` | Rebuild one collection's internal snapshot |
 | GET | `/api/v1/sessions` | Active and recent playback |
 | GET | `/api/v1/playback/{id}` | Decision explanation |
 | POST | `/api/v1/diagnostics/traces` | Arm targeted trace |
@@ -2570,6 +2575,12 @@ Browser panels authenticate with the session cookie plus per-session CSRF token;
 `POST /server/sync` is idempotent while a sync is already queued or running. Only one full reconciliation may run at once. A repeated call returns the current job ID instead of starting a second scan.
 
 `POST /api/v1/server/collections/refresh` is an optional authenticated completion hook for a collection builder such as Aggregar. Call it after the builder has finished changing collections. The request runs a bounded owner-token reconciliation of all library collection catalogs and child pages; it does not accept or return a Plex token. A complete collection snapshot publishes its ordered membership in one transaction. Failed/incomplete scans preserve the last published membership and return an error. A successful publication advances the server-wide `collections` response generation so all users refresh collection pages without evicting unrelated cache classes. The periodic full sync remains the fallback if the hook is not configured.
+
+`GET /api/v1/warming` reports the in-memory job scheduler configuration and queue counters. `PATCH` accepts any subset of `{ "enabled": true, "paused": false, "maxTracked": 512, "requestsPerPass": 16, "maxPerScopePerPass": 4, "bytesPerPass": 67108864 }`. Bounds are 1–512 tracked entries, 1–64 requests per pass, 1–requests-per-pass per scope, and 8–256 MiB per pass; defaults are 512, 16, 4 and 64 MiB. Enable and pause are separate: disabling turns off background jobs; pause suspends dispatch while retaining eligible queued work. Invalid limits return 400. Configuration is live for the current process and returns to deployment defaults after restart.
+
+Warm jobs are bounded, priority scheduled, deduplicated, fairly dispatched across scopes, and subject to capacity and backoff. Caller credentials used for warm refreshes come only from successful authenticated foreground requests and live in bounded short-lived memory; they are not written to the database or job payloads. Expired or revoked contexts are discarded. A warm response is still subject to the normal caller authorization lease when served.
+
+`GET /api/v1/warming/coverage` reports known observed entries, pending/due work, recent outcomes, priority distribution, active ephemeral authorization contexts, and artwork admission state. It deliberately does not report a percentage of the complete Plex library: uncached sorts, filters, headers and content are not enumerable from observed traffic. `POST /api/v1/warming/collections/{ratingKey}/rebuild` refreshes one numeric Plex collection key and its snapshot. `POST /api/v1/storage/evict-low-priority` runs one bounded eviction pass and reports removed entries and bytes; it never removes protected artwork. These manual operations are audited and rate limited.
 
 Expensive cache invalidation operations require explicit scope and are rate limited. Invalidation retires generations (per scope/class, or global), never reconstructed keys.
 
@@ -3618,7 +3629,7 @@ Do not start by downloading the entire library. That would consume the storage b
 
 # Agent execution plan
 
-Status: batches A, B and C implemented and locally checked on 29 October 2026; batch D implementation is in integration. This is a reusable instruction document for Codex, not a standalone shell scheduler.
+Status: batches A–E implemented and locally checked on 29 October 2026. Live PMS and physical-client qualification remains pending. This is a reusable instruction document for Codex, not a standalone shell scheduler.
 
 ## Run instruction
 
@@ -3682,9 +3693,13 @@ Sol High implements explicit snapshots and ordered membership, then targeted inv
 
 Collection synchronization stages the complete catalog and ordered PMS child results for one library before a single transaction publishes its metadata, snapshot pointers and deletions. Ordinary and smart collections use PMS-evaluated children. Failed pages, changing totals, duplicate keys and ambiguous empty responses preserve the published generation; an explicit complete empty result can remove all collections or members. Unchanged content retains its published generation. Collection metadata, artwork references, ordering, membership additions/deletions and Plex delete/recreate identifiers participate in the change comparison. A committed change records a durable pending cache invalidation; the callback runs after commit and failures are retried. New catalog placeholders and staged snapshots are internal data and must never be treated as caller authorization or served as published data without a published-generation join.
 
-### E: warming and operations — pending
+### E: warming and operations — complete locally
 
-Sol Medium implements priority jobs and bounded ephemeral user contexts. Luna implements stable admin controls and coverage reporting. Gate: warming respects capacity, permissions, origin request budgets and browsing priority.
+Sol Medium implements priority jobs and bounded ephemeral user contexts. Luna Medium implements stable admin controls and coverage reporting. Gate: warming respects capacity, permissions, origin request budgets and browsing priority.
+
+The scheduler only warms observed browse representations; it does not enumerate every library item, prefetch all artwork, or guess device-specific transforms. Jobs are deduplicated, limited to 512 entries, dispatched serially with request/byte/per-scope budgets, and prioritized across scopes. Foreground traffic cancels active background work. User credentials are held in at most 32 in-memory contexts for a fixed two minutes after successful foreground authorization; jobs contain no credentials, and publication rechecks the job/context before storage. Invalid credentials remove that scope's context and queued entries. Collection browse paths are protected in the queue, library section responses high priority, metadata normal, with low-priority shared artwork eligible for safe eviction only when no higher-priority reference shares its blob.
+
+Authenticated admin operations expose process-local pause/enable and bounded budgets, honest observed-entry coverage, one-collection rebuild, and low-priority artwork eviction. Settings revert to deployment defaults on restart. Full asset enumeration/prefetch, likely-next-page planning, durable warming controls and live PMS/device behavior remain pending qualification or later phases.
 
 ### F: qualification — pending
 
@@ -3702,6 +3717,7 @@ Sol High reviews integrated changes and runs failure/race tests with required se
 - Batch B complete: durable Postgres generations, v4 cache namespace, exact caller/resource leases and proxy integration are in place. `go test ./... -count=1` passed with `REPLX_EDGE_TEST_POSTGRES_URL` pointing to the temporary local PostgreSQL test instance; `go vet ./...`, generated-spec check and `git diff --check` passed.
 - Batch C complete: shared content-addressed artwork, durable transform references and reservations, crash recovery, priority eviction, free-space admission guard and admin storage stats are implemented. SQL-backed shared-store tests and proxy/admin tests pass. Production config defaults to a 100 GiB artwork budget and preserves a 30 GiB free-space floor.
 - Batch D collection implementation ran in a GPT-6.1 Sol High agent. The PostgreSQL-backed sync tests cover ordered/smart/empty collection publication, unchanged generation reuse, late-page failures preserving the whole library, incomplete catalogs, changing totals, explicit empty deletion, delete/recreate and pending invalidation retry. Coordinator integration adds authenticated completion triggering and a server-wide `collections` generation that preserves unrelated cache classes. `go test ./... -count=1` passes with the temporary PostgreSQL URL configured; `go vet ./...` and `git diff --check` pass. Actual daily Aggregar execution, PMS behavior and client/device behavior remain live validation requirements.
+- Batch E implementation used GPT-6.1 Sol Medium for bounded priority warming and GPT-6 Luna Medium for admin operations/documentation. Integration adds foreground cancellation, memory-only expiring user contexts, authorization-aware publication, fair bounded scheduling, request/body budgets, backoff, coverage reporting, targeted collection rebuild, and safe low-priority artwork eviction. `go test ./... -count=1` passed with the temporary PostgreSQL URL configured; `go vet ./...`, generated complete-spec check and `git diff --check` pass. Only observed browse representations are warmed; full library asset prefetch/transform planning is pending. Live PMS, Aggregar and physical-client behavior remain unverified.
 - Batch D completes the bounded first execution batch, not all Phase 0/2 requirements or the overall implementation roadmap. No deployment has been performed.
 
 ## Initial assessment findings

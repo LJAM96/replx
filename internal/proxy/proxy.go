@@ -268,6 +268,9 @@ func (h *Handler) observe(r *http.Request) obs {
 			o.fresh, o.invalid = res.Fresh, res.Invalid
 			if res.Invalid {
 				h.grants.Revoke(o.fingerprint)
+				if h.warmer != nil {
+					h.warmer.ForgetScope(o.scope)
+				}
 			}
 		}
 	}
@@ -360,6 +363,12 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.warmer != nil {
+		releaseForeground := h.warmer.Foreground()
+		if releaseForeground != nil {
+			defer releaseForeground()
+		}
+	}
 	start := time.Now()
 	id := requestid.New()
 	w.Header().Set(RequestIDHeader, id)
@@ -1035,6 +1044,7 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 	if h.cacheBroken.Load() || !h.currentCacheGeneration(r, o) {
 		return n
 	}
+	stored := false
 	if err := h.cache.Set(r.Context(), o.cacheKey, cache.Entry{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
@@ -1042,11 +1052,12 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 		Body:        body,
 	}, o.cacheTTL); err == nil {
 		h.grants.Grant(o.fingerprint, o.cacheKey)
+		stored = true
 	}
 	// Snapshots currently reproduce only query and Accept. Header variants
 	// remain cacheable on demand, but must not be refreshed without them.
-	if h.warmer != nil && cache.HeaderVariation(r.Header) == "" {
-		h.warmer.Track(o.cacheKey, warmer.Snapshot{
+	if stored && h.warmer != nil && cache.HeaderVariation(r.Header) == "" {
+		h.warmer.TrackAuthorized(o.cacheKey, warmer.Snapshot{
 			Method:   r.Method,
 			Path:     r.URL.Path,
 			RawQuery: r.URL.RawQuery,
@@ -1054,7 +1065,7 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 			Scope:    o.scope,
 			Class:    cache.ClassOf(r.URL.Path),
 			TTL:      o.cacheTTL,
-		})
+		}, trace.ExtractToken(r))
 	}
 	return n
 }

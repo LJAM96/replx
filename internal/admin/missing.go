@@ -35,6 +35,10 @@ func (m *Mux) registerMissing(checks health.Checks) {
 	m.mux.HandleFunc("/api/v1/cache", m.auth(m.handleCacheStats))
 	m.mux.HandleFunc("/api/v1/cache/invalidate", m.auth(m.handleCacheInvalidate))
 	m.mux.HandleFunc("/api/v1/storage", m.auth(m.handleStorage))
+	m.mux.HandleFunc("/api/v1/storage/evict-low-priority", m.auth(m.handleEvictLowPriority))
+	m.mux.HandleFunc("/api/v1/warming", m.auth(m.handleWarming))
+	m.mux.HandleFunc("/api/v1/warming/coverage", m.auth(m.handleWarmingCoverage))
+	m.mux.HandleFunc("/api/v1/warming/collections/", m.auth(m.handleCollectionRebuild))
 	m.mux.HandleFunc("/api/v1/sessions", m.auth(m.handleSessionsAlias))
 	m.mux.HandleFunc("/api/v1/playback/", m.auth(m.handlePlaybackDetail))
 	m.mux.HandleFunc("/api/v1/diagnostics/traces", m.auth(m.handleTraces))
@@ -586,6 +590,162 @@ func (m *Mux) handleStorage(w http.ResponseWriter, r *http.Request) {
 		out["audits"] = audits
 	}
 	writeData(w, http.StatusOK, out)
+}
+
+const (
+	adminWarmMaxTracked        = 512
+	adminWarmMaxRequests       = 64
+	adminWarmMaxPerScope       = 16
+	adminWarmMinBytes    int64 = 8 << 20
+	adminWarmMaxBytes    int64 = 256 << 20
+)
+
+func (m *Mux) handleWarming(w http.ResponseWriter, r *http.Request) {
+	if m.warmingControl == nil {
+		writeError(w, http.StatusConflict, "WARMING_UNAVAILABLE", "warming controls are not wired")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeData(w, http.StatusOK, map[string]any{"config": m.warmingControl.Config(), "stats": m.warmingControl.Stats()})
+	case http.MethodPatch:
+		var body struct {
+			Enabled            *bool  `json:"enabled"`
+			Paused             *bool  `json:"paused"`
+			MaxTracked         *int   `json:"maxTracked"`
+			RequestsPerPass    *int   `json:"requestsPerPass"`
+			MaxPerScopePerPass *int   `json:"maxPerScopePerPass"`
+			BytesPerPass       *int64 `json:"bytesPerPass"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_BODY", "warming settings JSON required")
+			return
+		}
+		if body.Enabled == nil && body.Paused == nil && body.MaxTracked == nil && body.RequestsPerPass == nil && body.MaxPerScopePerPass == nil && body.BytesPerPass == nil {
+			writeError(w, http.StatusBadRequest, "INVALID_BODY", "at least one warming setting is required")
+			return
+		}
+		cfg := m.warmingControl.Config()
+		if body.Enabled != nil {
+			cfg.Enabled = *body.Enabled
+		}
+		if body.MaxTracked != nil {
+			cfg.MaxTracked = *body.MaxTracked
+		}
+		if body.RequestsPerPass != nil {
+			cfg.RequestsPerPass = *body.RequestsPerPass
+		}
+		if body.MaxPerScopePerPass != nil {
+			cfg.MaxPerScopePerPass = *body.MaxPerScopePerPass
+		}
+		if body.BytesPerPass != nil {
+			cfg.BytesPerPass = *body.BytesPerPass
+		}
+		if cfg.MaxTracked < 1 || cfg.MaxTracked > adminWarmMaxTracked ||
+			cfg.RequestsPerPass < 1 || cfg.RequestsPerPass > adminWarmMaxRequests ||
+			cfg.MaxPerScopePerPass < 1 || cfg.MaxPerScopePerPass > adminWarmMaxPerScope || cfg.MaxPerScopePerPass > cfg.RequestsPerPass ||
+			cfg.BytesPerPass < adminWarmMinBytes || cfg.BytesPerPass > adminWarmMaxBytes {
+			writeError(w, http.StatusBadRequest, "WARMING_LIMIT_INVALID", "maxTracked must be 1..512, requestsPerPass 1..64, maxPerScopePerPass 1..16 and <= requestsPerPass, bytesPerPass 8..256 MiB")
+			return
+		}
+		before := map[string]any{"config": m.warmingControl.Config(), "paused": m.warmingControl.Stats().Paused}
+		if err := m.warmingControl.Configure(cfg); err != nil {
+			writeError(w, http.StatusBadRequest, "WARMING_CONFIG_INVALID", err.Error())
+			return
+		}
+		if body.Paused != nil {
+			m.warmingControl.SetPaused(*body.Paused)
+		}
+		m.auditEventWithBefore(r.Context(), subjectOf(r), "warming.configure", "warming", "global", before, map[string]any{"config": cfg, "paused": m.warmingControl.Stats().Paused})
+		writeData(w, http.StatusOK, map[string]any{"config": m.warmingControl.Config(), "stats": m.warmingControl.Stats()})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET or PATCH")
+	}
+}
+
+// Coverage describes observed warm entries and admission state. It is not a
+// percentage of the entire Plex catalog: unobserved queries are unknowable.
+func (m *Mux) handleWarmingCoverage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET only")
+		return
+	}
+	if m.warmingControl == nil {
+		writeError(w, http.StatusConflict, "WARMING_UNAVAILABLE", "warming controls are not wired")
+		return
+	}
+	out := map[string]any{"basis": "observed cache entries only; this is not full-library coverage", "config": m.warmingControl.Config(), "stats": m.warmingControl.Stats()}
+	if m.artworkStats != nil {
+		if stats, err := m.artworkStats(r.Context()); err == nil {
+			out["artworkAdmission"] = stats
+		} else if errors.Is(err, artwork.ErrInitializing) {
+			out["artworkAdmission"] = map[string]string{"state": "initializing"}
+		} else {
+			out["artworkAdmission"] = map[string]string{"state": "unavailable"}
+		}
+	}
+	writeData(w, http.StatusOK, out)
+}
+
+func (m *Mux) handleCollectionRebuild(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "POST only")
+		return
+	}
+	if m.collectionRebuilder == nil {
+		writeError(w, http.StatusConflict, "COLLECTION_REBUILD_UNAVAILABLE", "collection rebuild is not wired")
+		return
+	}
+	key := strings.TrimPrefix(r.URL.Path, "/api/v1/warming/collections/")
+	key = strings.TrimSuffix(key, "/rebuild")
+	if key == "" || strings.Contains(key, "/") || !asciiDigits(key) {
+		writeError(w, http.StatusBadRequest, "COLLECTION_KEY_INVALID", "numeric Plex collection ratingKey required")
+		return
+	}
+	if !m.checkRate(subjectOf(r)+":collection-rebuild", time.Minute, 2) {
+		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "at most two collection rebuilds per minute")
+		return
+	}
+	if err := m.collectionRebuilder(r.Context(), key); err != nil {
+		writeError(w, http.StatusBadGateway, "COLLECTION_REBUILD_FAILED", err.Error())
+		return
+	}
+	m.auditEvent(r.Context(), subjectOf(r), "warming.collection.rebuild", "collection", key, map[string]any{"completed": true})
+	writeData(w, http.StatusOK, map[string]any{"completed": true, "ratingKey": key})
+}
+
+func (m *Mux) handleEvictLowPriority(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "POST only")
+		return
+	}
+	if m.lowPriorityEvictor == nil {
+		writeError(w, http.StatusConflict, "ARTWORK_EVICTION_UNAVAILABLE", "shared artwork eviction is not wired")
+		return
+	}
+	if !m.checkRate(subjectOf(r)+":artwork-evict", time.Minute, 1) {
+		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "at most one low-priority eviction per minute")
+		return
+	}
+	removed, freed, err := m.lowPriorityEvictor(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "ARTWORK_EVICTION_FAILED", err.Error())
+		return
+	}
+	m.auditEvent(r.Context(), subjectOf(r), "storage.evict_low_priority", "artwork", "low", map[string]any{"removed": removed, "freedBytes": freed})
+	writeData(w, http.StatusOK, map[string]any{"removed": removed, "freedBytes": freed})
+}
+
+func asciiDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // --- sessions / playback ---

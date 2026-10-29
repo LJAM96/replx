@@ -241,3 +241,32 @@ func TestLiveCollectionDeleteRecreateAndInvalidationRetry(t *testing.T) {
 		t.Fatalf("invalidation retry lost: %v %d %v", pending, invalidations, err)
 	}
 }
+
+func TestLiveTargetedCollectionRefreshLeavesSiblingsUntouched(t *testing.T) {
+	ctx, db := liveDB(t)
+	seedServer(t, db)
+	fx := &collectionFixture{
+		catalog: []string{`{"ratingKey":"800","title":"Daily A"}`, `{"ratingKey":"801","title":"Daily B"}`},
+		members: map[string][]string{
+			"800": {`{"ratingKey":"1","type":"movie"}`},
+			"801": {`{"ratingKey":"2","type":"movie"}`},
+		},
+	}
+	w := newCollectionFixture(t, db, fx)
+	if err := w.SyncCollectionsOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first, _, _ := publishedCollection(t, ctx, db, "800")
+	untouched, _, _ := publishedCollection(t, ctx, db, "801")
+	invalidations := 0
+	w.InvalidateCollections = func(context.Context) error { invalidations++; return nil }
+	fx.members["800"] = []string{`{"ratingKey":"3","type":"movie"}`}
+	if err := w.SyncCollectionOnce(ctx, "800"); err != nil {
+		t.Fatal(err)
+	}
+	updated, _, members := publishedCollection(t, ctx, db, "800")
+	stillUntouched, _, siblingMembers := publishedCollection(t, ctx, db, "801")
+	if updated == first || strings.Join(members, ",") != "3" || stillUntouched != untouched || strings.Join(siblingMembers, ",") != "2" || invalidations != 1 {
+		t.Fatalf("targeted rebuild affected wrong data: target=%d/%d %v sibling=%d/%d %v invalidations=%d", first, updated, members, untouched, stillUntouched, siblingMembers, invalidations)
+	}
+}

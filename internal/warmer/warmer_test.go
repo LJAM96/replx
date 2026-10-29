@@ -136,4 +136,7 @@ func TestStripSecrets(t *testing.T) {
 	if !strings.Contains(got, "type=2") || !strings.Contains(got, "b=1") {
 		t.Fatalf("params lost: %s", got)
 	}
+	if nested := stripSecrets("url=%2Flibrary%2Fmetadata%2F1%2Fthumb%3FX-Plex-Token%3Dnested-secret%26width%3D300"); strings.Contains(nested, "nested-secret") {
+		t.Fatalf("nested URL credential retained: %s", nested)
+	}
 }

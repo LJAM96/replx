@@ -376,10 +376,16 @@ func runServe() error {
 	adminMux.SetMetrics(registry)
 	adminMux.SetCapture(captureStore)
 	adminMux.SetWarmer(warm.Stats)
+	adminMux.SetWarmingControl(warm)
 	adminMux.SetSync(syncWorker)
+	adminMux.SetCollectionRebuilder(syncWorker.SyncCollectionOnce)
 	adminMux.SetCacheInvalidator(proxyHandler.InvalidateCache)
 	if artworkStore != nil {
 		adminMux.SetArtworkStats(artworkStore.Stats)
+		adminMux.SetLowPriorityEvictor(func(ctx context.Context) (int, int64, error) {
+			result, err := artworkStore.EvictLowPriority(ctx)
+			return result.Removed, result.FreedBytes, err
+		})
 	}
 	// Diagnostics gauge: active targeted captures.
 	go func() {

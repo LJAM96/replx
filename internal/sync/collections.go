@@ -280,3 +280,92 @@ func (w *Worker) publishCollections(ctx context.Context, libraryID string, gen i
 	}
 	return nil
 }
+
+// SyncCollectionOnce refreshes one existing collection's child snapshot. It
+// never reconciles the catalog or changes sibling collections.
+func (w *Worker) SyncCollectionOnce(ctx context.Context, ratingKey string) error {
+	if ratingKey == "" {
+		return fmt.Errorf("sync: collection ratingKey required")
+	}
+	w.mu.Lock()
+	if w.inFlight {
+		w.mu.Unlock()
+		return ErrInFlight
+	}
+	w.inFlight = true
+	w.mu.Unlock()
+	defer func() { w.mu.Lock(); w.inFlight = false; w.mu.Unlock() }()
+	token, ok := w.OwnerToken(ctx)
+	if !ok {
+		return fmt.Errorf("sync: no owner credential (onboarding incomplete)")
+	}
+	serverID, err := enabledServer(ctx, w.DB)
+	if err != nil {
+		return err
+	}
+	var libraryID, id string
+	var c collectionJSON
+	var key, sortTitle, summary, thumb, art string
+	var smart bool
+	err = w.DB.QueryRow(ctx, `SELECT c.id::text,c.library_id::text,c.rating_key,COALESCE(c.collection_key,''),c.title,COALESCE(c.sort_title,''),COALESCE(c.summary,''),COALESCE(c.thumb,''),COALESCE(c.art,''),c.smart
+		FROM library_collections c WHERE c.server_id=$1 AND c.rating_key=$2 AND c.published_generation IS NOT NULL`, serverID, ratingKey).Scan(
+		&id, &libraryID, &c.RatingKey, &key, &c.Title, &sortTitle, &summary, &thumb, &art, &smart)
+	if err != nil {
+		return fmt.Errorf("sync: collection %s not found or unpublished: %w", ratingKey, err)
+	}
+	c.Key, c.TitleSort, c.Summary, c.Thumb, c.Art = key, sortTitle, summary, thumb, art
+	c.Smart, _ = json.Marshal(smart)
+	var gen int64
+	if err := w.DB.QueryRow(ctx, `SELECT nextval('collection_snapshot_generation_seq')`).Scan(&gen); err != nil {
+		return err
+	}
+	if err := w.stageCollection(ctx, serverID, libraryID, token, c, gen); err != nil {
+		return err
+	}
+	return w.publishOneCollection(ctx, id, libraryID, gen)
+}
+
+func (w *Worker) publishOneCollection(ctx context.Context, collectionID, libraryID string, gen int64) error {
+	tx, err := w.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var changed bool
+	if err := tx.QueryRow(ctx, `SELECT staged.content_hash IS DISTINCT FROM old.content_hash
+		FROM collection_snapshots staged JOIN library_collections c ON c.id=staged.collection_id
+		LEFT JOIN collection_snapshots old ON old.collection_id=c.id AND old.generation=c.published_generation
+		WHERE c.id=$1 AND staged.generation=$2 AND staged.completed_at IS NOT NULL`, collectionID, gen).Scan(&changed); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE library_collections c SET collection_key=NULLIF(s.metadata->>'key',''),title=s.metadata->>'title',sort_title=NULLIF(s.metadata->>'titleSort',''),summary=NULLIF(s.metadata->>'summary',''),thumb=NULLIF(s.metadata->>'thumb',''),art=NULLIF(s.metadata->>'art',''),smart=(s.metadata->>'smart')::boolean,published_generation=CASE WHEN s.content_hash IS DISTINCT FROM old.content_hash THEN $2 ELSE c.published_generation END,synced_at=now()
+		FROM collection_snapshots s LEFT JOIN collection_snapshots old ON old.collection_id=s.collection_id AND old.generation=(SELECT previous.published_generation FROM library_collections previous WHERE previous.id=s.collection_id)
+		WHERE c.id=$1 AND s.collection_id=c.id AND s.generation=$2 AND s.completed_at IS NOT NULL`, collectionID, gen); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE library_collection_syncs SET invalidation_pending=invalidation_pending OR $2 WHERE library_id=$1`, libraryID, changed); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM collection_snapshots WHERE collection_id=$1 AND generation IS DISTINCT FROM (SELECT published_generation FROM library_collections WHERE id=$1)`, collectionID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	return w.flushCollectionInvalidation(ctx, libraryID)
+}
+
+func (w *Worker) flushCollectionInvalidation(ctx context.Context, libraryID string) error {
+	var pending bool
+	if err := w.DB.QueryRow(ctx, `SELECT invalidation_pending FROM library_collection_syncs WHERE library_id=$1`, libraryID).Scan(&pending); err != nil {
+		return err
+	}
+	if !pending || w.InvalidateCollections == nil {
+		return nil
+	}
+	if err := w.InvalidateCollections(ctx); err != nil {
+		return err
+	}
+	_, err := w.DB.Exec(ctx, `UPDATE library_collection_syncs SET invalidation_pending=false WHERE library_id=$1`, libraryID)
+	return err
+}
