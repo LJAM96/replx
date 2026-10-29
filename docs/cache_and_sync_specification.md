@@ -65,6 +65,11 @@ Raw Plex tokens never appear in keys.
 
 ## Default TTLs
 
+Implementation update (agent execution batch A): home/hub, Continue Watching,
+on-deck and resume feeds bypass the response cache and are read live from PMS.
+The feed TTL/stale values below describe the earlier policy and are not active
+for those routes. No stale serving is enabled in this implementation.
+
 | Class | TTL | Stale allowance |
 | --- | ---: | ---: |
 | PMS identity | 5 minutes | 30 minutes |
@@ -87,6 +92,12 @@ bounded duration and re-check. Acquisition is atomic (check-and-claim
 under one lock): exactly one request per key becomes the refresher.
 
 ## Invalidation generations
+
+Batch A expands successful watch-write invalidation to the writer's recorded
+response classes after PMS acknowledges the operation. Foreground and background
+fills check the generation captured before their fetch before publishing results.
+Generations remain process-local; durable restart-safe epochs are assigned to
+execution batch B and are not complete.
 
 Keys carry per-scope, per-class and global generation segments
 (`...:{scope}:{representation}:{scopeGen}:{globalGen}:{hash}`).
@@ -123,9 +134,13 @@ full consistency sweep every 6 hours
 
 ## Continue Watching
 
-Cache the actual user scoped PMS Continue Watching response. Do not attempt to reimplement Plex's Continue Watching ranking algorithm.
+Fetch the actual user scoped PMS Continue Watching response live. Home/hub
+containers also bypass caching because they may embed the same watch state.
+Do not attempt to reimplement Plex's Continue Watching ranking algorithm.
 
-Invalidate after successful timeline, scrobble and unscrobble changes.
+Invalidate the writer's affected response namespaces after successful timeline,
+scrobble and unscrobble changes. Updates sent directly to PMS remain a real-client
+validation requirement; Replx cannot invalidate a write it did not observe.
 
 ## Search
 

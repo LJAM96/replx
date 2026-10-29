@@ -303,9 +303,16 @@ func (w *Warmer) countErr() {
 // refresh re-fetches one entry under the owner token and stores 200s
 // within the entry cap. Anything else is an error (no negative caching:
 // a flapping origin must not poison hot keys). The store key is
-// recomputed under current invalidation generations so a refresh never
-// resurrects a retired namespace; a superseded tracked key is dropped.
+// captured before fetching and checked again before publication so an
+// invalidation during the fetch cannot publish an old body as current.
 func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner string) error {
+	storeKey := key
+	if w.KeyFunc != nil {
+		storeKey = w.KeyFunc(s)
+		if storeKey == "" {
+			return refreshError{msg: "warmer: cache key unavailable"}
+		}
+	}
 	target := w.origin + s.Path
 	if s.RawQuery != "" {
 		target += "?" + s.RawQuery
@@ -317,6 +324,9 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 	req.Header.Set("X-Plex-Token", owner)
 	if s.Accept != "" {
 		req.Header.Set("Accept", s.Accept)
+	}
+	if _, ok := cache.RequestCacheable(req); !ok {
+		return refreshError{msg: "warmer: request is not cacheable"}
 	}
 	// Warmer refreshes feed the identity-normalized cache: ask for
 	// identity encoding so stored bytes stay servable to any client.
@@ -330,9 +340,9 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 		return errStatus(resp.StatusCode)
 	}
-	if ce := strings.TrimSpace(strings.ToLower(resp.Header.Get("Content-Encoding"))); ce != "" && ce != "identity" {
+	if !cache.StorableResponse(resp.Header) {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return refreshError{msg: "warmer: encoded origin response not storable"}
+		return refreshError{msg: "warmer: origin response not storable"}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, cache.MaxEntryBytes+1))
 	if err != nil {
@@ -341,15 +351,13 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 	if len(body) > cache.MaxEntryBytes {
 		return errTooLarge()
 	}
-	storeKey := key
-	if w.KeyFunc != nil {
-		if nk := w.KeyFunc(s); nk != "" {
-			storeKey = nk
-		}
+	if w.KeyFunc != nil && w.KeyFunc(s) != storeKey {
+		return refreshError{msg: "warmer: generation changed during refresh"}
 	}
 	if err := w.store.Set(ctx, storeKey, cache.Entry{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
+		Headers:     cache.SafeHeaders(resp.Header),
 		Body:        body,
 	}, s.TTL); err != nil {
 		return err

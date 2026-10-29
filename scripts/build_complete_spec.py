@@ -31,6 +31,8 @@ order = [
     'docs/operations_runbook.md',
     'docs/ci_release_backup_upgrade.md',
     'docs/implementation_roadmap.md',
+    'docs/bounded_cache_implementation_plan.md',
+    'docs/agent_execution_plan.md',
     'docs/acceptance_criteria.md',
     'deploy/media_fallback_design.md',
     'deploy/compose.yml',

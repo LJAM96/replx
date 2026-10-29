@@ -227,6 +227,8 @@ type obs struct {
 	cacheTTL   time.Duration
 	cacheable  bool
 	cacheState string
+	scopeGen   uint64
+	globalGen  uint64
 }
 
 func (h *Handler) observe(r *http.Request) obs {
@@ -262,16 +264,25 @@ func (h *Handler) observe(r *http.Request) obs {
 	// Resolved accounts share one scope across all their devices. The
 	// fingerprint gate (secret+token required) keeps a missing secret
 	// from collapsing everyone into one bucket.
-	if h.cache != nil && o.fingerprint != "" && o.scope != "" {
-		if ttl, ok := cache.Cacheable(r.Method, r.URL.Path); ok {
+	if h.cache != nil && o.fingerprint != "" && o.scope != "" && !o.invalid {
+		if ttl, ok := cache.RequestCacheable(r); ok {
 			o.cacheable = true
 			o.cacheTTL = ttl
-			class := cache.ClassOf(r.URL.Path)
-			sg, gg := h.gens.Get(o.scope, class)
-			o.cacheKey = cache.ResponseKeyGen(o.scope, class, r.Method, r.URL.Path, r.URL.Query(), r.Header.Get("Accept"), sg, gg)
+			h.refreshCacheGeneration(r, &o)
 		}
 	}
 	return o
+}
+
+func (h *Handler) refreshCacheGeneration(r *http.Request, o *obs) {
+	class := cache.ClassOf(r.URL.Path)
+	o.scopeGen, o.globalGen = h.gens.Get(o.scope, class)
+	o.cacheKey = cache.RequestKeyGen(o.scope, class, r, o.scopeGen, o.globalGen)
+}
+
+func (h *Handler) currentCacheGeneration(r *http.Request, o obs) bool {
+	sg, gg := h.gens.Get(o.scope, cache.ClassOf(r.URL.Path))
+	return sg == o.scopeGen && gg == o.globalGen
 }
 
 // serveCache attempts a cached control response. It reports whether it
@@ -283,8 +294,11 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 		// PMS answers live (usually 401) instead.
 		return false
 	}
+	// A request may have waited for another fill while a watch write was
+	// acknowledged. Recompute before lookup and reject a retired read.
+	h.refreshCacheGeneration(r, o)
 	entry, ok, err := h.cache.Get(r.Context(), o.cacheKey)
-	if err != nil || !ok {
+	if err != nil || !ok || !h.currentCacheGeneration(r, *o) {
 		o.cacheState = "miss"
 		if h.metrics != nil {
 			h.metrics.IncCacheMiss()
@@ -419,12 +433,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if routeClass == "control" && h.serveCache(w, r, id, &o, start) {
 		return
 	}
-	// Watch-state invalidation runs for every state mutation, whether or
-	// not the route itself is cacheable: timeline/scrobble POSTs retire
-	// the writer's Continue Watching namespace via generations.
-	if isStateWrite(r.URL.Path) {
-		h.bumpStateGeneration(o.scope)
-	}
 	// Stampede control: one request refreshes an expired object while
 	// concurrent requests for the same key wait bounded for the cache to
 	// populate, then serve the fresh entry instead of churning origin.
@@ -449,22 +457,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.proxy(w, r, id, o, routeClass, start)
 }
 
-// isStateWrite reports watch-state mutations that retire Continue
-// Watching: timeline progress plus scrobble transitions.
+// isStateWrite recognizes Plex watch mutations, which may use GET verbs.
 func isStateWrite(path string) bool {
 	p := strings.ToLower(path)
-	return strings.Contains(p, "/:/timeline") ||
-		strings.Contains(p, "/:/scrobble") ||
-		strings.Contains(p, "/:/unscrobble")
+	for _, suffix := range []string{"/:/timeline", "/:/progress", "/:/scrobble", "/:/unscrobble"} {
+		if strings.HasSuffix(strings.TrimSuffix(p, "/"), suffix) {
+			return true
+		}
+	}
+	return gateway.IsSessionStop(p)
 }
 
-// bumpStateGeneration retires the writer's Continue Watching namespace in
-// constant time. TTLs remain the correctness backstop.
+// bumpStateGeneration retires all writer responses: details, collections,
+// section badges and show/season counts can all carry watch state.
 func (h *Handler) bumpStateGeneration(scope string) {
 	if h.gens == nil || scope == "" {
 		return
 	}
-	h.gens.Bump(scope, "cw")
+	h.gens.BumpScope(scope)
 }
 
 // Generations exposes the cache invalidation registry for admin wiring.
@@ -851,6 +861,12 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 	}
 	defer resp.Body.Close()
 
+	// Retire reads fetched before successful origin acknowledgement. A
+	// failed write never invents a local watch-state transition.
+	if r.Method != http.MethodHead && r.Method != http.MethodOptions && resp.StatusCode >= 200 && resp.StatusCode < 300 && isStateWrite(r.URL.Path) {
+		h.bumpStateGeneration(o.scope)
+	}
+
 	// Response-side media guard: in tunnel mode a control-classified route
 	// that returns bulk media bytes must fail closed BEFORE streaming.
 	// This covers unknown large-body media the path classifier could not
@@ -883,7 +899,7 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 // response for replay, and oversize bodies stream through uncached. The
 // client always receives whatever the origin produced either way.
 func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *http.Response) int64 {
-	if !o.cacheable || resp.StatusCode != http.StatusOK || !storableResponse(resp.Header) {
+	if !o.cacheable || resp.StatusCode != http.StatusOK || !cache.StorableResponse(resp.Header) {
 		n, _ := io.Copy(w, resp.Body)
 		return n
 	}
@@ -900,13 +916,18 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 		return n + rest
 	}
 	body := buf.Bytes()
+	if !h.currentCacheGeneration(r, o) {
+		return n
+	}
 	_ = h.cache.Set(r.Context(), o.cacheKey, cache.Entry{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
 		Headers:     cache.SafeHeaders(resp.Header),
 		Body:        body,
 	}, o.cacheTTL)
-	if h.warmer != nil {
+	// Snapshots currently reproduce only query and Accept. Header variants
+	// remain cacheable on demand, but must not be refreshed without them.
+	if h.warmer != nil && cache.HeaderVariation(r.Header) == "" {
 		h.warmer.Track(o.cacheKey, warmer.Snapshot{
 			Method:   r.Method,
 			Path:     r.URL.Path,
@@ -918,22 +939,6 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 		})
 	}
 	return n
-}
-
-// storableResponse reports whether an origin response is safe to persist:
-// identity encoding only (stored bytes must be servable regardless of the
-// requester's Accept-Encoding) and no wildcard Vary (the key does not
-// model arbitrary request variation).
-func storableResponse(hdr http.Header) bool {
-	if ce := strings.TrimSpace(strings.ToLower(hdr.Get("Content-Encoding"))); ce != "" && ce != "identity" {
-		return false
-	}
-	for _, v := range strings.Split(hdr.Get("Vary"), ",") {
-		if strings.TrimSpace(strings.ToLower(v)) == "*" {
-			return false
-		}
-	}
-	return true
 }
 
 func (h *Handler) writeBadGateway(w http.ResponseWriter, r *http.Request, id string, o obs, routeClass string, start time.Time) {

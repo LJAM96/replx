@@ -398,7 +398,7 @@ func TestCacheHitServesWithoutOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	get := func() *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/hubs/home/recentlyAdded?contentDirectoryID=22", nil)
+		req := httptest.NewRequest(http.MethodGet, "/library/sections/22/recentlyAdded", nil)
 		req.Header.Set("X-Plex-Token", "user-a-token")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -439,7 +439,7 @@ func TestCacheIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	get := func(token string) string {
-		req := httptest.NewRequest(http.MethodGet, "/hubs/home/continueWatching", nil)
+		req := httptest.NewRequest(http.MethodGet, "/library/metadata/1", nil)
 		req.Header.Set("X-Plex-Token", token)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -877,7 +877,7 @@ func TestSearchPassthroughNeverServesLocal(t *testing.T) {
 	}
 }
 
-func TestStateWriteBumpsCWGeneration(t *testing.T) {
+func TestContinueWatchingAlwaysLive(t *testing.T) {
 	const secret = "test-secret-for-cw-invalidation-0123456789"
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
@@ -895,11 +895,11 @@ func TestStateWriteBumpsCWGeneration(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec
 	}
-	if got := cw(); got.Header().Get(CacheHeader) != "miss" {
-		t.Fatalf("first CW must miss, got %s", got.Header().Get(CacheHeader))
+	if got := cw(); got.Header().Get(CacheHeader) != "bypass" {
+		t.Fatalf("first CW must bypass, got %s", got.Header().Get(CacheHeader))
 	}
-	if got := cw(); got.Header().Get(CacheHeader) != "hit" {
-		t.Fatalf("second CW must hit, got %s", got.Header().Get(CacheHeader))
+	if got := cw(); got.Header().Get(CacheHeader) != "bypass" {
+		t.Fatalf("second CW must bypass, got %s", got.Header().Get(CacheHeader))
 	}
 	// Watch-state mutation retires the CW namespace even though the
 	// timeline route itself is never cacheable.
@@ -910,8 +910,8 @@ func TestStateWriteBumpsCWGeneration(t *testing.T) {
 	if timelineRec.Code != http.StatusOK {
 		t.Fatalf("timeline must proxy, got %d", timelineRec.Code)
 	}
-	if got := cw(); got.Header().Get(CacheHeader) != "miss" {
-		t.Fatalf("CW after timeline must miss, got %s", got.Header().Get(CacheHeader))
+	if got := cw(); got.Header().Get(CacheHeader) != "bypass" {
+		t.Fatalf("CW after timeline must bypass, got %s", got.Header().Get(CacheHeader))
 	}
 }
 

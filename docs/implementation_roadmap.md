@@ -1,5 +1,10 @@
 # Implementation Roadmap
 
+For the detailed deployment-specific sequence covering a 200 GB VPS, shared
+artwork, three users, daily collection updates and live Continue Watching, see
+[Bounded library acceleration implementation plan](bounded_cache_implementation_plan.md).
+That document describes proposed work and acceptance gates, not completed runtime behavior.
+
 ## Alpha: Foundations, owner auth, discovery and routing spike
 
 Implement:

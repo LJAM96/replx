@@ -5,8 +5,8 @@
 // secret query params are stripped before hashing. Watch state
 // (timeline), negotiation (transcode decisions), media bytes and artwork
 // transcodes are never cacheable: only idempotent browse GETs with short
-// TTLs. Invalidation is TTL plus the Gamma PMS event consumer (later);
-// short TTLs keep operator surprise bounded until then.
+// TTLs. Home/hub and resume feeds stay live; successful watch mutations
+// retire the writer's response generations.
 package cache
 
 import (
@@ -26,7 +26,7 @@ import (
 )
 
 // SchemaVersion prefixes every key so a codec/policy change can roll keys.
-const SchemaVersion = "v2"
+const SchemaVersion = "v3"
 
 // MaxEntryBytes caps a cacheable body. Larger origins stream uncached;
 // the client still receives full bytes, only caching is skipped.
@@ -49,45 +49,28 @@ var ttlByPrefix = []struct {
 	{"/library/metadata/", 5 * time.Minute},
 	{"/library/sections", 5 * time.Minute},
 	{"/identity", 5 * time.Minute},
-	{"/hubs/", 10 * time.Second},
-}
-
-// hubTTL refines /hubs/ by feed: Continue Watching and Recently Added
-// change faster than structural hubs. Values match the spec table; the
-// owner warmer renews hot entries at TTL/2. There is no stale serving:
-// expiry is a hard miss.
-func hubTTL(path string) (time.Duration, bool) {
-	p := strings.ToLower(path)
-	if !strings.HasPrefix(p, "/hubs/") {
-		return 0, false
-	}
-	if strings.Contains(p, "continuewatching") {
-		return 5 * time.Second, true
-	}
-	if strings.Contains(p, "recentlyadded") {
-		return 15 * time.Second, true
-	}
-	if strings.Contains(p, "/search") {
-		return 30 * time.Second, true
-	}
-	return 10 * time.Second, true
 }
 
 // Cacheable reports whether a method+path pair is safe to cache and its
 // TTL. Only idempotent browse GETs qualify; timeline, decisions, media,
 // artwork and streams never do (they are absent from the prefix table).
 func Cacheable(method, path string) (time.Duration, bool) {
-	if method != "GET" && method != "HEAD" {
+	if method != "GET" {
 		return 0, false
 	}
 	p := strings.ToLower(path)
-	if ttl, ok := hubTTL(p); ok {
-		return ttl, true
+	// Hub containers can embed Continue Watching even when their URL does
+	// not name that feed. Until client captures establish narrower policies,
+	// every hub and on-deck/resume feed is live.
+	for _, part := range strings.Split(p, "/") {
+		if part == "hubs" || part == "home" || part == "ondeck" || part == "continuewatching" || part == "resume" || part == ":" {
+			return 0, false
+		}
 	}
 	best := -1
 	for i, e := range ttlByPrefix {
-		if e.prefix == "/hubs/" {
-			continue // handled above with feed granularity
+		if !strings.HasSuffix(e.prefix, "/") && p != e.prefix {
+			continue
 		}
 		if strings.HasPrefix(p, e.prefix) && (best < 0 || len(e.prefix) > len(ttlByPrefix[best].prefix)) {
 			best = i
@@ -123,24 +106,18 @@ func ResponseKeyGen(scope, class, method, path string, query url.Values, accept 
 	b.WriteByte(0)
 	b.WriteString(path)
 	b.WriteByte(0)
-	keys := make([]string, 0, len(query))
-	for k := range query {
+	// Preserve the exact representation negotiation, including preference
+	// order and quality values, rather than only its json/xml label.
+	b.WriteString(accept)
+	b.WriteByte(0)
+	canonicalQuery := make(url.Values, len(query))
+	for k, values := range query {
 		if secretParams[strings.ToLower(k)] {
 			continue
 		}
-		keys = append(keys, k)
+		canonicalQuery[k] = values
 	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		vals := append([]string(nil), query[k]...)
-		sort.Strings(vals)
-		for _, v := range vals {
-			b.WriteString(k)
-			b.WriteByte('=')
-			b.WriteString(v)
-			b.WriteByte('&')
-		}
-	}
+	b.WriteString(canonicalQuery.Encode())
 	sum := sha256.Sum256([]byte(b.String()))
 	rep := normalizeRepresentation(accept)
 	if class == "" {
@@ -150,9 +127,8 @@ func ResponseKeyGen(scope, class, method, path string, query url.Values, accept 
 		SchemaVersion, "default", class, scope, rep, scopeGen, globalGen, hex.EncodeToString(sum[:])[:16])
 }
 
-// ClassOf partitions a path into an invalidation namespace. Continue
-// Watching gets its own class so watch-state writes retire only it, not
-// every hub for the user.
+// ClassOf partitions paths for invalidation and diagnostics. Hub and CW
+// classes remain recognizable even though those feeds are served live.
 func ClassOf(path string) string {
 	p := strings.ToLower(path)
 	switch {
@@ -277,6 +253,8 @@ func normalizeRepresentation(accept string) string {
 // written by older allowlists are re-filtered on read and lose it.
 var safeHeaders = map[string]bool{
 	"Etag": true, "Last-Modified": true, "Content-Language": true,
+	"Vary": true, "X-Plex-Container-Start": true, "X-Plex-Container-Size": true,
+	"X-Plex-Container-Total-Size": true,
 }
 
 // SafeHeaders extracts the allowlisted subset of an origin header set.
@@ -288,6 +266,9 @@ func SafeHeaders(h http.Header) map[string]string {
 			continue
 		}
 		out[canonical] = vv[0]
+		if canonical == "Vary" {
+			out[canonical] = strings.Join(vv, ", ")
+		}
 	}
 	return out
 }
