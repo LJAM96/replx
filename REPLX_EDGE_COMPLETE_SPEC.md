@@ -1520,6 +1520,18 @@ personalized metadata
 
 CI must include a two user isolation test that poisons one user's cache and proves the second user never receives it.
 
+### Exact response authorization lease
+
+Identity and a recently valid Plex.tv credential do not prove current access
+to a cached PMS response. Batch B adds a memory-only lease keyed by the caller's
+token fingerprint and the exact response cache key. Only a completed, successful
+response fetched from PMS with that caller token grants reuse. Leases expire after
+30 seconds without extending on cache hits. Expired, absent or invalidated leases
+bypass the cached response and reauthorize through PMS. Local artwork uses the
+same rule with its exact account-scoped transformation key. Warming never grants
+user authorization. The lease is not a section ACL or a substitute for Plex
+permission evaluation; real revocation behavior still needs client/PMS validation.
+
 ## Canonical cache key
 
 ```text
@@ -1567,8 +1579,11 @@ under one lock): exactly one request per key becomes the refresher.
 Batch A expands successful watch-write invalidation to the writer's recorded
 response classes after PMS acknowledges the operation. Foreground and background
 fills check the generation captured before their fetch before publishing results.
-Generations remain process-local; durable restart-safe epochs are assigned to
-execution batch B and are not complete.
+Batch B persists global, per-scope and per-class counters in PostgreSQL. Scope
+identifiers are stored as SHA-256 digests. Production cache reads bypass when a
+generation cannot be read; a failed bump disables cache serving until a successful
+global recovery bump. The migration seeds a nonzero default global counter and the
+key schema advances to v4, retiring prior process-local generation namespaces.
 
 Keys carry per-scope, per-class and global generation segments
 (`...:{scope}:{representation}:{scopeGen}:{globalGen}:{hash}`).
@@ -3562,7 +3577,7 @@ Do not start by downloading the entire library. That would consume the storage b
 
 # Agent execution plan
 
-Status: batch A implemented and locally checked on 29 October 2026; batch B is next. This is a reusable instruction document for Codex, not a standalone shell scheduler.
+Status: batches A and B implemented and locally checked on 29 October 2026; batch C is next. This is a reusable instruction document for Codex, not a standalone shell scheduler.
 
 ## Run instruction
 
@@ -3607,9 +3622,14 @@ Model settings are passed when spawning each agent. The coordinator cannot chang
 3. Luna Medium: read-only artwork/collection interface assessment.
 4. Coordinator: integrate, inspect diffs, run checks and record remaining work.
 
-### B: cache authorization and durable invalidation — pending
+### B: cache authorization and durable invalidation — locally complete
 
-Sol High completes request-variation handling, durable generation storage and resource authorization contracts. Sol review verifies per-user visibility, revocation and restart races. Resolve these interfaces before shared-artwork implementation.
+1. Sol High: add `cache_generations` migration and Postgres/memory generation stores. Store only a digest of scopes; keep independent server, scope and class counters. Seed the default global counter and advance cache key schema to v4.
+2. Sol High: wire production proxy and warmer keys to Postgres generation reads; bypass on generation read failure. A failed durable bump disables cache serving until an operator/global successful recovery bump.
+3. Sol High: add exact-response authorization leases in memory, keyed by caller fingerprint plus exact request cache key. Grant only after a complete successful caller-token PMS response; a lease lasts 30 seconds, does not slide and is revoked on known invalid credentials. Expired or absent proof bypasses local response/artwork reuse.
+4. Sol review: verify exact-request scope, restart behavior, SQL atomicity, key privacy, and fail-closed paths.
+
+Gate completed locally: SQL integration tests exercised migrations and a new generation-store instance after restart; current counters remain effective and a later scope bump retires all earlier classes. Real Plex permission revocation and client behavior remain unverified. The 30-second lease is a bounded authorization staleness window, not a library ACL. Unknown/managed-content semantics still need live testing. Race tests remain unavailable without CGO tooling.
 
 ### C: shared artwork — pending
 
@@ -3635,7 +3655,8 @@ Sol High reviews integrated changes and runs failure/race tests with required se
 - Batch A completed: bounded inventory command, live home/watch feeds, request-header variation keys, successful watch-write invalidation and foreground/background generation guards.
 - Inventory received a separate read-only review; findings were corrected before integration.
 - `go test ./...` and `go vet ./...` pass after integration. SQL-backed tests skip without their database configuration; Docker's daemon is unavailable. Race testing requires CGO in this Windows environment and did not run. Real PMS and client checks did not run.
-- Header-dependent responses remain cacheable on demand but are not background-warmed because the current warmer cannot reproduce their headers. Durable generations, resource authorization improvements, shared artwork and storage admission are pending batches B/C.
+- Header-dependent responses remain cacheable on demand but are not background-warmed because the current warmer cannot reproduce their headers. Shared artwork and storage admission are pending batch C.
+- Batch B complete: durable Postgres generations, v4 cache namespace, exact caller/resource leases and proxy integration are in place. `go test ./... -count=1` passed with `REPLX_EDGE_TEST_POSTGRES_URL` pointing to the temporary local PostgreSQL test instance; `go vet ./...`, generated-spec check and `git diff --check` passed.
 - This completes the bounded first execution batch, not all Phase 0/2 requirements or the overall implementation roadmap. No deployment or commits were performed.
 
 ## Initial assessment findings

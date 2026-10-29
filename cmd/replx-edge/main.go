@@ -116,6 +116,8 @@ func runServe() error {
 		return err
 	}
 	defer db.Close()
+	generationStore := cache.NewPostgresGenerations(db.Raw(), "default")
+	var generationsLoaded atomic.Bool
 	migrate := func() {
 		mctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		defer cancel()
@@ -126,10 +128,16 @@ func runServe() error {
 		}
 		logger.Log(logging.Entry{Level: "info", Component: "database",
 			Fields: map[string]any{"event": "migrate_complete"}})
+		if err := generationStore.Load(mctx); err != nil {
+			logger.Log(logging.Entry{Level: "error", Component: "cache",
+				Fields: map[string]any{"event": "generation_store_load_failed", "error": err.Error()}})
+			return
+		}
+		generationsLoaded.Store(true)
 	}
 	go func() {
 		migrate()
-		if db.MigrationsComplete() {
+		if db.MigrationsComplete() && generationsLoaded.Load() {
 			return
 		}
 		ticker := time.NewTicker(30 * time.Second)
@@ -141,7 +149,7 @@ func runServe() error {
 			case <-ticker.C:
 			}
 			migrate()
-			if db.MigrationsComplete() {
+			if db.MigrationsComplete() && generationsLoaded.Load() {
 				return
 			}
 		}
@@ -193,6 +201,8 @@ func runServe() error {
 			Fields: map[string]any{"event": "cache_degraded", "reason": "valkey unreachable; browse falls through to origin"}})
 	}
 	cacheStore := cache.NewValkeyStore(cacheClient)
+	// Durable generations ensure watch-write invalidations remain retired
+	// across restarts while Valkey response entries persist.
 	// Identity pipeline: fingerprint to Plex account resolution with
 	// account-scoped cache sharing across a user's devices. plex.tv is
 	// consulted on cold fingerprints only; user tokens are never stored.
@@ -269,6 +279,7 @@ func runServe() error {
 		Metrics:     registry,
 		Capture:     captureStore,
 		Cache:       cacheStore,
+		Generations: generationStore,
 		Warmer:      warm,
 		Playback:    playbackEngine,
 		Artwork:     artworkStore,
@@ -297,7 +308,12 @@ func runServe() error {
 		if class == "" {
 			class = cache.ClassOf(s.Path)
 		}
-		sg, gg := proxyHandler.Generations().Get(s.Scope, class)
+		gctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		sg, gg, err := generationStore.Get(gctx, s.Scope, class)
+		if err != nil {
+			return ""
+		}
 		return cache.ResponseKeyGen(s.Scope, class, s.Method, s.Path, q, s.Accept, sg, gg)
 	}
 

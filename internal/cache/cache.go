@@ -26,7 +26,7 @@ import (
 )
 
 // SchemaVersion prefixes every key so a codec/policy change can roll keys.
-const SchemaVersion = "v3"
+const SchemaVersion = "v4"
 
 // MaxEntryBytes caps a cacheable body. Larger origins stream uncached;
 // the client still receives full bytes, only caching is skipped.

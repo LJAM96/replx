@@ -49,6 +49,18 @@ personalized metadata
 
 CI must include a two user isolation test that poisons one user's cache and proves the second user never receives it.
 
+### Exact response authorization lease
+
+Identity and a recently valid Plex.tv credential do not prove current access
+to a cached PMS response. Batch B adds a memory-only lease keyed by the caller's
+token fingerprint and the exact response cache key. Only a completed, successful
+response fetched from PMS with that caller token grants reuse. Leases expire after
+30 seconds without extending on cache hits. Expired, absent or invalidated leases
+bypass the cached response and reauthorize through PMS. Local artwork uses the
+same rule with its exact account-scoped transformation key. Warming never grants
+user authorization. The lease is not a section ACL or a substitute for Plex
+permission evaluation; real revocation behavior still needs client/PMS validation.
+
 ## Canonical cache key
 
 ```text
@@ -96,8 +108,11 @@ under one lock): exactly one request per key becomes the refresher.
 Batch A expands successful watch-write invalidation to the writer's recorded
 response classes after PMS acknowledges the operation. Foreground and background
 fills check the generation captured before their fetch before publishing results.
-Generations remain process-local; durable restart-safe epochs are assigned to
-execution batch B and are not complete.
+Batch B persists global, per-scope and per-class counters in PostgreSQL. Scope
+identifiers are stored as SHA-256 digests. Production cache reads bypass when a
+generation cannot be read; a failed bump disables cache serving until a successful
+global recovery bump. The migration seeds a nonzero default global counter and the
+key schema advances to v4, retiring prior process-local generation namespaces.
 
 Keys carry per-scope, per-class and global generation segments
 (`...:{scope}:{representation}:{scopeGen}:{globalGen}:{hash}`).

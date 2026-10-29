@@ -70,7 +70,7 @@ func TestKeyStripsSecretsAndSorts(t *testing.T) {
 	if a == json {
 		t.Fatal("representations must never share keys")
 	}
-	if !strings.HasPrefix(a, "replx_edge:v3:default:hubs:fp-user-1:xml:0:0:") {
+	if !strings.HasPrefix(a, "replx_edge:v4:default:hubs:fp-user-1:xml:0:0:") {
 		t.Fatalf("key shape: %s", a)
 	}
 }
