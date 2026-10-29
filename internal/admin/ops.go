@@ -68,6 +68,30 @@ func (m *Mux) SetSync(w syncpkgWorker) {
 	m.syncWorker = w
 	m.mux.HandleFunc("/api/v1/sync/status", m.auth(m.handleSyncStatus))
 	m.mux.HandleFunc("/api/v1/sync/full", m.auth(m.handleSyncFull))
+	m.mux.HandleFunc("/api/v1/server/collections/refresh", m.auth(m.handleCollectionsRefresh))
+}
+
+// handleCollectionsRefresh is a completion hook for external collection
+// builders. It is protected by the same local admin authentication as sync.
+func (m *Mux) handleCollectionsRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "POST only")
+		return
+	}
+	if m.syncWorker == nil {
+		writeError(w, http.StatusConflict, "SYNC_DISABLED", "no sync worker wired")
+		return
+	}
+	if err := m.syncWorker.SyncCollectionsOnce(r.Context()); err != nil {
+		if errors.Is(err, syncpkg.ErrInFlight) {
+			writeError(w, http.StatusConflict, "SYNC_IN_FLIGHT", "another sync is already running")
+			return
+		}
+		writeError(w, http.StatusBadGateway, "COLLECTION_SYNC_FAILED", err.Error())
+		return
+	}
+	m.auditEvent(r.Context(), subjectOf(r), "sync.collections", "library", "collections", map[string]any{"result": "complete"})
+	writeData(w, http.StatusOK, map[string]any{"completed": true})
 }
 
 func (m *Mux) handleSyncStatus(w http.ResponseWriter, r *http.Request) {

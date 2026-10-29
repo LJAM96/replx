@@ -111,6 +111,11 @@ func TestHandleEventData(t *testing.T) {
 	if !w.isDirty("22") {
 		t.Fatal("completed refresh must dirty the section")
 	}
+	collections := &Worker{}
+	collections.handleEventData(`{"NotificationContainer":{"type":"activity","Activity":{"type":"library.refresh.collections","subtype":"library.refresh.collections","progress":100,"Context":{"key":"/library/sections/22/refresh"}}}}`)
+	if !collections.isCollectionsDirty("22") {
+		t.Fatal("completed collection refresh must dirty the collection catalog")
+	}
 	w2 := &Worker{dirty: map[string]bool{}}
 	w2.handleEventData(`{"NotificationContainer":{"type":"activity","Activity":{"type":"library.refresh.items","subtype":"library.refresh.items","progress":42,"Context":{"key":"/library/sections/22/refresh"}}}}`)
 	if w2.isDirty("22") {

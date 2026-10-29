@@ -49,6 +49,7 @@ Responses include:
 | GET | `/api/v1/server` | PMS and discovery status |
 | POST | `/api/v1/server/test` | Test origin and identity |
 | POST | `/api/v1/server/sync` | Queue reconciliation |
+| POST | `/api/v1/server/collections/refresh` | Reconcile collection catalog and ordered membership after an external collection builder completes |
 | GET | `/api/v1/users` | User list |
 | GET | `/api/v1/users/{id}` | User detail |
 | GET | `/api/v1/users/{id}/policy` | User policy |
@@ -93,6 +94,8 @@ Browser panels authenticate with the session cookie plus per-session CSRF token;
 `POST /server/test` defaults to 5 requests per minute per admin session.
 
 `POST /server/sync` is idempotent while a sync is already queued or running. Only one full reconciliation may run at once. A repeated call returns the current job ID instead of starting a second scan.
+
+`POST /api/v1/server/collections/refresh` is an optional authenticated completion hook for a collection builder such as Aggregar. Call it after the builder has finished changing collections. The request runs a bounded owner-token reconciliation of all library collection catalogs and child pages; it does not accept or return a Plex token. A complete collection snapshot publishes its ordered membership in one transaction. Failed/incomplete scans preserve the last published membership and return an error. A successful publication advances the server-wide `collections` response generation so all users refresh collection pages without evicting unrelated cache classes. The periodic full sync remains the fallback if the hook is not configured.
 
 Expensive cache invalidation operations require explicit scope and are rate limited. Invalidation retires generations (per scope/class, or global), never reconstructed keys.
 

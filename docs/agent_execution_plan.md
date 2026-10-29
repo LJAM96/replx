@@ -1,6 +1,6 @@
 # Agent execution plan
 
-Status: batches A, B and C implemented and locally checked on 29 October 2026; batch D is next. This is a reusable instruction document for Codex, not a standalone shell scheduler.
+Status: batches A, B and C implemented and locally checked on 29 October 2026; batch D implementation is in integration. This is a reusable instruction document for Codex, not a standalone shell scheduler.
 
 ## Run instruction
 
@@ -58,9 +58,11 @@ Gate completed locally: SQL integration tests exercised migrations and a new gen
 
 Sol High implemented shared content-addressed blobs, PostgreSQL transform references, atomic publication, per-caller authorization gates, write reservations, crash recovery, priority eviction and a minimum-free-space guard. Admin storage reporting exposes bounded capacity figures. Gate evidence: proxy and SQL tests verify three callers must each authorize through PMS, their scoped references deduplicate identical bytes to one blob, and anonymous reuse is denied; replacement preserves other references; expired reservations/orphans recover; low-priority data evicts before posters; forced low disk rejects admission while reads remain available; concurrent reservations stay inside budget. Real Plex permission behavior and deployment disk pressure remain pending.
 
-### D: collections — pending
+### D: collections — complete locally
 
-Sol High implements explicit snapshots and ordered membership, then targeted invalidation and optional completion-trigger handling. Luna implements fixtures/documentation. Gate: incomplete scans cannot delete valid memberships, and daily rebuilds publish complete generations.
+Sol High implements explicit snapshots and ordered membership, then targeted invalidation and optional completion-trigger handling. Coordinator integrates admin wiring and documentation. Gate: incomplete scans cannot delete valid memberships, and daily rebuilds publish complete generations.
+
+Collection synchronization stages the complete catalog and ordered PMS child results for one library before a single transaction publishes its metadata, snapshot pointers and deletions. Ordinary and smart collections use PMS-evaluated children. Failed pages, changing totals, duplicate keys and ambiguous empty responses preserve the published generation; an explicit complete empty result can remove all collections or members. Unchanged content retains its published generation. Collection metadata, artwork references, ordering, membership additions/deletions and Plex delete/recreate identifiers participate in the change comparison. A committed change records a durable pending cache invalidation; the callback runs after commit and failures are retried. New catalog placeholders and staged snapshots are internal data and must never be treated as caller authorization or served as published data without a published-generation join.
 
 ### E: warming and operations — pending
 
@@ -81,7 +83,8 @@ Sol High reviews integrated changes and runs failure/race tests with required se
 - Header-dependent responses remain cacheable on demand but are not background-warmed because the current warmer cannot reproduce their headers.
 - Batch B complete: durable Postgres generations, v4 cache namespace, exact caller/resource leases and proxy integration are in place. `go test ./... -count=1` passed with `REPLX_EDGE_TEST_POSTGRES_URL` pointing to the temporary local PostgreSQL test instance; `go vet ./...`, generated-spec check and `git diff --check` passed.
 - Batch C complete: shared content-addressed artwork, durable transform references and reservations, crash recovery, priority eviction, free-space admission guard and admin storage stats are implemented. SQL-backed shared-store tests and proxy/admin tests pass. Production config defaults to a 100 GiB artwork budget and preserves a 30 GiB free-space floor.
-- This completes the bounded first execution batch, not all Phase 0/2 requirements or the overall implementation roadmap. No deployment or commits were performed.
+- Batch D collection implementation ran in a GPT-6.1 Sol High agent. The PostgreSQL-backed sync tests cover ordered/smart/empty collection publication, unchanged generation reuse, late-page failures preserving the whole library, incomplete catalogs, changing totals, explicit empty deletion, delete/recreate and pending invalidation retry. Coordinator integration adds authenticated completion triggering and a server-wide `collections` generation that preserves unrelated cache classes. `go test ./... -count=1` passes with the temporary PostgreSQL URL configured; `go vet ./...` and `git diff --check` pass. Actual daily Aggregar execution, PMS behavior and client/device behavior remain live validation requirements.
+- Batch D completes the bounded first execution batch, not all Phase 0/2 requirements or the overall implementation roadmap. No deployment has been performed.
 
 ## Initial assessment findings
 

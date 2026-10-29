@@ -18,6 +18,7 @@ type GenerationStore interface {
 	Bump(context.Context, string, string) error
 	BumpScope(context.Context, string) error
 	BumpAll(context.Context) error
+	BumpServerClass(context.Context, string) error
 }
 
 // PostgresGenerations persists independent server, scope, and class counters.
@@ -64,16 +65,28 @@ func (g *PostgresGenerations) Get(ctx context.Context, scope, class string) (uin
 	if class == "" {
 		class = "browse"
 	}
-	var scopeGeneration, classGeneration, globalGeneration int64
+	var scopeGeneration, classGeneration, serverClassGeneration, globalGeneration int64
 	err := g.db.QueryRow(ctx, `SELECT
 		COALESCE((SELECT generation FROM cache_generations WHERE server_id=$1 AND scope_hash=$2 AND class=''), 0),
 		COALESCE((SELECT generation FROM cache_generations WHERE server_id=$1 AND scope_hash=$2 AND class=$3), 0),
+		COALESCE((SELECT generation FROM cache_generations WHERE server_id=$1 AND scope_hash='' AND class=$3), 0),
 		COALESCE((SELECT generation FROM cache_generations WHERE server_id=$1 AND scope_hash='' AND class=''), 0)`,
-		g.server, generationScopeHash(scope), class).Scan(&scopeGeneration, &classGeneration, &globalGeneration)
+		g.server, generationScopeHash(scope), class).Scan(&scopeGeneration, &classGeneration, &serverClassGeneration, &globalGeneration)
 	if err != nil {
 		return 0, 0, fmt.Errorf("cache: get generations: %w", err)
 	}
-	return uint64(scopeGeneration) + uint64(classGeneration), uint64(globalGeneration), nil
+	return saturatedAdd(uint64(scopeGeneration), uint64(classGeneration), uint64(serverClassGeneration)), uint64(globalGeneration), nil
+}
+
+func saturatedAdd(values ...uint64) uint64 {
+	var total uint64
+	for _, value := range values {
+		if ^uint64(0)-total < value {
+			return ^uint64(0)
+		}
+		total += value
+	}
+	return total
 }
 
 // Bump atomically retires one scope/class namespace.
@@ -99,6 +112,15 @@ func (g *PostgresGenerations) BumpScope(ctx context.Context, scope string) error
 // BumpAll atomically retires every namespace for this server.
 func (g *PostgresGenerations) BumpAll(ctx context.Context) error {
 	return g.bump(ctx, "", "")
+}
+
+// BumpServerClass retires one response class across every caller scope while
+// leaving artwork, playback and unrelated library classes warm.
+func (g *PostgresGenerations) BumpServerClass(ctx context.Context, class string) error {
+	if class == "" {
+		return errors.New("cache: server class is required")
+	}
+	return g.bump(ctx, "", class)
 }
 
 func (g *PostgresGenerations) bump(ctx context.Context, scopeHash, class string) error {

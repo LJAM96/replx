@@ -267,8 +267,6 @@ func runServe() error {
 	// run behind the single-replica worker loops; absence of credentials
 	// (pre-onboarding) idles them without failing startup.
 	syncWorker := syncpkg.New(db.Raw(), cfg.OriginInternalURL, ownerPMSToken, logger, registry)
-	go syncWorker.Run(ctx)
-	go syncWorker.Subscribe(ctx)
 	// Epsilon enforcement: negotiation interception plus the raw-part
 	// boundary behind the spike redirector. Sessions persist in Postgres;
 	// absent sessions preserve Alpha allow-through exactly.
@@ -308,6 +306,13 @@ func runServe() error {
 	if err != nil {
 		return err
 	}
+	syncWorker.InvalidateCollections = func(ctx context.Context) error {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return proxyHandler.InvalidateCacheContext(cctx, "all", "collections")
+	}
+	go syncWorker.Run(ctx)
+	go syncWorker.Subscribe(ctx)
 	// Warmer uses the canonical owner scope (identity UUID) and
 	// generation-aware keys so refreshes land in the live namespace.
 	warm.DB = db.Raw()

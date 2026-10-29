@@ -32,20 +32,22 @@ var ErrInFlight = errors.New("sync: another sync is already running")
 
 // Worker performs owner library synchronization against one origin.
 type Worker struct {
-	DB         database.DBTX
-	Origin     string
-	OwnerToken func(ctx context.Context) (string, bool)
-	Logger     *logging.Logger
-	Metrics    *metrics.Registry
-	Client     HTTPClient
+	DB                    database.DBTX
+	Origin                string
+	OwnerToken            func(ctx context.Context) (string, bool)
+	Logger                *logging.Logger
+	Metrics               *metrics.Registry
+	Client                HTTPClient
+	InvalidateCollections func(context.Context) error
 
 	LightInterval time.Duration
 	FullInterval  time.Duration
 	PageSize      int
 
-	mu       sync.Mutex
-	inFlight bool
-	dirty    map[string]bool
+	mu               sync.Mutex
+	inFlight         bool
+	dirty            map[string]bool
+	collectionsDirty map[string]bool
 }
 
 // HTTPClient is the minimal origin client surface (injectable for tests).
@@ -62,7 +64,7 @@ func New(db database.DBTX, origin string, owner func(ctx context.Context) (strin
 		Logger: logger, Metrics: reg,
 		Client:        NewOriginClient(origin, 30*time.Second),
 		LightInterval: 15 * time.Minute, FullInterval: 6 * time.Hour,
-		PageSize: 100, dirty: map[string]bool{},
+		PageSize: 100, dirty: map[string]bool{}, collectionsDirty: map[string]bool{},
 	}
 }
 
@@ -81,6 +83,20 @@ func (w *Worker) MarkDirty(sectionID string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.dirty[sectionID] = true
+}
+
+// MarkCollectionsDirty schedules a targeted collection catalog and membership
+// reconciliation for the next light pass (or an explicit refresh).
+func (w *Worker) MarkCollectionsDirty(sectionID string) {
+	if w == nil || sectionID == "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.collectionsDirty == nil {
+		w.collectionsDirty = map[string]bool{}
+	}
+	w.collectionsDirty[sectionID] = true
 }
 
 // Run performs an initial full sync in the background, then light passes
@@ -172,7 +188,96 @@ func (w *Worker) SyncOnce(ctx context.Context, full bool) error {
 		_ = w.setCursor(ctx, serverID, "section", &s.LibraryID, "complete", "")
 		w.clearDirty(s.SectionID)
 	}
+	for _, s := range sections {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if s.MediaType != "movie" && s.MediaType != "show" {
+			continue
+		}
+		if !full && !w.isCollectionsDirty(s.SectionID) && !w.collectionsNeverSynced(ctx, s.LibraryID) {
+			continue
+		}
+		_ = w.setCursor(ctx, serverID, "collections", &s.LibraryID, "running", "")
+		if err := w.syncLibraryCollections(ctx, serverID, token, s); err != nil {
+			w.countErr()
+			w.log("collection_sync", err.Error())
+			w.MarkCollectionsDirty(s.SectionID)
+			_ = w.setCursor(ctx, serverID, "collections", &s.LibraryID, "error", err.Error())
+			continue
+		}
+		_ = w.setCursor(ctx, serverID, "collections", &s.LibraryID, "complete", "")
+		w.clearCollectionsDirty(s.SectionID)
+	}
 	return nil
+}
+
+func (w *Worker) isCollectionsDirty(sectionID string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.collectionsDirty[sectionID]
+}
+func (w *Worker) clearCollectionsDirty(sectionID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.collectionsDirty, sectionID)
+}
+
+// SyncCollectionsOnce explicitly reconciles collections without requiring a
+// full library item sweep. It is used by the authenticated admin completion hook.
+func (w *Worker) SyncCollectionsOnce(ctx context.Context) error {
+	w.mu.Lock()
+	if w.inFlight {
+		w.mu.Unlock()
+		return ErrInFlight
+	}
+	w.inFlight = true
+	w.mu.Unlock()
+	defer func() { w.mu.Lock(); w.inFlight = false; w.mu.Unlock() }()
+	token, ok := w.OwnerToken(ctx)
+	if !ok {
+		return fmt.Errorf("sync: no owner credential (onboarding incomplete)")
+	}
+	serverID, err := enabledServer(ctx, w.DB)
+	if err != nil {
+		return err
+	}
+	sections, err := w.syncSections(ctx, serverID, token, false)
+	if err != nil {
+		return err
+	}
+	var errs int
+	for _, s := range sections {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if s.MediaType != "movie" && s.MediaType != "show" {
+			continue
+		}
+		_ = w.setCursor(ctx, serverID, "collections", &s.LibraryID, "running", "")
+		if err := w.syncLibraryCollections(ctx, serverID, token, s); err != nil {
+			errs++
+			w.countErr()
+			w.MarkCollectionsDirty(s.SectionID)
+			w.log("collection_sync", err.Error())
+			_ = w.setCursor(ctx, serverID, "collections", &s.LibraryID, "error", err.Error())
+		} else {
+			w.clearCollectionsDirty(s.SectionID)
+			_ = w.setCursor(ctx, serverID, "collections", &s.LibraryID, "complete", "")
+		}
+	}
+	if errs > 0 {
+		return fmt.Errorf("sync: collection refresh incomplete for %d libraries", errs)
+	}
+	return nil
+}
+
+func (w *Worker) collectionsNeverSynced(ctx context.Context, libraryID string) bool {
+	var done bool
+	if err := w.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM library_collection_syncs WHERE library_id=$1 AND last_completed_at IS NOT NULL)`, libraryID).Scan(&done); err != nil {
+		return true
+	}
+	return !done
 }
 
 func (w *Worker) log(event, errText string) {

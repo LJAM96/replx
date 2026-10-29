@@ -89,6 +89,7 @@ func (m *Mux) SetArtworkStats(fn func(context.Context) (artwork.Stats, error)) {
 type syncpkgWorker interface {
 	Status(ctx context.Context) ([]syncpkg.CursorStatus, error)
 	SyncOnce(ctx context.Context, full bool) error
+	SyncCollectionsOnce(ctx context.Context) error
 }
 
 type ctxKey struct{}

@@ -47,6 +47,12 @@ func testGenerationStore(t *testing.T, g GenerationStore) {
 	}
 	check("user:one", "metadata", 2, 1)
 	check("user:two", "metadata", 0, 1)
+	if err := g.BumpServerClass(ctx, "collections"); err != nil {
+		t.Fatal(err)
+	}
+	check("user:one", "collections", 2, 1)
+	check("user:two", "collections", 1, 1)
+	check("user:two", "metadata", 0, 1)
 }
 
 func TestMemoryGenerationStore(t *testing.T) {
@@ -85,6 +91,7 @@ func TestMemoryGenerationStoreCanceledContext(t *testing.T) {
 		func() error { return g.Bump(ctx, "scope", "class") },
 		func() error { return g.BumpScope(ctx, "scope") },
 		func() error { return g.BumpAll(ctx) },
+		func() error { return g.BumpServerClass(ctx, "collections") },
 	} {
 		if err := bump(); !errors.Is(err, context.Canceled) {
 			t.Fatal(err)
@@ -114,7 +121,7 @@ func (d *generationTestDB) QueryRow(_ context.Context, _ string, args ...any) pg
 }
 
 type generationTestRow struct {
-	values [3]int64
+	values [4]int64
 	err    error
 }
 
@@ -129,7 +136,7 @@ func (r generationTestRow) Scan(dest ...any) error {
 }
 
 func TestPostgresGenerationsScopePrivacyAndCounterRange(t *testing.T) {
-	db := &generationTestDB{row: generationTestRow{values: [3]int64{math.MaxInt64, math.MaxInt64, 3}}}
+	db := &generationTestDB{row: generationTestRow{values: [4]int64{math.MaxInt64, math.MaxInt64, 0, 3}}}
 	g := NewPostgresGenerations(db, "")
 	ctx := context.Background()
 	scope := "tok:secret-must-not-be-stored"
@@ -161,6 +168,7 @@ func TestPostgresGenerationsErrorsPropagate(t *testing.T) {
 		func() error { return g.Bump(ctx, "scope", "metadata") },
 		func() error { return g.BumpScope(ctx, "scope") },
 		func() error { return g.BumpAll(ctx) },
+		func() error { return g.BumpServerClass(ctx, "collections") },
 	} {
 		if err := operation(); !errors.Is(err, want) {
 			t.Fatal(err)

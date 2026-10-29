@@ -236,6 +236,11 @@ func (s *stubSync) SyncOnce(ctx context.Context, full bool) error {
 	return s.err
 }
 
+func (s *stubSync) SyncCollectionsOnce(ctx context.Context) error {
+	s.calls++
+	return s.err
+}
+
 func TestSyncEndpoints(t *testing.T) {
 	ctx := context.Background()
 	_ = ctx
@@ -258,6 +263,13 @@ func TestSyncEndpoints(t *testing.T) {
 	m2.ServeHTTP(postRec, post)
 	if postRec.Code != http.StatusOK || stub.calls != 1 {
 		t.Fatalf("sync full: %d calls=%d %s", postRec.Code, stub.calls, postRec.Body.String())
+	}
+	collections := httptest.NewRequest(http.MethodPost, "/api/v1/server/collections/refresh", nil)
+	collections.Header.Set("Authorization", "Bearer tok123")
+	collectionsRec := httptest.NewRecorder()
+	m2.ServeHTTP(collectionsRec, collections)
+	if collectionsRec.Code != http.StatusOK || stub.calls != 2 {
+		t.Fatalf("collections refresh: %d calls=%d %s", collectionsRec.Code, stub.calls, collectionsRec.Body.String())
 	}
 	// Immediate repeat trips the 5-minute rate limit.
 	post2 := httptest.NewRequest(http.MethodPost, "/api/v1/sync/full", nil)

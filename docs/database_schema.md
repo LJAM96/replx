@@ -210,6 +210,12 @@ CREATE INDEX library_items_sort_title_trgm_idx ON library_items USING gin(sort_t
 CREATE INDEX library_items_original_title_trgm_idx ON library_items USING gin(original_title gin_trgm_ops);
 ```
 
+## library_collections, collection_snapshots and collection_members
+
+The owner-only collection index records source rating keys and display metadata. Ordered child membership is stored as a generation-specific snapshot. `library_collections.published_generation` points only to a completed generation; failed scans leave that pointer and its rows intact. Membership rows retain their Plex order through the zero-based `position` field. Smart collections are enumerated by Plex and use the same child endpoint; the local service does not evaluate their rules.
+
+`library_collection_syncs.catalog_generation` advances only after a complete paginated library catalog scan. Collection rows absent from that completed scan are removed, cascading their snapshots. `collection_snapshots` tracks completion, item count and a content hash. Incomplete staging rows older than seven days are eligible for cleanup.
+
 ## item_guids
 
 ```sql

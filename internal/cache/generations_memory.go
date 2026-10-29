@@ -9,16 +9,17 @@ import (
 // without persistent response caching. Persistent response caches must use
 // PostgresGenerations so retired namespaces remain retired after a restart.
 type MemoryGenerationStore struct {
-	mu      sync.Mutex
-	scopes  map[string]uint64
-	classes map[string]uint64
-	global  uint64
+	mu            sync.Mutex
+	scopes        map[string]uint64
+	classes       map[string]uint64
+	global        uint64
+	serverClasses map[string]uint64
 }
 
 var _ GenerationStore = (*MemoryGenerationStore)(nil)
 
 func NewMemoryGenerationStore() *MemoryGenerationStore {
-	return &MemoryGenerationStore{scopes: map[string]uint64{}, classes: map[string]uint64{}}
+	return &MemoryGenerationStore{scopes: map[string]uint64{}, classes: map[string]uint64{}, serverClasses: map[string]uint64{}}
 }
 
 func (g *MemoryGenerationStore) Get(ctx context.Context, scope, class string) (uint64, uint64, error) {
@@ -30,7 +31,7 @@ func (g *MemoryGenerationStore) Get(ctx context.Context, scope, class string) (u
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.scopes[scope] + g.classes[scope+"\x00"+class], g.global, nil
+	return saturatedAdd(g.scopes[scope], g.classes[scope+"\x00"+class], g.serverClasses[class]), g.global, nil
 }
 
 func (g *MemoryGenerationStore) Bump(ctx context.Context, scope, class string) error {
@@ -69,5 +70,18 @@ func (g *MemoryGenerationStore) BumpAll(ctx context.Context) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.global++
+	return nil
+}
+
+func (g *MemoryGenerationStore) BumpServerClass(ctx context.Context, class string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if class == "" {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.serverClasses[class]++
 	return nil
 }

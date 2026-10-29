@@ -518,29 +518,46 @@ func (h *Handler) Generations() cache.GenerationStore {
 	return h.gens
 }
 
-// InvalidateCache retires cache namespaces for the admin invalidation API:
-// scope "all" retires everything, empty class retires the whole scope,
-// otherwise one (scope, class) namespace.
+// InvalidateCache retires namespaces for the admin invalidation API. Scope
+// "all" with a class targets that class server-wide; with no class it retires
+// everything. Empty class on a user scope retires that user's whole namespace.
 func (h *Handler) InvalidateCache(scope, class string) {
+	_ = h.InvalidateCacheContext(context.Background(), scope, class)
+}
+
+// InvalidateCacheContext lets sync jobs observe durable invalidation failures
+// and keeps cache serving fail-closed until a successful recovery bump.
+func (h *Handler) InvalidateCacheContext(ctx context.Context, scope, class string) error {
 	if h.gens == nil {
-		return
+		return nil
 	}
 	switch {
+	case (scope == "all" || scope == "") && class != "":
+		if err := h.gens.BumpServerClass(ctx, class); err != nil {
+			h.cacheBroken.Store(true)
+			return err
+		}
+		return nil
 	case scope == "" || scope == "all":
-		if err := h.gens.BumpAll(context.Background()); err == nil {
+		if err := h.gens.BumpAll(ctx); err == nil {
 			h.cacheBroken.Store(false)
+			return nil
 		} else {
 			h.cacheBroken.Store(true)
+			return err
 		}
 	case class == "":
-		if err := h.gens.BumpScope(context.Background(), scope); err != nil {
+		if err := h.gens.BumpScope(ctx, scope); err != nil {
 			h.cacheBroken.Store(true)
+			return err
 		}
 	default:
-		if err := h.gens.Bump(context.Background(), scope, class); err != nil {
+		if err := h.gens.Bump(ctx, scope, class); err != nil {
 			h.cacheBroken.Store(true)
+			return err
 		}
 	}
+	return nil
 }
 
 // waitForFlight reports whether another request is already refreshing key.
