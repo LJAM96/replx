@@ -1,6 +1,6 @@
 # Agent execution plan
 
-Status: batches A and B implemented and locally checked on 29 October 2026; batch C is next. This is a reusable instruction document for Codex, not a standalone shell scheduler.
+Status: batches A, B and C implemented and locally checked on 29 October 2026; batch D is next. This is a reusable instruction document for Codex, not a standalone shell scheduler.
 
 ## Run instruction
 
@@ -54,9 +54,9 @@ Model settings are passed when spawning each agent. The coordinator cannot chang
 
 Gate completed locally: SQL integration tests exercised migrations and a new generation-store instance after restart; current counters remain effective and a later scope bump retires all earlier classes. Real Plex permission revocation and client behavior remain unverified. The 30-second lease is a bounded authorization staleness window, not a library ACL. Unknown/managed-content semantics still need live testing. Race tests remain unavailable without CGO tooling.
 
-### C: shared artwork — pending
+### C: shared artwork — locally complete
 
-Sol High implements shared blob/reference records, atomic publication and authorization gates. A subsequent bounded task implements admission reservations, crash recovery and priority eviction. Luna adds admin reporting only after interfaces stabilize. Gate: three authorized users share one blob and unauthorized access remains denied; disk budget survives concurrent writes.
+Sol High implemented shared content-addressed blobs, PostgreSQL transform references, atomic publication, per-caller authorization gates, write reservations, crash recovery, priority eviction and a minimum-free-space guard. Admin storage reporting exposes bounded capacity figures. Gate evidence: proxy and SQL tests verify three callers must each authorize through PMS, their scoped references deduplicate identical bytes to one blob, and anonymous reuse is denied; replacement preserves other references; expired reservations/orphans recover; low-priority data evicts before posters; forced low disk rejects admission while reads remain available; concurrent reservations stay inside budget. Real Plex permission behavior and deployment disk pressure remain pending.
 
 ### D: collections — pending
 
@@ -78,8 +78,9 @@ Sol High reviews integrated changes and runs failure/race tests with required se
 - Batch A completed: bounded inventory command, live home/watch feeds, request-header variation keys, successful watch-write invalidation and foreground/background generation guards.
 - Inventory received a separate read-only review; findings were corrected before integration.
 - `go test ./...` and `go vet ./...` pass after integration. SQL-backed tests skip without their database configuration; Docker's daemon is unavailable. Race testing requires CGO in this Windows environment and did not run. Real PMS and client checks did not run.
-- Header-dependent responses remain cacheable on demand but are not background-warmed because the current warmer cannot reproduce their headers. Shared artwork and storage admission are pending batch C.
+- Header-dependent responses remain cacheable on demand but are not background-warmed because the current warmer cannot reproduce their headers.
 - Batch B complete: durable Postgres generations, v4 cache namespace, exact caller/resource leases and proxy integration are in place. `go test ./... -count=1` passed with `REPLX_EDGE_TEST_POSTGRES_URL` pointing to the temporary local PostgreSQL test instance; `go vet ./...`, generated-spec check and `git diff --check` passed.
+- Batch C complete: shared content-addressed artwork, durable transform references and reservations, crash recovery, priority eviction, free-space admission guard and admin storage stats are implemented. SQL-backed shared-store tests and proxy/admin tests pass. Production config defaults to a 100 GiB artwork budget and preserves a 30 GiB free-space floor.
 - This completes the bounded first execution batch, not all Phase 0/2 requirements or the overall implementation roadmap. No deployment or commits were performed.
 
 ## Initial assessment findings

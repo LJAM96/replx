@@ -669,8 +669,8 @@ func TestArtworkAccountScoped(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec
 	}
-	// Without an identity resolver every token stays token-scoped:
-	// distinct tokens isolate, and the second fetch re-hits origin.
+	// Without an identity resolver each token must be authorized by its
+	// own caller-token PMS response, even though identical bytes are shared.
 	first := get("token-a")
 	second := get("token-b")
 	if first.Header().Get(CacheHeader) != "miss" || second.Header().Get(CacheHeader) != "miss" {
@@ -687,12 +687,33 @@ func TestArtworkAccountScoped(t *testing.T) {
 	if third.Body.String() != "thumb-bytes" {
 		t.Fatal("hit body wrong")
 	}
+	fourth := get("token-b")
+	if fourth.Header().Get(CacheHeader) != "hit" || hits != 2 {
+		t.Fatalf("second authorized caller should reuse its artwork reference: %s hits=%d", fourth.Header().Get(CacheHeader), hits)
+	}
 	// Anonymous artwork bypasses: authorization to reference required.
 	anon := httptest.NewRequest(http.MethodGet, "/photo/:/transcode?width=480&height=720", nil)
 	anonRec := httptest.NewRecorder()
 	h.ServeHTTP(anonRec, anon)
 	if anonRec.Header().Get(CacheHeader) == "hit" {
 		t.Fatal("anonymous artwork must never hit account entries")
+	}
+}
+
+func TestArtworkPriorityUsesRequestedAssetKind(t *testing.T) {
+	poster := httptest.NewRequest(http.MethodGet, "/photo/:/transcode?url=%2Flibrary%2Fmetadata%2F1%2Fthumb", nil)
+	background := httptest.NewRequest(http.MethodGet, "/photo/:/transcode?url=%2Flibrary%2Fmetadata%2F1%2Fart", nil)
+	if artworkPriority(poster) != artwork.High || artworkPriority(background) != artwork.Low {
+		t.Fatal("poster/thumb should outrank background/art")
+	}
+}
+
+func TestArtworkTransformReferencesRemainScopeScoped(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/photo/:/transcode?width=480&url=%2Flibrary%2Fmetadata%2F1%2Fthumb", nil)
+	first := artworkCacheKey("user:one", req)
+	second := artworkCacheKey("user:two", req)
+	if first == second || len(first) != 64 || len(second) != 64 {
+		t.Fatal("transform references must be opaque and scope scoped")
 	}
 }
 

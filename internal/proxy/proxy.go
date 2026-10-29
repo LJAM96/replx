@@ -621,22 +621,29 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 	if o.invalid || (h.identity != nil && !o.fresh) {
 		return false
 	}
+	// Startup recovery can walk the old cache tree; client requests bypass
+	// local artwork until that bounded admission scan has completed.
+	if !h.artwork.Ready() {
+		return false
+	}
 	key := artworkCacheKey(o.scope, r)
-	if ct, body, ok := h.artwork.Get(key); ok && h.grants.Authorized(o.fingerprint, key) {
-		o.cacheState = "hit"
-		if h.metrics != nil {
-			h.metrics.IncCacheHit()
-			h.metrics.ObserveHTTP("control", http.StatusOK, time.Since(start))
+	if h.grants.Authorized(o.fingerprint, key) {
+		if ct, body, ok := h.artwork.GetContext(r.Context(), key); ok {
+			o.cacheState = "hit"
+			if h.metrics != nil {
+				h.metrics.IncCacheHit()
+				h.metrics.ObserveHTTP("control", http.StatusOK, time.Since(start))
+			}
+			w.Header().Set(RequestIDHeader, id)
+			w.Header().Set(CacheHeader, "hit")
+			if ct != "" {
+				w.Header().Set("Content-Type", ct)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			h.emit(r, id, o, "control", http.StatusOK, start, map[string]any{"bodyBytes": len(body), "artwork": true})
+			return true
 		}
-		w.Header().Set(RequestIDHeader, id)
-		w.Header().Set(CacheHeader, "hit")
-		if ct != "" {
-			w.Header().Set("Content-Type", ct)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
-		h.emit(r, id, o, "control", http.StatusOK, start, map[string]any{"bodyBytes": len(body), "artwork": true})
-		return true
 	}
 	target := *h.origin
 	target.Path = singleJoin(h.origin.Path, r.URL.Path)
@@ -652,6 +659,15 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 		out.Header.Set("X-Forwarded-For", fwd)
 	}
 	out.Host = h.origin.Host
+	reservation, reserveErr := h.artwork.Reserve(r.Context(), key, artworkPriority(r))
+	if reserveErr != nil || reservation == nil {
+		return false
+	}
+	defer func() {
+		cancelCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		reservation.Cancel(cancelCtx)
+	}()
 	originStart := time.Now()
 	resp, err := h.client.Do(out) //nolint:gosec // target is admin-configured origin only
 	if h.metrics != nil {
@@ -667,8 +683,9 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 		// normal proxy streams it uncached. Nothing written yet.
 		return false
 	}
-	if resp.StatusCode == http.StatusOK && cache.StorableResponse(resp.Header) {
-		if h.artwork.Set(key, resp.Header.Get("Content-Type"), body) == nil {
+	if resp.StatusCode == http.StatusOK && cache.StorableResponse(resp.Header) &&
+		strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "image/") {
+		if reservation.Commit(r.Context(), resp.Header.Get("Content-Type"), body) == nil {
 			h.grants.Grant(o.fingerprint, key)
 		}
 	}
@@ -687,9 +704,23 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 }
 
 func artworkCacheKey(scope string, r *http.Request) string {
+	// Keep transform references isolated by the current Plex scope because
+	// the same URL can produce permission-dependent bytes. The payload store
+	// deduplicates across scopes by content digest.
 	variationKey := cache.RequestKeyGen(scope, "artwork", r, 0, 0)
 	sum := sha256.Sum256([]byte(variationKey))
 	return hex.EncodeToString(sum[:])
+}
+
+func artworkPriority(r *http.Request) artwork.Priority {
+	resource := strings.ToLower(r.URL.Query().Get("url"))
+	if strings.Contains(resource, "background") || strings.HasSuffix(resource, "/art") {
+		return artwork.Low
+	}
+	if strings.HasSuffix(resource, "/thumb") || strings.HasSuffix(resource, "/poster") || strings.HasSuffix(resource, "/cover") {
+		return artwork.High
+	}
+	return artwork.Normal
 }
 
 func requestHasCondition(r *http.Request) bool {

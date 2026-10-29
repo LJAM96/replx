@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/health"
 	"github.com/LJAM96/replx/internal/pms"
 )
@@ -561,6 +563,15 @@ func (m *Mux) handleStorage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{"cache": "valkey-best-effort", "artwork": "filesystem", "diagnostics": "filesystem"}
+	if m.artworkStats != nil {
+		if stats, err := m.artworkStats(r.Context()); err == nil {
+			out["artworkStats"] = stats
+		} else if errors.Is(err, artwork.ErrInitializing) {
+			out["artworkStats"] = map[string]string{"state": "initializing"}
+		} else {
+			out["artworkStats"] = map[string]string{"state": "unavailable"}
+		}
+	}
 	if m.svc != nil {
 		var items, sessions, decisions, traces, audits int64
 		_ = m.svc.DB.QueryRow(r.Context(), `SELECT count(*) FROM library_items`).Scan(&items)

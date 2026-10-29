@@ -7,7 +7,8 @@ Replx Edge uses three distinct data classes:
 ```text
 PostgreSQL internal library index
 Valkey user scoped response cache
-Filesystem artwork and trace storage
+PostgreSQL artwork variant/reference records
+Shared content-addressed artwork blobs and trace storage
 ```
 
 The library index is shared internal data. It is not a ready made user response cache.
@@ -32,7 +33,7 @@ The owner synchronized library index may be shared internally for:
 
 Before a shared index result is returned to a user, Replx Edge must ensure the user's PMS permissions and visibility are respected. Local search should fall back to PMS when Replex cannot prove that a result is visible to that user.
 
-Artwork binaries may be shared when their URL and transformation key are identical and the user has already been authorized to reference the artwork.
+Artwork bytes are shared by content digest. A PostgreSQL transform reference is scoped to the caller's Plex scope and request variation, then points to a shared blob; neither the transform mapping nor the blob grants access. The caller must hold a current exact-resource authorization lease before a local read.
 
 ## Cache isolation invariant
 
@@ -57,9 +58,38 @@ token fingerprint and the exact response cache key. Only a completed, successful
 response fetched from PMS with that caller token grants reuse. Leases expire after
 30 seconds without extending on cache hits. Expired, absent or invalidated leases
 bypass the cached response and reauthorize through PMS. Local artwork uses the
-same rule with its exact account-scoped transformation key. Warming never grants
+same rule with its exact scope-bound transform key and caller fingerprint,
+while the underlying content-addressed blob can be shared across scopes.
+Warming never grants
 user authorization. The lease is not a section ACL or a substitute for Plex
 permission evaluation; real revocation behavior still needs client/PMS validation.
+
+## Shared artwork storage and admission
+
+Production stores request transform references in PostgreSQL and complete
+image payloads under sharded SHA-256 paths. Different transforms with identical
+bytes share one blob. Existing account-scoped flat-cache files are not imported;
+recovery counts them as untracked bytes against admission until operators remove
+them. Authorization remains in the bounded, memory-only exact-resource lease.
+
+Before reading an origin image, the store reserves the maximum 8 MiB payload
+plus conservative record overhead. At most 32 concurrent transfers can hold
+reservations by default. Reservations expire after two minutes and recovery
+removes abandoned temporary files. Publication writes a private temporary file,
+hashes the completed body, atomically publishes the blob, then commits the
+variant reference. Deduplication occurs by content digest. Readers hold a shared
+database lock while opening the blob so eviction cannot remove an active read.
+
+The default artwork quota is 100 GiB (configurable with
+`REPLX_EDGE_ARTWORK_MAX_GB`), with a 90% eviction target, a bounded protected
+pool and a 30 GiB minimum filesystem-free-space guard. Low priority backgrounds
+and `/art` assets are eviction candidates before normal assets; posters and
+`/thumb` transforms receive higher retention priority. Protected is a bounded
+retention tier, not a permanent pin; collection-specific protection awaits
+collection synchronization. When admission fails, artwork falls through to
+PMS and browsing continues. `/api/v1/storage` reports payload, metadata,
+reservation, untracked, quota and free-space figures without exposing keys,
+URLs or identities.
 
 ## Canonical cache key
 

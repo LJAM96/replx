@@ -1022,7 +1022,7 @@ PMS event consumer
 incremental sync
 reconciliation
 cache janitor
-artwork janitor
+shared artwork recovery and priority-eviction janitor
 diagnostics janitor
 playback retention janitor
 session reconciliation
@@ -1478,7 +1478,8 @@ Replx Edge uses three distinct data classes:
 ```text
 PostgreSQL internal library index
 Valkey user scoped response cache
-Filesystem artwork and trace storage
+PostgreSQL artwork variant/reference records
+Shared content-addressed artwork blobs and trace storage
 ```
 
 The library index is shared internal data. It is not a ready made user response cache.
@@ -1503,7 +1504,7 @@ The owner synchronized library index may be shared internally for:
 
 Before a shared index result is returned to a user, Replx Edge must ensure the user's PMS permissions and visibility are respected. Local search should fall back to PMS when Replex cannot prove that a result is visible to that user.
 
-Artwork binaries may be shared when their URL and transformation key are identical and the user has already been authorized to reference the artwork.
+Artwork bytes are shared by content digest. A PostgreSQL transform reference is scoped to the caller's Plex scope and request variation, then points to a shared blob; neither the transform mapping nor the blob grants access. The caller must hold a current exact-resource authorization lease before a local read.
 
 ## Cache isolation invariant
 
@@ -1528,9 +1529,38 @@ token fingerprint and the exact response cache key. Only a completed, successful
 response fetched from PMS with that caller token grants reuse. Leases expire after
 30 seconds without extending on cache hits. Expired, absent or invalidated leases
 bypass the cached response and reauthorize through PMS. Local artwork uses the
-same rule with its exact account-scoped transformation key. Warming never grants
+same rule with its exact scope-bound transform key and caller fingerprint,
+while the underlying content-addressed blob can be shared across scopes.
+Warming never grants
 user authorization. The lease is not a section ACL or a substitute for Plex
 permission evaluation; real revocation behavior still needs client/PMS validation.
+
+## Shared artwork storage and admission
+
+Production stores request transform references in PostgreSQL and complete
+image payloads under sharded SHA-256 paths. Different transforms with identical
+bytes share one blob. Existing account-scoped flat-cache files are not imported;
+recovery counts them as untracked bytes against admission until operators remove
+them. Authorization remains in the bounded, memory-only exact-resource lease.
+
+Before reading an origin image, the store reserves the maximum 8 MiB payload
+plus conservative record overhead. At most 32 concurrent transfers can hold
+reservations by default. Reservations expire after two minutes and recovery
+removes abandoned temporary files. Publication writes a private temporary file,
+hashes the completed body, atomically publishes the blob, then commits the
+variant reference. Deduplication occurs by content digest. Readers hold a shared
+database lock while opening the blob so eviction cannot remove an active read.
+
+The default artwork quota is 100 GiB (configurable with
+`REPLX_EDGE_ARTWORK_MAX_GB`), with a 90% eviction target, a bounded protected
+pool and a 30 GiB minimum filesystem-free-space guard. Low priority backgrounds
+and `/art` assets are eviction candidates before normal assets; posters and
+`/thumb` transforms receive higher retention priority. Protected is a bounded
+retention tier, not a permanent pin; collection-specific protection awaits
+collection synchronization. When admission fails, artwork falls through to
+PMS and browsing continues. `/api/v1/storage` reports payload, metadata,
+reservation, untracked, quota and free-space figures without exposing keys,
+URLs or identities.
 
 ## Canonical cache key
 
@@ -2930,7 +2960,8 @@ never does. A product version change resets certainty for review.
 | `REPLX_EDGE_ADMIN_BIND` | No | Legacy alias for the listen address on direct (non-Docker) runs |
 | `REPLX_EDGE_LOG_LEVEL` | No | Production log level |
 | `REPLX_EDGE_CACHE_MAX_GB` | No | General cache budget |
-| `REPLX_EDGE_ARTWORK_MAX_GB` | No | Artwork budget |
+| `REPLX_EDGE_ARTWORK_MAX_GB` | No | Shared artwork payload and metadata admission budget (default 100 GiB); a separate 30 GiB filesystem free-space floor is enforced |
+| `REPLX_EDGE_SHARED_ARTWORK_ENABLED` | No | Enable shared artwork caching; default `true`, set `false` to bypass local storage and use authorized PMS passthrough |
 | `REPLX_EDGE_DIAGNOSTICS_MAX_GB` | No | Trace file budget |
 | `REPLX_EDGE_TRACE_RETENTION_DAYS` | No | Trace retention |
 | `REPLX_EDGE_PLAYBACK_RETENTION_DAYS` | No | Playback decision retention |
@@ -2979,7 +3010,8 @@ REPLX_EDGE_INGRESS_MODE=cloudflare_tunnel
 REPLX_EDGE_ADMIN_PORT=8080
 REPLX_EDGE_LOG_LEVEL=info
 REPLX_EDGE_CACHE_MAX_GB=20
-REPLX_EDGE_ARTWORK_MAX_GB=50
+REPLX_EDGE_ARTWORK_MAX_GB=100
+REPLX_EDGE_SHARED_ARTWORK_ENABLED=true
 REPLX_EDGE_DIAGNOSTICS_MAX_GB=10
 REPLX_EDGE_TRACE_RETENTION_DAYS=7
 REPLX_EDGE_PLAYBACK_RETENTION_DAYS=30
@@ -3266,7 +3298,7 @@ Source inspection established the following; it is not evidence of a successful 
 | `internal/cache/cache.go` | User-scoped responses, short TTLs, 2 MiB body cap, process-local invalidation generations | Explicit request variation, durable generations and measured body limits |
 | `internal/proxy/proxy.go` | Cache lookup, origin fallback, request coalescing, artwork routing and watch-write recognition | Response-aware invalidation, cache admission and comprehensive route policies |
 | `internal/warmer/warmer.go` | Refreshes observed owner entries; maximum 512 tracked requests | Priority scheduling, proactive preparation and bounded user-context warming |
-| `internal/artwork/artwork.go` | Account-scoped files, seven-day expiry and periodic oldest-first cleanup | Shared blobs with independent authorization, priority eviction and write-time reservations |
+| `internal/artwork/` | Shared content-addressed blobs, PostgreSQL transform references, seven-day expiry, durable write reservations, crash recovery, priority eviction and a free-space guard | Collection-aware protected artwork and measured client transform/priority coverage |
 | `internal/sync/` | Owner index of libraries/items/media; periodic reconciliation | Explicit collection/member indexing and change publication |
 | `internal/sync/events.go` | Selected library refresh events mark sections dirty | Prompt invalidation, event coverage validation and missed-event recovery |
 | `internal/identity/` | Token fingerprints resolve identities; ordinary user credentials are not persisted | Separate identity from current PMS resource authorization |
@@ -3352,7 +3384,7 @@ Use low/high watermarks to avoid deleting one file on every incoming request. Fi
 Separate three concepts:
 
 - Resource authorization: a user is currently allowed to reference this PMS artwork resource.
-- Source/transform mapping: server identity, resource version and response-affecting transformation parameters map to a blob.
+- Source/transform mapping: Plex scope, server identity, resource version and response-affecting transformation parameters map to a blob. Scope-bound references prevent identical URLs from exposing permission-dependent response bytes; the payload deduplicates across users by content digest.
 - Blob identity: cryptographic digest of the completed image bytes, with size, MIME type and storage path.
 
 Proposed records: `artwork_blobs`, `artwork_variants`, `artwork_authorizations`, and bounded warming jobs. Add indexes for eviction priority and last use. Never key authorization solely by a public blob hash or account identity.
@@ -3577,7 +3609,7 @@ Do not start by downloading the entire library. That would consume the storage b
 
 # Agent execution plan
 
-Status: batches A and B implemented and locally checked on 29 October 2026; batch C is next. This is a reusable instruction document for Codex, not a standalone shell scheduler.
+Status: batches A, B and C implemented and locally checked on 29 October 2026; batch D is next. This is a reusable instruction document for Codex, not a standalone shell scheduler.
 
 ## Run instruction
 
@@ -3631,9 +3663,9 @@ Model settings are passed when spawning each agent. The coordinator cannot chang
 
 Gate completed locally: SQL integration tests exercised migrations and a new generation-store instance after restart; current counters remain effective and a later scope bump retires all earlier classes. Real Plex permission revocation and client behavior remain unverified. The 30-second lease is a bounded authorization staleness window, not a library ACL. Unknown/managed-content semantics still need live testing. Race tests remain unavailable without CGO tooling.
 
-### C: shared artwork — pending
+### C: shared artwork — locally complete
 
-Sol High implements shared blob/reference records, atomic publication and authorization gates. A subsequent bounded task implements admission reservations, crash recovery and priority eviction. Luna adds admin reporting only after interfaces stabilize. Gate: three authorized users share one blob and unauthorized access remains denied; disk budget survives concurrent writes.
+Sol High implemented shared content-addressed blobs, PostgreSQL transform references, atomic publication, per-caller authorization gates, write reservations, crash recovery, priority eviction and a minimum-free-space guard. Admin storage reporting exposes bounded capacity figures. Gate evidence: proxy and SQL tests verify three callers must each authorize through PMS, their scoped references deduplicate identical bytes to one blob, and anonymous reuse is denied; replacement preserves other references; expired reservations/orphans recover; low-priority data evicts before posters; forced low disk rejects admission while reads remain available; concurrent reservations stay inside budget. Real Plex permission behavior and deployment disk pressure remain pending.
 
 ### D: collections — pending
 
@@ -3655,8 +3687,9 @@ Sol High reviews integrated changes and runs failure/race tests with required se
 - Batch A completed: bounded inventory command, live home/watch feeds, request-header variation keys, successful watch-write invalidation and foreground/background generation guards.
 - Inventory received a separate read-only review; findings were corrected before integration.
 - `go test ./...` and `go vet ./...` pass after integration. SQL-backed tests skip without their database configuration; Docker's daemon is unavailable. Race testing requires CGO in this Windows environment and did not run. Real PMS and client checks did not run.
-- Header-dependent responses remain cacheable on demand but are not background-warmed because the current warmer cannot reproduce their headers. Shared artwork and storage admission are pending batch C.
+- Header-dependent responses remain cacheable on demand but are not background-warmed because the current warmer cannot reproduce their headers.
 - Batch B complete: durable Postgres generations, v4 cache namespace, exact caller/resource leases and proxy integration are in place. `go test ./... -count=1` passed with `REPLX_EDGE_TEST_POSTGRES_URL` pointing to the temporary local PostgreSQL test instance; `go vet ./...`, generated-spec check and `git diff --check` passed.
+- Batch C complete: shared content-addressed artwork, durable transform references and reservations, crash recovery, priority eviction, free-space admission guard and admin storage stats are implemented. SQL-backed shared-store tests and proxy/admin tests pass. Production config defaults to a 100 GiB artwork budget and preserves a 30 GiB free-space floor.
 - This completes the bounded first execution batch, not all Phase 0/2 requirements or the overall implementation roadmap. No deployment or commits were performed.
 
 ## Initial assessment findings
@@ -3938,7 +3971,8 @@ services:
       REPLX_EDGE_IN_DOCKER: "true"
       REPLX_EDGE_LOG_LEVEL: ${REPLX_EDGE_LOG_LEVEL:-info}
       REPLX_EDGE_CACHE_MAX_GB: ${REPLX_EDGE_CACHE_MAX_GB:-20}
-      REPLX_EDGE_ARTWORK_MAX_GB: ${REPLX_EDGE_ARTWORK_MAX_GB:-50}
+      REPLX_EDGE_ARTWORK_MAX_GB: ${REPLX_EDGE_ARTWORK_MAX_GB:-100}
+      REPLX_EDGE_SHARED_ARTWORK_ENABLED: ${REPLX_EDGE_SHARED_ARTWORK_ENABLED:-true}
       REPLX_EDGE_DIAGNOSTICS_MAX_GB: ${REPLX_EDGE_DIAGNOSTICS_MAX_GB:-10}
       REPLX_EDGE_TRACE_RETENTION_DAYS: ${REPLX_EDGE_TRACE_RETENTION_DAYS:-7}
       REPLX_EDGE_PLAYBACK_RETENTION_DAYS: ${REPLX_EDGE_PLAYBACK_RETENTION_DAYS:-30}

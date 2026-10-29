@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/health"
 	"github.com/LJAM96/replx/internal/metrics"
@@ -29,6 +30,27 @@ func TestSetupGate(t *testing.T) {
 	m.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("spike events must also gate, got %d", rec.Code)
+	}
+}
+
+func TestStorageReportsArtworkCapacity(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", false, nil, &spike.Observations{})
+	m.SetArtworkStats(func(context.Context) (artwork.Stats, error) {
+		return artwork.Stats{Shared: true, PayloadBytes: 123, ReservedBytes: 8, MaxBytes: 1000}, nil
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage", nil)
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"payloadBytes":123`) || !strings.Contains(rec.Body.String(), `"maxBytes":1000`) {
+		t.Fatalf("storage response missing artwork capacity: %d %s", rec.Code, rec.Body.String())
+	}
+	m.SetArtworkStats(func(context.Context) (artwork.Stats, error) {
+		return artwork.Stats{}, artwork.ErrInitializing
+	})
+	rec = httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), `"state":"initializing"`) {
+		t.Fatalf("initializing storage status missing: %s", rec.Body.String())
 	}
 }
 

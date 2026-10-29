@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/health"
 	"github.com/LJAM96/replx/internal/metrics"
@@ -59,6 +60,7 @@ type Mux struct {
 	registry      *metrics.Registry
 	cap           *capture.Store
 	warmerStats   func() warmer.Stats
+	artworkStats  func(context.Context) (artwork.Stats, error)
 	syncWorker    syncpkgWorker
 	syncMu        sync.Mutex
 	lastSyncFull  time.Time
@@ -75,6 +77,11 @@ type Mux struct {
 // namespace invalidation.
 func (m *Mux) SetCacheInvalidator(fn func(scope, class string)) {
 	m.invalidator = fn
+}
+
+// SetArtworkStats wires bounded storage reporting into the admin storage API.
+func (m *Mux) SetArtworkStats(fn func(context.Context) (artwork.Stats, error)) {
+	m.artworkStats = fn
 }
 
 // syncpkgWorker is the sync surface admin needs (narrower than *sync.Worker

@@ -243,16 +243,25 @@ func runServe() error {
 	warm := warmer.New(cacheStore, cfg.OriginInternalURL, cfg.SecretKey, ownerPMSToken, logger, registry)
 	warm.OwnerAccount = ownerAccount
 	go warm.Run(ctx, 15*time.Second)
-	// Eta artwork: shared filesystem transcode cache with oldest-first
-	// janitor. Directory failure degrades to uncached artwork, never to
-	// failed startup.
+	// Eta artwork: shared content-addressed blobs with durable admission
+	// reservations. Directory or migration failure degrades to uncached
+	// artwork, never to failed startup.
 	var artworkStore *artwork.Store
-	if art, err := artwork.New(cfg.ArtworkDir, cfg.ArtworkMaxGB); err != nil {
-		logger.Log(logging.Entry{Level: "warn", Component: "cache",
-			Fields: map[string]any{"event": "artwork_degraded", "error": err.Error()}})
+	if cfg.SharedArtworkEnabled {
+		artworkBudget := int64(cfg.ArtworkMaxGB) << 30
+		if art, err := artwork.NewShared(db.Raw(), cfg.ArtworkDir, artwork.SharedOptions{
+			Namespace: "default", MaxBytes: artworkBudget, MinFreeBytes: 30 << 30,
+			LowWatermarkBytes: artworkBudget * 9 / 10, ProtectedBytes: artworkBudget / 20,
+		}); err != nil {
+			logger.Log(logging.Entry{Level: "warn", Component: "cache",
+				Fields: map[string]any{"event": "artwork_degraded", "error": err.Error()}})
+		} else {
+			artworkStore = art
+			go art.Run(ctx, 30*time.Minute)
+		}
 	} else {
-		artworkStore = art
-		go art.Run(ctx, 30*time.Minute)
+		logger.Log(logging.Entry{Level: "info", Component: "cache",
+			Fields: map[string]any{"event": "shared_artwork_disabled"}})
 	}
 	// Gamma index: owner library sync plus the PMS event consumer. Both
 	// run behind the single-replica worker loops; absence of credentials
@@ -364,6 +373,9 @@ func runServe() error {
 	adminMux.SetWarmer(warm.Stats)
 	adminMux.SetSync(syncWorker)
 	adminMux.SetCacheInvalidator(proxyHandler.InvalidateCache)
+	if artworkStore != nil {
+		adminMux.SetArtworkStats(artworkStore.Stats)
+	}
 	// Diagnostics gauge: active targeted captures.
 	go func() {
 		ticker := time.NewTicker(time.Minute)

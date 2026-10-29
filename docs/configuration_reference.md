@@ -22,7 +22,8 @@
 | `REPLX_EDGE_ADMIN_BIND` | No | Legacy alias for the listen address on direct (non-Docker) runs |
 | `REPLX_EDGE_LOG_LEVEL` | No | Production log level |
 | `REPLX_EDGE_CACHE_MAX_GB` | No | General cache budget |
-| `REPLX_EDGE_ARTWORK_MAX_GB` | No | Artwork budget |
+| `REPLX_EDGE_ARTWORK_MAX_GB` | No | Shared artwork payload and metadata admission budget (default 100 GiB); a separate 30 GiB filesystem free-space floor is enforced |
+| `REPLX_EDGE_SHARED_ARTWORK_ENABLED` | No | Enable shared artwork caching; default `true`, set `false` to bypass local storage and use authorized PMS passthrough |
 | `REPLX_EDGE_DIAGNOSTICS_MAX_GB` | No | Trace file budget |
 | `REPLX_EDGE_TRACE_RETENTION_DAYS` | No | Trace retention |
 | `REPLX_EDGE_PLAYBACK_RETENTION_DAYS` | No | Playback decision retention |
@@ -71,7 +72,8 @@ REPLX_EDGE_INGRESS_MODE=cloudflare_tunnel
 REPLX_EDGE_ADMIN_PORT=8080
 REPLX_EDGE_LOG_LEVEL=info
 REPLX_EDGE_CACHE_MAX_GB=20
-REPLX_EDGE_ARTWORK_MAX_GB=50
+REPLX_EDGE_ARTWORK_MAX_GB=100
+REPLX_EDGE_SHARED_ARTWORK_ENABLED=true
 REPLX_EDGE_DIAGNOSTICS_MAX_GB=10
 REPLX_EDGE_TRACE_RETENTION_DAYS=7
 REPLX_EDGE_PLAYBACK_RETENTION_DAYS=30

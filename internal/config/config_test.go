@@ -57,6 +57,7 @@ func TestLoadReadsEnv(t *testing.T) {
 	t.Setenv("REPLX_EDGE_INGRESS_MODE", "direct")
 	t.Setenv("REPLX_EDGE_ADMIN_PORT", "8080")
 	t.Setenv("REPLX_EDGE_MEDIA_PORT", "32402")
+	t.Setenv("REPLX_EDGE_SHARED_ARTWORK_ENABLED", "false")
 	os.Unsetenv("TUNNEL_TOKEN")
 	os.Unsetenv("TUNNEL_TOKEN_FILE")
 	cfg, err := Load()
@@ -65,6 +66,9 @@ func TestLoadReadsEnv(t *testing.T) {
 	}
 	if cfg.AdminPort != 8080 || cfg.IngressMode != "direct" {
 		t.Fatalf("unexpected config: %+v", cfg)
+	}
+	if cfg.SharedArtworkEnabled {
+		t.Fatal("shared artwork feature switch should disable local caching")
 	}
 }
 

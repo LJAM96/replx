@@ -42,7 +42,7 @@ Source inspection established the following; it is not evidence of a successful 
 | `internal/cache/cache.go` | User-scoped responses, short TTLs, 2 MiB body cap, process-local invalidation generations | Explicit request variation, durable generations and measured body limits |
 | `internal/proxy/proxy.go` | Cache lookup, origin fallback, request coalescing, artwork routing and watch-write recognition | Response-aware invalidation, cache admission and comprehensive route policies |
 | `internal/warmer/warmer.go` | Refreshes observed owner entries; maximum 512 tracked requests | Priority scheduling, proactive preparation and bounded user-context warming |
-| `internal/artwork/artwork.go` | Account-scoped files, seven-day expiry and periodic oldest-first cleanup | Shared blobs with independent authorization, priority eviction and write-time reservations |
+| `internal/artwork/` | Shared content-addressed blobs, PostgreSQL transform references, seven-day expiry, durable write reservations, crash recovery, priority eviction and a free-space guard | Collection-aware protected artwork and measured client transform/priority coverage |
 | `internal/sync/` | Owner index of libraries/items/media; periodic reconciliation | Explicit collection/member indexing and change publication |
 | `internal/sync/events.go` | Selected library refresh events mark sections dirty | Prompt invalidation, event coverage validation and missed-event recovery |
 | `internal/identity/` | Token fingerprints resolve identities; ordinary user credentials are not persisted | Separate identity from current PMS resource authorization |
@@ -128,7 +128,7 @@ Use low/high watermarks to avoid deleting one file on every incoming request. Fi
 Separate three concepts:
 
 - Resource authorization: a user is currently allowed to reference this PMS artwork resource.
-- Source/transform mapping: server identity, resource version and response-affecting transformation parameters map to a blob.
+- Source/transform mapping: Plex scope, server identity, resource version and response-affecting transformation parameters map to a blob. Scope-bound references prevent identical URLs from exposing permission-dependent response bytes; the payload deduplicates across users by content digest.
 - Blob identity: cryptographic digest of the completed image bytes, with size, MIME type and storage path.
 
 Proposed records: `artwork_blobs`, `artwork_variants`, `artwork_authorizations`, and bounded warming jobs. Add indexes for eviction priority and last use. Never key authorization solely by a public blob hash or account identity.
