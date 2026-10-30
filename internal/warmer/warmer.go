@@ -1,16 +1,7 @@
-// Package warmer keeps hot owner-scoped browse entries fresh.
-//
-// The proxy tracks freshly stored cache entries; the warmer re-fetches the
-// ones due (past TTL/2) with the owner credential before they expire, so
-// active paths rarely miss. Only entries fingerprinted to the CURRENT owner
-// token are ever refreshed: anything else is dropped from tracking, which
-// is what keeps one user's refreshed response from ever landing in another
-// user's cache slot. Owner token rotation therefore re-baselines tracking
-// instead of poisoning it.
-//
-// Raw user tokens never enter the warmer: tracked snapshots carry the
-// fingerprint and a secret-stripped query, and refreshes run under the
-// owner token fetched per cycle from the encrypted credential store.
+// Package warmer schedules bounded background refreshes for observed browse
+// requests. Jobs contain only secret-stripped request metadata. User credentials
+// remain in separate, short-lived memory contexts and never extend their own
+// lifetime through warming.
 package warmer
 
 import (
@@ -45,14 +36,7 @@ type Snapshot struct {
 	Scope    string
 	Class    string
 	TTL      time.Duration
-}
-
-// Stats is the operator-visible warmer state.
-type Stats struct {
-	Tracked      int   `json:"tracked"`
-	Refreshed    int64 `json:"refreshed"`
-	Errors       int64 `json:"errors"`
-	OwnerWarming bool  `json:"ownerWarming"`
+	Priority Priority
 }
 
 // Warmer refreshes due owner-scoped entries against the origin.
@@ -72,25 +56,48 @@ type Warmer struct {
 	// KeyFunc recomputes a snapshot's cache key under current
 	// invalidation generations. Unset keeps the tracked key as-is.
 	KeyFunc func(s Snapshot) string
+	// CanWarm is an optional capacity gate evaluated before each background
+	// request. A false result leaves the job queued without consuming a request.
+	CanWarm func(context.Context, Snapshot) bool
 	log     *logging.Logger
 	metrics *metrics.Registry
 	client  *http.Client
 	now     func() time.Time
 
-	mu        sync.Mutex
-	tracked   map[string]tracked
-	refreshed int64
-	errors    int64
-	warming   bool
-	ownerAcct int64
-	ownerUUID string
-	ownerOK   bool
-	ownerAt   time.Time
+	mu             sync.Mutex
+	tracked        map[string]tracked
+	refreshed      int64
+	errors         int64
+	warming        bool
+	ownerAcct      int64
+	ownerUUID      string
+	ownerOK        bool
+	ownerAt        time.Time
+	config         Config
+	paused         bool
+	running        bool
+	foreground     int
+	activeCancel   context.CancelFunc
+	activeScope    string
+	contexts       map[string]credentialContext
+	contextVersion uint64
+	sequence       uint64
+	served         map[string]uint64
+	servedSequence uint64
+	warmedBytes    int64
+	backoffs       int64
+	dropped        int64
 }
 
 type tracked struct {
-	snap Snapshot
-	last time.Time
+	key             string
+	snap            Snapshot
+	last            time.Time
+	observed        time.Time
+	next            time.Time
+	failures        int
+	requiresContext bool
+	sequence        uint64
 }
 
 // New builds a Warmer. Nil store disables (Track/RefreshOnce no-op, Stats
@@ -104,6 +111,7 @@ func New(store cache.Store, origin, secret string,
 		client:  originClientFor(origin),
 		now:     time.Now,
 		tracked: map[string]tracked{},
+		config:  DefaultConfig(), contexts: map[string]credentialContext{}, served: map[string]uint64{},
 	}
 }
 
@@ -119,25 +127,7 @@ func originClientFor(originBase string) *http.Client {
 // Track records a freshly stored entry for future refresh. Snapshots with
 // empty keys, fingerprints or TTLs are ignored.
 func (w *Warmer) Track(key string, s Snapshot) {
-	if w == nil || w.store == nil || key == "" || s.Scope == "" || s.TTL <= 0 {
-		return
-	}
-	s.RawQuery = stripSecrets(s.RawQuery)
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if len(w.tracked) >= maxTracked {
-		// Evict the stalest entry to bound memory.
-		oldest := key
-		var oldestTime time.Time
-		first := true
-		for k, t := range w.tracked {
-			if first || t.last.Before(oldestTime) {
-				oldest, oldestTime, first = k, t.last, false
-			}
-		}
-		delete(w.tracked, oldest)
-	}
-	w.tracked[key] = tracked{snap: s, last: w.now()}
+	w.track(key, s, "", false)
 }
 
 // Run refreshes due entries every interval until ctx ends.
@@ -162,73 +152,12 @@ func (w *Warmer) Run(ctx context.Context, interval time.Duration) {
 
 // RefreshOnce refreshes every due entry exactly once. Testable single pass.
 func (w *Warmer) RefreshOnce(ctx context.Context) {
-	if w == nil || w.store == nil {
-		return
-	}
-	now := w.now()
-	w.mu.Lock()
-	due := make([]string, 0)
-	for k, t := range w.tracked {
-		if t.snap.TTL <= 0 || now.Sub(t.last) >= t.snap.TTL/2 {
-			due = append(due, k)
-		}
-	}
-	w.mu.Unlock()
-	if len(due) == 0 {
-		return
-	}
-	owner, ok := w.owner(ctx)
-	w.mu.Lock()
-	w.warming = ok
-	w.mu.Unlock()
-	if !ok {
-		return
-	}
-	ownerScope := w.ownerScope(ctx)
-	if ownerScope == "" {
-		return
-	}
-	for _, k := range due {
-		w.mu.Lock()
-		t, exists := w.tracked[k]
-		w.mu.Unlock()
-		if !exists {
-			continue
-		}
-		if t.snap.Scope != ownerScope {
-			// Not owner-scoped (different account): drop rather than
-			// refresh under the wrong identity. It re-tracks on its
-			// next store if current.
-			w.mu.Lock()
-			delete(w.tracked, k)
-			w.mu.Unlock()
-			continue
-		}
-		if err := w.refresh(ctx, k, t.snap, owner); err != nil {
-			w.countErr()
-			continue
-		}
-		w.mu.Lock()
-		if cur, exists := w.tracked[k]; exists {
-			cur.last = w.now()
-			w.tracked[k] = cur
-		}
-		w.refreshed++
-		w.mu.Unlock()
-		if w.metrics != nil {
-			w.metrics.IncCacheWarmed()
-		}
-	}
+	w.refreshPass(ctx)
 }
 
 // Stats snapshots operator state.
 func (w *Warmer) Stats() Stats {
-	if w == nil {
-		return Stats{}
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return Stats{Tracked: len(w.tracked), Refreshed: w.refreshed, Errors: w.errors, OwnerWarming: w.warming}
+	return w.stats()
 }
 
 func (w *Warmer) owner(ctx context.Context) (string, bool) {
@@ -303,56 +232,72 @@ func (w *Warmer) countErr() {
 // refresh re-fetches one entry under the owner token and stores 200s
 // within the entry cap. Anything else is an error (no negative caching:
 // a flapping origin must not poison hot keys). The store key is
-// recomputed under current invalidation generations so a refresh never
-// resurrects a retired namespace; a superseded tracked key is dropped.
+// captured before fetching and checked again before publication so an
+// invalidation during the fetch cannot publish an old body as current.
 func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner string) error {
+	_, err := w.refreshChecked(ctx, key, s, owner, nil)
+	return err
+}
+
+func (w *Warmer) refreshChecked(ctx context.Context, key string, s Snapshot, credential string, permit func() bool) (int64, error) {
+	storeKey := key
+	if w.KeyFunc != nil {
+		storeKey = w.KeyFunc(s)
+		if storeKey == "" {
+			return 0, refreshError{msg: "warmer: cache key unavailable"}
+		}
+	}
 	target := w.origin + s.Path
 	if s.RawQuery != "" {
 		target += "?" + s.RawQuery
 	}
 	req, err := http.NewRequestWithContext(ctx, s.Method, target, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	req.Header.Set("X-Plex-Token", owner)
+	req.Header.Set("X-Plex-Token", credential)
 	if s.Accept != "" {
 		req.Header.Set("Accept", s.Accept)
+	}
+	if _, ok := cache.RequestCacheable(req); !ok {
+		return 0, refreshError{msg: "warmer: request is not cacheable"}
 	}
 	// Warmer refreshes feed the identity-normalized cache: ask for
 	// identity encoding so stored bytes stay servable to any client.
 	req.Header.Del("Accept-Encoding")
 	resp, err := w.client.Do(req) //nolint:gosec // admin-configured origin only
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return errStatus(resp.StatusCode)
+		n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		return n, errStatus(resp.StatusCode)
 	}
-	if ce := strings.TrimSpace(strings.ToLower(resp.Header.Get("Content-Encoding"))); ce != "" && ce != "identity" {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return refreshError{msg: "warmer: encoded origin response not storable"}
+	if !cache.StorableResponse(resp.Header) {
+		n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		return n, refreshError{msg: "warmer: origin response not storable"}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, cache.MaxEntryBytes+1))
 	if err != nil {
-		return err
+		return int64(len(body)), err
 	}
 	if len(body) > cache.MaxEntryBytes {
-		return errTooLarge()
+		return int64(len(body)), errTooLarge()
 	}
-	storeKey := key
-	if w.KeyFunc != nil {
-		if nk := w.KeyFunc(s); nk != "" {
-			storeKey = nk
-		}
+	if w.KeyFunc != nil && w.KeyFunc(s) != storeKey {
+		return int64(len(body)), refreshError{msg: "warmer: generation changed during refresh"}
+	}
+	if permit != nil && !permit() {
+		return int64(len(body)), refreshError{msg: "warmer: authorization context or job expired"}
 	}
 	if err := w.store.Set(ctx, storeKey, cache.Entry{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
+		Headers:     cache.SafeHeaders(resp.Header),
 		Body:        body,
 	}, s.TTL); err != nil {
-		return err
+		return int64(len(body)), err
 	}
 	if storeKey != key {
 		type deleter interface {
@@ -362,7 +307,7 @@ func (w *Warmer) refresh(ctx context.Context, key string, s Snapshot, owner stri
 			_ = d.Delete(ctx, key)
 		}
 	}
-	return nil
+	return int64(len(body)), nil
 }
 
 // stripSecrets drops token-bearing params from a raw query so snapshots
@@ -379,17 +324,29 @@ func stripSecrets(raw string) string {
 		switch strings.ToLower(k) {
 		case "x-plex-token", "token", "authtoken":
 			q.Del(k)
+		default:
+			values := q[k]
+			for i, value := range values {
+				if nested, err := url.Parse(value); err == nil && nested.RawQuery != "" {
+					nested.RawQuery = stripSecrets(nested.RawQuery)
+					values[i] = nested.String()
+				}
+			}
+			q[k] = values
 		}
 	}
 	return q.Encode()
 }
 
-type refreshError struct{ msg string }
+type refreshError struct {
+	msg    string
+	status int
+}
 
 func (e refreshError) Error() string { return e.msg }
 
 func errStatus(code int) error {
-	return refreshError{msg: "warmer: origin status " + http.StatusText(code)}
+	return refreshError{msg: "warmer: origin status " + http.StatusText(code), status: code}
 }
 
 func errTooLarge() error {

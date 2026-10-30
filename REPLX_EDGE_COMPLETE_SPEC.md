@@ -152,6 +152,8 @@ The files under `docs/` and `deploy/` are canonical source documents.
 | `docs/operations_runbook.md` | Production operations |
 | `docs/ci_release_backup_upgrade.md` | CI, releases, backup and upgrade |
 | `docs/implementation_roadmap.md` | Ordered build phases |
+| `docs/bounded_cache_implementation_plan.md` | Detailed 200 GB deployment plan, shared artwork and phased library acceleration |
+| `docs/agent_execution_plan.md` | Model assignments, execution batches and implementation status |
 | `docs/acceptance_criteria.md` | Definition of done |
 | `deploy/media_fallback_design.md` | Optional non Cloudflare media gateway |
 
@@ -1020,7 +1022,7 @@ PMS event consumer
 incremental sync
 reconciliation
 cache janitor
-artwork janitor
+shared artwork recovery and priority-eviction janitor
 diagnostics janitor
 playback retention janitor
 session reconciliation
@@ -1476,7 +1478,8 @@ Replx Edge uses three distinct data classes:
 ```text
 PostgreSQL internal library index
 Valkey user scoped response cache
-Filesystem artwork and trace storage
+PostgreSQL artwork variant/reference records
+Shared content-addressed artwork blobs and trace storage
 ```
 
 The library index is shared internal data. It is not a ready made user response cache.
@@ -1501,7 +1504,7 @@ The owner synchronized library index may be shared internally for:
 
 Before a shared index result is returned to a user, Replx Edge must ensure the user's PMS permissions and visibility are respected. Local search should fall back to PMS when Replex cannot prove that a result is visible to that user.
 
-Artwork binaries may be shared when their URL and transformation key are identical and the user has already been authorized to reference the artwork.
+Artwork bytes are shared by content digest. A PostgreSQL transform reference is scoped to the caller's Plex scope and request variation, then points to a shared blob; neither the transform mapping nor the blob grants access. The caller must hold a current exact-resource authorization lease before a local read.
 
 ## Cache isolation invariant
 
@@ -1518,6 +1521,47 @@ personalized metadata
 
 CI must include a two user isolation test that poisons one user's cache and proves the second user never receives it.
 
+### Exact response authorization lease
+
+Identity and a recently valid Plex.tv credential do not prove current access
+to a cached PMS response. Batch B adds a memory-only lease keyed by the caller's
+token fingerprint and the exact response cache key. Only a completed, successful
+response fetched from PMS with that caller token grants reuse. Leases expire after
+30 seconds without extending on cache hits. Expired, absent or invalidated leases
+bypass the cached response and reauthorize through PMS. Local artwork uses the
+same rule with its exact scope-bound transform key and caller fingerprint,
+while the underlying content-addressed blob can be shared across scopes.
+Warming never grants
+user authorization. The lease is not a section ACL or a substitute for Plex
+permission evaluation; real revocation behavior still needs client/PMS validation.
+
+## Shared artwork storage and admission
+
+Production stores request transform references in PostgreSQL and complete
+image payloads under sharded SHA-256 paths. Different transforms with identical
+bytes share one blob. Existing account-scoped flat-cache files are not imported;
+recovery counts them as untracked bytes against admission until operators remove
+them. Authorization remains in the bounded, memory-only exact-resource lease.
+
+Before reading an origin image, the store reserves the maximum 8 MiB payload
+plus conservative record overhead. At most 32 concurrent transfers can hold
+reservations by default. Reservations expire after two minutes and recovery
+removes abandoned temporary files. Publication writes a private temporary file,
+hashes the completed body, atomically publishes the blob, then commits the
+variant reference. Deduplication occurs by content digest. Readers hold a shared
+database lock while opening the blob so eviction cannot remove an active read.
+
+The default artwork quota is 100 GiB (configurable with
+`REPLX_EDGE_ARTWORK_MAX_GB`), with a 90% eviction target, a bounded protected
+pool and a 30 GiB minimum filesystem-free-space guard. Low priority backgrounds
+and `/art` assets are eviction candidates before normal assets; posters and
+`/thumb` transforms receive higher retention priority. Protected is a bounded
+retention tier, not a permanent pin; collection-specific protection awaits
+collection synchronization. When admission fails, artwork falls through to
+PMS and browsing continues. `/api/v1/storage` reports payload, metadata,
+reservation, untracked, quota and free-space figures without exposing keys,
+URLs or identities.
+
 ## Canonical cache key
 
 ```text
@@ -1533,6 +1577,11 @@ scope=user:{identity_uuid}
 Raw Plex tokens never appear in keys.
 
 ## Default TTLs
+
+Implementation update (agent execution batch A): home/hub, Continue Watching,
+on-deck and resume feeds bypass the response cache and are read live from PMS.
+The feed TTL/stale values below describe the earlier policy and are not active
+for those routes. No stale serving is enabled in this implementation.
 
 | Class | TTL | Stale allowance |
 | --- | ---: | ---: |
@@ -1556,6 +1605,15 @@ bounded duration and re-check. Acquisition is atomic (check-and-claim
 under one lock): exactly one request per key becomes the refresher.
 
 ## Invalidation generations
+
+Batch A expands successful watch-write invalidation to the writer's recorded
+response classes after PMS acknowledges the operation. Foreground and background
+fills check the generation captured before their fetch before publishing results.
+Batch B persists global, per-scope and per-class counters in PostgreSQL. Scope
+identifiers are stored as SHA-256 digests. Production cache reads bypass when a
+generation cannot be read; a failed bump disables cache serving until a successful
+global recovery bump. The migration seeds a nonzero default global counter and the
+key schema advances to v4, retiring prior process-local generation namespaces.
 
 Keys carry per-scope, per-class and global generation segments
 (`...:{scope}:{representation}:{scopeGen}:{globalGen}:{hash}`).
@@ -1592,9 +1650,13 @@ full consistency sweep every 6 hours
 
 ## Continue Watching
 
-Cache the actual user scoped PMS Continue Watching response. Do not attempt to reimplement Plex's Continue Watching ranking algorithm.
+Fetch the actual user scoped PMS Continue Watching response live. Home/hub
+containers also bypass caching because they may embed the same watch state.
+Do not attempt to reimplement Plex's Continue Watching ranking algorithm.
 
-Invalidate after successful timeline, scrobble and unscrobble changes.
+Invalidate the writer's affected response namespaces after successful timeline,
+scrobble and unscrobble changes. Updates sent directly to PMS remain a real-client
+validation requirement; Replx cannot invalidate a write it did not observe.
 
 ## Search
 
@@ -2070,6 +2132,12 @@ CREATE INDEX library_items_sort_title_trgm_idx ON library_items USING gin(sort_t
 CREATE INDEX library_items_original_title_trgm_idx ON library_items USING gin(original_title gin_trgm_ops);
 ```
 
+## library_collections, collection_snapshots and collection_members
+
+The owner-only collection index records source rating keys and display metadata. Ordered child membership is stored as a generation-specific snapshot. `library_collections.published_generation` points only to a completed generation; failed scans leave that pointer and its rows intact. Membership rows retain their Plex order through the zero-based `position` field. Smart collections are enumerated by Plex and use the same child endpoint; the local service does not evaluate their rules.
+
+`library_collection_syncs.catalog_generation` advances only after a complete paginated library catalog scan. Collection rows absent from that completed scan are removed, cascading their snapshots. `collection_snapshots` tracks completion, item count and a content hash. Incomplete staging rows older than seven days are eligible for cleanup.
+
 ## item_guids
 
 ```sql
@@ -2455,6 +2523,7 @@ Responses include:
 | GET | `/api/v1/server` | PMS and discovery status |
 | POST | `/api/v1/server/test` | Test origin and identity |
 | POST | `/api/v1/server/sync` | Queue reconciliation |
+| POST | `/api/v1/server/collections/refresh` | Reconcile collection catalog and ordered membership after an external collection builder completes |
 | GET | `/api/v1/users` | User list |
 | GET | `/api/v1/users/{id}` | User detail |
 | GET | `/api/v1/users/{id}/policy` | User policy |
@@ -2469,6 +2538,11 @@ Responses include:
 | GET | `/api/v1/cache` | Cache statistics |
 | POST | `/api/v1/cache/invalidate` | Retire cache namespaces by scope/class via generations (audited) |
 | GET | `/api/v1/storage` | Storage use |
+| POST | `/api/v1/storage/evict-low-priority` | Evict low-priority shared artwork under storage pressure (audited, rate limited) |
+| GET | `/api/v1/warming` | Live warming configuration and queue status |
+| PATCH | `/api/v1/warming` | Pause/enable warming and tune bounded request/byte budgets |
+| GET | `/api/v1/warming/coverage` | Observed-entry warming coverage and artwork admission state |
+| POST | `/api/v1/warming/collections/{ratingKey}/rebuild` | Rebuild one collection's internal snapshot |
 | GET | `/api/v1/sessions` | Active and recent playback |
 | GET | `/api/v1/playback/{id}` | Decision explanation |
 | POST | `/api/v1/diagnostics/traces` | Arm targeted trace |
@@ -2499,6 +2573,14 @@ Browser panels authenticate with the session cookie plus per-session CSRF token;
 `POST /server/test` defaults to 5 requests per minute per admin session.
 
 `POST /server/sync` is idempotent while a sync is already queued or running. Only one full reconciliation may run at once. A repeated call returns the current job ID instead of starting a second scan.
+
+`POST /api/v1/server/collections/refresh` is an optional authenticated completion hook for a collection builder such as Aggregar. Call it after the builder has finished changing collections. The request runs a bounded owner-token reconciliation of all library collection catalogs and child pages; it does not accept or return a Plex token. A complete collection snapshot publishes its ordered membership in one transaction. Failed/incomplete scans preserve the last published membership and return an error. A successful publication advances the server-wide `collections` response generation so all users refresh collection pages without evicting unrelated cache classes. The periodic full sync remains the fallback if the hook is not configured.
+
+`GET /api/v1/warming` reports the in-memory job scheduler configuration and queue counters. `PATCH` accepts any subset of `{ "enabled": true, "paused": false, "maxTracked": 512, "requestsPerPass": 16, "maxPerScopePerPass": 4, "bytesPerPass": 67108864 }`. Bounds are 1–512 tracked entries, 1–64 requests per pass, 1–requests-per-pass per scope, and 8–256 MiB per pass; defaults are 512, 16, 4 and 64 MiB. Enable and pause are separate: disabling turns off background jobs; pause suspends dispatch while retaining eligible queued work. Invalid limits return 400. Configuration is live for the current process and returns to deployment defaults after restart.
+
+Warm jobs are bounded, priority scheduled, deduplicated, fairly dispatched across scopes, and subject to capacity and backoff. Caller credentials used for warm refreshes come only from successful authenticated foreground requests and live in bounded short-lived memory; they are not written to the database or job payloads. Expired or revoked contexts are discarded. A warm response is still subject to the normal caller authorization lease when served.
+
+`GET /api/v1/warming/coverage` reports known observed entries, pending/due work, recent outcomes, priority distribution, active ephemeral authorization contexts, and artwork admission state. It deliberately does not report a percentage of the complete Plex library: uncached sorts, filters, headers and content are not enumerable from observed traffic. `POST /api/v1/warming/collections/{ratingKey}/rebuild` refreshes one numeric Plex collection key and its snapshot. `POST /api/v1/storage/evict-low-priority` runs one bounded eviction pass and reports removed entries and bytes; it never removes protected artwork. These manual operations are audited and rate limited.
 
 Expensive cache invalidation operations require explicit scope and are rate limited. Invalidation retires generations (per scope/class, or global), never reconstructed keys.
 
@@ -2898,7 +2980,8 @@ never does. A product version change resets certainty for review.
 | `REPLX_EDGE_ADMIN_BIND` | No | Legacy alias for the listen address on direct (non-Docker) runs |
 | `REPLX_EDGE_LOG_LEVEL` | No | Production log level |
 | `REPLX_EDGE_CACHE_MAX_GB` | No | General cache budget |
-| `REPLX_EDGE_ARTWORK_MAX_GB` | No | Artwork budget |
+| `REPLX_EDGE_ARTWORK_MAX_GB` | No | Shared artwork payload and metadata admission budget (default 100 GiB); a separate 30 GiB filesystem free-space floor is enforced |
+| `REPLX_EDGE_SHARED_ARTWORK_ENABLED` | No | Enable shared artwork caching; default `true`, set `false` to bypass local storage and use authorized PMS passthrough |
 | `REPLX_EDGE_DIAGNOSTICS_MAX_GB` | No | Trace file budget |
 | `REPLX_EDGE_TRACE_RETENTION_DAYS` | No | Trace retention |
 | `REPLX_EDGE_PLAYBACK_RETENTION_DAYS` | No | Playback decision retention |
@@ -2947,7 +3030,8 @@ REPLX_EDGE_INGRESS_MODE=cloudflare_tunnel
 REPLX_EDGE_ADMIN_PORT=8080
 REPLX_EDGE_LOG_LEVEL=info
 REPLX_EDGE_CACHE_MAX_GB=20
-REPLX_EDGE_ARTWORK_MAX_GB=50
+REPLX_EDGE_ARTWORK_MAX_GB=100
+REPLX_EDGE_SHARED_ARTWORK_ENABLED=true
 REPLX_EDGE_DIAGNOSTICS_MAX_GB=10
 REPLX_EDGE_TRACE_RETENTION_DAYS=7
 REPLX_EDGE_PLAYBACK_RETENTION_DAYS=30
@@ -3104,6 +3188,11 @@ Application rollback is supported only where the database migration notes say th
 
 # Implementation Roadmap
 
+For the detailed deployment-specific sequence covering a 200 GB VPS, shared
+artwork, three users, daily collection updates and live Continue Watching, see
+[Bounded library acceleration implementation plan](bounded_cache_implementation_plan.md).
+That document describes proposed work and acceptance gates, not completed runtime behavior.
+
 ## Alpha: Foundations, owner auth, discovery and routing spike
 
 Implement:
@@ -3179,6 +3268,506 @@ Complete load testing, backup restore, retention tests, security review, ARM64 a
 ## Post 1.0 experiment
 
 Metadata hiding and media array filtering may be investigated only after the enforcement path is stable. Any design must account for cached metadata, play queues, concurrent sessions and every index translation point.
+
+
+---
+
+## Source: `docs/bounded_cache_implementation_plan.md`
+
+# Replx Edge: bounded library acceleration implementation plan
+
+Date: 29 October 2026
+
+Status: proposed implementation plan; no runtime behavior is changed by this document.
+
+Target deployment: one remote Plex Media Server, one nearby VPS, three core users.
+
+## 1. Intended outcome
+
+Users browse libraries and collections through Replx Edge using their normal Plex applications. Frequently used metadata and artwork are ready on the VPS. Missing data is fetched from Plex without breaking browsing. Video is delivered from Plex directly to the client using a validated media route. Plex remains authoritative for authentication, visibility, collection contents, watch state, playback negotiation and transcoding.
+
+The objective is a fast, bounded cache, not a complete copy of every Plex response or image transformation. A 200 GB VPS must remain healthy as the library grows. Cache coverage is allowed to decrease under pressure; correctness, permissions and playback must not.
+
+This document adds a deployment-specific implementation sequence to the existing roadmap. Existing specifications remain the runtime contract until each phase explicitly updates them. Proposed defaults, schema names and configuration controls below are not implemented interfaces. Existing playback policy must continue to work; this project does not remove it.
+
+## 2. Confirmed requirements and unresolved inputs
+
+| Area | Requirement or current understanding |
+| --- | --- |
+| Library | 84,291 movies and 12,209 TV shows: 96,500 top-level entries, with further growth expected |
+| Users | Three core users; permissions and watched state remain separate |
+| Collections | Approximately 10 movie collections and 10 TV collections |
+| Collection automation | Aggregar rebuilds/updates collections daily around 03:00; timezone and completion integration are unconfirmed |
+| Clients | Fire TV/Firestick, Apple TV, Hisense Plex application and Plex Web |
+| Hisense | Model, operating system and application version are not yet known |
+| Origin | HTTPS Plex endpoint; believed to be in Iceland |
+| Administration | User has Plex administration and token access, but no bare-metal/server filesystem access |
+| Cache host | Planned VPS in Wales with 200 GB disk; RAM, CPU, actual usable capacity and networking are unconfirmed |
+| Artwork | Identical files should be shared across authorized users, not copied three times |
+| Priority | Collection entry screens and posters ahead of rarely accessed backgrounds and speculative artwork |
+| Watch state | Continue Watching must not acquire stale-cache delay when leaving playback |
+
+Season/episode totals are not blockers: inventory can count them through permitted APIs. No implementation phase should require shell access to the Plex host. A completion hook from Aggregar is optional and requires separate access to wherever that automation runs.
+
+## 3. Current implementation baseline
+
+Source inspection established the following; it is not evidence of a successful production deployment or real-client test.
+
+| Component | Existing behavior | Work needed |
+| --- | --- | --- |
+| `internal/cache/cache.go` | User-scoped responses, short TTLs, 2 MiB body cap, process-local invalidation generations | Explicit request variation, durable generations and measured body limits |
+| `internal/proxy/proxy.go` | Cache lookup, origin fallback, request coalescing, artwork routing and watch-write recognition | Response-aware invalidation, cache admission and comprehensive route policies |
+| `internal/warmer/warmer.go` | Refreshes observed owner entries; maximum 512 tracked requests | Priority scheduling, proactive preparation and bounded user-context warming |
+| `internal/artwork/` | Shared content-addressed blobs, PostgreSQL transform references, seven-day expiry, durable write reservations, crash recovery, priority eviction and a free-space guard | Collection-aware protected artwork and measured client transform/priority coverage |
+| `internal/sync/` | Owner index of libraries/items/media; periodic reconciliation | Explicit collection/member indexing and change publication |
+| `internal/sync/events.go` | Selected library refresh events mark sections dirty | Prompt invalidation, event coverage validation and missed-event recovery |
+| `internal/identity/` | Token fingerprints resolve identities; ordinary user credentials are not persisted | Separate identity from current PMS resource authorization |
+| `internal/spike/` | Experimental direct-origin redirects with transient delegation tokens | Real-client evidence and production delivery configuration |
+| `cmd/replx-edge/main.go` | Worker wiring; optional media gateway remains a health-only placeholder | Wire new services; avoid presenting the placeholder as a playback fallback |
+| `deploy/compose.yml` | PostgreSQL, Valkey, Replx and optional tunnel infrastructure | Enforce RAM/disk budgets and account for persistence/maintenance overhead |
+| `tests/integration/` | Fixtures and limited integration checks | Full proxy/storage tests rather than only key/route assertions |
+
+Important distinction: `direct` ingress currently can proxy media. It does not itself promise a direct client-to-PMS media connection. Artwork misses also normally pass through Replx; they are not automatically redirected to Plex.
+
+## 4. Architecture and invariants
+
+```text
+Plex client -- browse --> Replx on Wales VPS
+                           |-- authorized response cache (Valkey)
+                           |-- per-user artwork authorization/reference
+                           |       `-- shared image blob on disk
+                           `-- cache miss / live state --> remote PMS
+
+Plex client -- validated media redirect ----------------> remote PMS
+
+Owner API sync --> PostgreSQL inventory and collection snapshots
+Changes        --> durable invalidation --> bounded warmer
+```
+
+Required invariants:
+
+1. Owner inventory never becomes an unfiltered shared user response.
+2. A cached blob's existence does not authorize a user to read it.
+3. Identical image bytes can share storage; different transformations may remain distinct.
+4. No media bytes are intentionally delivered through a Cloudflare control hostname.
+5. A cache failure preserves origin browsing where origin access is available.
+6. Disk pressure stops admission before exhausting the filesystem.
+7. Failed or partial collection scans never establish authoritative deletion.
+8. An in-flight response from an old generation cannot repopulate current state.
+9. Credentials never appear in cache keys, filenames, metrics or logs.
+10. No client or protocol is declared supported without playback evidence.
+
+Location is not a latency guarantee. Measure all three legs: client-to-Replx, Replx-to-PMS and client-to-PMS. Cache misses take an additional hop; playback remains dependent on the origin connection.
+
+## 5. Capacity and storage policy
+
+### 5.1 Initial budgets
+
+Use decimal GB in operator-facing planning and explicit bytes in implementation. Verify filesystem usable capacity before applying limits; a provider's 200 GB allocation is not 200 GiB of free application space.
+
+| Area | Initial planning allowance | Enforcement |
+| --- | ---: | --- |
+| Shared artwork | 100 GB | Hard admission budget including temporary/reserved image space |
+| PostgreSQL plus persistent response-cache files | 20 GB | Monitored allowance, retention and growth alarms; never delete authoritative DB data to satisfy a cache quota |
+| Logs and diagnostics | 5 GB | Rotation and retention limits |
+| Other capacity | Approximately 75 GB | OS, container images, maintenance, WAL/AOF rewrite, growth and free space |
+| Minimum free space | 30 GB within the remaining capacity | Pause warming, reject new cache writes and evict reclaimable artwork |
+
+These allowances are not independent guarantees: the global filesystem threshold overrides individual cache budgets. Temporary database maintenance and Valkey persistence rewrite space must be included in capacity testing. Critical free-space exhaustion must alert the operator; cache eviction cannot fix unbounded unrelated files indefinitely.
+
+Choose Valkey `maxmemory` only after learning VPS RAM. Reserve memory for the OS, PostgreSQL, Replx and concurrent image transfers. Treat Valkey responses as disposable. Store correctness-critical invalidation epochs outside an evictable response namespace, preferably in PostgreSQL with a bounded in-process read cache for this single-instance deployment.
+
+### 5.2 Preload estimate and measurement
+
+For 96,500 top-level titles, illustrative averages of 150–400 KB per poster, 300 KB–1 MB per background, up to 50–200 KB per logo and 10–50 KB basic metadata produce roughly 49–159 GB for one variant of each asset. These are assumptions, not measurements. Logos are not universally present. Indexes, seasons, episodes, collections, multiple transforms and temporary versions are additional.
+
+Inventory through PMS and sample at least 500 movies, 200 shows, representative seasons/episodes, and all 20 collections. Include old/new/popular/random titles and differing image sizes. Report mean, p50/p95 sizes, missing-asset rates, duplicate rates and actual client transform counts. Estimate database bytes separately from serialized response sizes.
+
+Do not preload preview frames, trailers, extras or every cast image in the initial release. Report coverage as separate counts: inventory indexed, posters available, collection landing pages warm and per-user pages warm. A single “100% cached” label would be misleading.
+
+### 5.3 Retention priorities
+
+| Tier | Examples | Policy |
+| --- | --- | --- |
+| Protected, bounded | Collection covers and essential collection-list snapshots | Reserve a small capped pool; replace on updates |
+| High | First visible collection posters, recent titles, actively accessed posters | Retain before lower tiers; not permanently pinned |
+| Normal | Other movie/show posters and commonly used logos | Evict by recency/frequency within a size-aware policy |
+| Low | Backgrounds, oversized/duplicate-size variants, speculative assets | First eviction candidates |
+| On demand | Rare episode thumbnails and secondary images | Admit only when useful and budget permits |
+
+Do not deprioritize letters V–Z. Learn actual usage and prepare initial pages for the client's actual sort order. A huge collection must not pin its entire membership. Per-collection first-page coverage and protected bytes have explicit caps; pinned content cannot exceed the hard budget.
+
+Use low/high watermarks to avoid deleting one file on every incoming request. First choose a lower-priority tier, then prefer cold/large assets within that tier. Buffer or sample access accounting rather than performing a database write on every image hit. Expiring one user's reference must not delete a blob still referenced by another user.
+
+## 6. Shared artwork design
+
+Separate three concepts:
+
+- Resource authorization: a user is currently allowed to reference this PMS artwork resource.
+- Source/transform mapping: Plex scope, server identity, resource version and response-affecting transformation parameters map to a blob. Scope-bound references prevent identical URLs from exposing permission-dependent response bytes; the payload deduplicates across users by content digest.
+- Blob identity: cryptographic digest of the completed image bytes, with size, MIME type and storage path.
+
+Proposed records: `artwork_blobs`, `artwork_variants`, `artwork_authorizations`, and bounded warming jobs. Add indexes for eviction priority and last use. Never key authorization solely by a public blob hash or account identity.
+
+Initially preserve PMS-generated client transformations. Normalize only proven-equivalent requests; unknown variation bypasses shared reuse. Validate permissions through an authorized PMS response, retain a bounded authorization validity interval and revalidate on uncertainty. Revoked access must not be extended by a long image TTL.
+
+Write workflow: authorize request; reserve a bounded maximum transfer size; fetch/stream to a private temporary file; validate completion and size; hash content; atomically publish or reuse the blob; commit references; release reservations. Deduplicate after hashing even when source URLs differ. Coalesce equivalent in-flight authorized requests when safe. Oversized or failed transfers stream uncached without leaving partial objects.
+
+Use sharded filesystem paths rather than a single directory containing millions of files. Reconcile orphan files and stale reservations after crashes. Eviction must coordinate with readers and refcounts so concurrent access cannot corrupt a response. Track payload, temporary and metadata usage, with filesystem free space as the final safeguard.
+
+Use content/version changes and periodic validation instead of redownloading the entire preload every seven days. Bound retained superseded versions. If Plex changes image bytes without changing a URL, periodic revalidation must eventually detect it.
+
+## 7. Collections and daily updates
+
+Store collections and ordered membership explicitly, including source IDs, type, relevant metadata/art references and last complete snapshot. Smart collections remain PMS-evaluated; do not reproduce their filtering or ranking.
+
+Preferred trigger: an authenticated Aggregar completion signal, if available. Fallback: bounded polling around the configured rebuild window and a regular reconciliation pass outside it. Confirm the timezone before activation; use an IANA timezone and handle daylight saving changes. Do not schedule a real automation as part of writing this plan.
+
+On change, stage a new snapshot, fetch affected collection pages, prepare protected artwork and atomically publish the completed generation. Refresh only changed membership/artwork and their dependent pages. Owner snapshot publication does not automatically make user response caches warm.
+
+A rebuild may delete and recreate collections with different IDs. Use PMS identifiers as authoritative; do not merge different collections merely because their titles match. A full completed enumeration establishes deletions. Without a completion signal, use repeated stable observations plus a maximum settling window and disclose that this is a heuristic. Mark refresh as incomplete rather than claiming an atomic view of a source changing mid-scan.
+
+Keep the last complete display snapshot within a bounded stale allowance during transient rebuild failures, provided authorization remains valid. Confirmed removals or access revocations override stale serving. Rate-limit and debounce large update bursts. Continue ordinary browsing while collection refresh runs.
+
+## 8. Watch-state freshness
+
+For three users, start with live PMS reads for Continue Watching and every home/hub response containing equivalent state. Detect those routes using real client captures, not only a pathname substring. Do not implement Plex's ranking algorithm locally.
+
+Forward timeline, stop, scrobble and unscrobble operations immediately. After successful origin acknowledgement, advance the user's relevant generation and invalidate affected details, resume positions, badges, home feeds and show/season counts. A provisional dirty marker before the write may prevent concurrent stale reads, but completion must retire responses fetched before acknowledgement. Failure must clear pending state without inventing a successful watch update.
+
+Measure whether each client sends progress to Replx or directly to PMS after media redirection. Where events are available, use them as invalidation hints, not as the sole source of truth. Live reads and bounded active-session reconciliation cover bypassed or lost events. Avoid permanently polling all user state at high frequency.
+
+Acceptance: once PMS reflects the update, the next requested Continue Watching response is fetched live and receives no stale-cache delay from Replx. Client rendering/request cadence and PMS update latency are measured separately. A background prefetch is optional and must use that user's valid context, never the owner token.
+
+## 9. Phased implementation
+
+Each phase produces reviewable commits and updates its affected canonical specifications. Code work should not start by implementing all phases in one patch. Dependencies are explicit; completion requires evidence, not only source code presence.
+
+### Phase 0 — inventory and reproducible baseline
+
+Dependencies: read access to the local repository; live measurements additionally require an approved secure Plex credential/configuration path.
+
+Tasks:
+
+1. Run the current test/CI baseline and record environment-related skips separately from passes.
+2. Add a read-only inventory/report command with pagination, bounded concurrency and resumable sampling.
+3. Count accessible libraries, seasons, episodes, collections and assets; measure representative sizes.
+4. Capture sanitized request sequences from the available priority clients.
+5. Measure cold/warm origin latency and actual VPS disk/RAM/CPU capacity.
+
+Likely modules: `internal/pms`, `internal/capture`, `internal/metrics`, a CLI command under `cmd`, and fixtures.
+
+Deliverables: inventory report, client request matrix, capacity worksheet and baseline test results. Gate: no performance promise is presented as measured without these results. Offline fixtures can proceed before server access is available.
+
+### Phase 1 — prove discovery and direct-origin playback
+
+Dependencies: Phase 0 captures and reachable HTTPS PMS.
+
+Tasks:
+
+1. Verify Custom Server Access URL discovery and preserved server identity.
+2. Trace selected connection on each client; document clients that bypass Replx.
+3. Test transient-token redirect compatibility, HTTPS trust, Range, seek/resume, subtitles and applicable transcode protocols.
+4. Confirm manifest and segment hosts; measure bulk bytes through Replx.
+5. Separate ingress transport configuration from media delivery strategy and add validated production routing controls.
+
+Likely modules: `internal/spike`, `internal/routing`, `internal/delegation`, `internal/proxy`, `internal/config`, onboarding and compatibility administration.
+
+Gate: Plex Web and at least one available physical client demonstrate the full path before broad cache rollout. Fire TV and Apple TV each require evidence before being advertised as supported; Hisense remains UNKNOWN until identified and tested. Do not silently enable the placeholder media gateway. Unsupported clients require a documented deployment decision.
+
+### Phase 2 — cache correctness and live watch state
+
+Dependencies: Phase 0 request matrix. Offline implementation may proceed alongside routing validation; deployment remains gated by Phase 1.
+
+Tasks:
+
+1. Introduce explicit route policies for cacheability, freshness, variation and user scope.
+2. Account for header/query pagination, language, representation, client capability variation and `Vary` behavior; safely bypass unknown cases.
+3. Add durable invalidation epochs and generation checks around concurrent fills.
+4. Bypass home/Continue Watching response caching and implement acknowledgement-aware state invalidation.
+5. Add tests for revoked credentials, managed/restricted users and resource authorization distinct from identity.
+
+Likely modules: `internal/cache`, `internal/proxy`, `internal/identity`, `internal/valkey`, migrations and tests.
+
+Gate: end-to-end isolation tests pass; changed watch state is never hidden by a Replx cache hit; restart and in-flight races cannot resurrect retired responses.
+
+### Phase 3 — shared artwork and hard storage controls
+
+Dependencies: Phase 2 authorization and cache invariants; Phase 0 size report for final defaults.
+
+Suggested commit sequence:
+
+1. Add blob/reference/authorization schema and filesystem interfaces.
+2. Add content hashing, atomic publication, sharded paths and deduplication.
+3. Add byte reservations, crash recovery and concurrent-reader-safe deletion.
+4. Add priority eviction, admission watermarks and the global free-space guard.
+5. Wire the new store behind a feature flag and add metrics/admin inspection.
+
+Migration strategy: treat the old artwork cache as disposable. Prefer lazy migration after reauthorization or a separate new cache directory. Count both stores against disk limits during transition; never blindly import old permission assumptions. Do not require downloading the complete library to turn on the new store.
+
+Gate: the same image requested by three authorized users occupies one blob; an unauthorized user cannot retrieve it; concurrent writes stay inside the reserved budget; forced low-disk tests preserve ordinary origin responses.
+
+### Phase 4 — collection snapshots and incremental synchronization
+
+Dependencies: Phase 2 durable invalidation; Phase 3 for artwork preparation.
+
+Tasks:
+
+1. Add collection, ordered membership and snapshot-generation migrations.
+2. Synchronize ordinary/smart collection results with pagination and completion markers.
+3. Publish change sets for additions, deletions, reorderings and art changes.
+4. Connect change sets to targeted cache invalidation and preparation queues.
+5. Add optional completion-trigger endpoint and configurable polling/reconciliation schedules.
+
+Likely modules: `internal/sync`, `internal/admin`, migrations, worker wiring and configuration.
+
+Gate: all 20 collections reconcile; failed scans do not erase membership; daily updates replace only affected data; source delete/recreate behavior and changing snapshots are tested.
+
+### Phase 5 — priority warming for three users
+
+Dependencies: Phases 2–4.
+
+Implementation status: the A–F execution batches delivered the cache, collection and observed-response warming foundation. Proactive library preloading remains an outstanding core requirement in Batch E. Follow **small discovery check → implement proactive preloading → controlled end-to-end and performance testing**. A–F completed the foundation; they did not complete the original preload requirement. See [Batch E in the agent execution plan](agent_execution_plan.md) for the assigned work and completion gate.
+
+Assigned models: GPT-6.1 Sol High for discovery, authorization/interface design and final qualification; GPT-6.1 Sol Medium for resumable enumeration and proactive preload implementation; GPT-6 Luna Medium for admin controls, coverage reporting and documentation after interfaces are stable. Exact model IDs and dispatch requirements are recorded in the agent execution plan.
+
+Tasks:
+
+1. Replace the owner-only observed-entry list with bounded priority jobs.
+2. Prepare protected collection assets and useful posters first, using actual client transformations.
+3. Warm first visible pages and likely next pages for recently active user/client contexts.
+4. Add per-user fairness, byte/request/concurrency budgets, deduplication and backoff.
+5. Cancel obsolete jobs on collection generations, permission changes and storage pressure.
+6. Add resumable, bounded asset enumeration so the configured priority library assets can be prepared before users browse each title. Refresh changed assets incrementally after catalog and collection updates; report proactive coverage separately from observed-request refresh.
+
+User-token policy: use a short-lived, bounded in-memory context from actual authorized user requests; clear it on expiry/revocation. Persistent jobs contain no raw credential. After restart, user warming waits for a fresh context. Owner credentials prepare owner data and shared internal inventory, not another user's personalized pages. Warming while users are absent across restarts requires a separate approved credential-lifecycle design.
+
+Gate: ordinary users benefit, warming does not starve browsing, and first-ever user access is honestly reported as cold where authorization or responses are unavailable. Success is useful warm coverage, not an impossible enumeration of every filter/sort combination.
+
+### Phase 6 — administration and operational controls
+
+Dependencies: Phases 3–5.
+
+Expose used/reserved/free bytes; blob deduplication ratio; eviction by tier; queued/failed jobs; per-user and per-route hit rates; cache bypass reasons; collection generation/last completion; origin latency; and media delivery evidence. Avoid raw tokens and high-cardinality resource IDs in metric labels.
+
+Add controls to pause warming, change budgets, rebuild one collection, evict low-priority assets and disable new behavior. Validate requested budgets against available storage; a protected tier cannot be configured above its parent budget. Dashboard text must distinguish configured behavior, observed operation and untested client support.
+
+Gate: an operator can explain a slow page or storage-pressure event without reading secret-bearing logs.
+
+### Phase 7 — integration, load and failure qualification
+
+Dependencies: Phases 1–6.
+
+Run the actual proxy with PostgreSQL, real Valkey and a controllable fake PMS. Add a Valkey service to the CI integration environment. Exercise large paginated synthetic inventories rather than loading hundreds of thousands of full response objects into memory.
+
+Required cases:
+
+- Three-user shared blob storage with differing library permissions and revoked access.
+- Pagination/header variation, unsupported `Vary`, incomplete responses and oversized images.
+- Collection rebuild during browsing; lost events; repeated triggers; interrupted sweeps.
+- Stop/back-out/watch transitions including writes reaching PMS directly.
+- Concurrent warm jobs and requests during eviction, restart and generation changes.
+- Valkey outage, PostgreSQL outage, origin timeout, full/low disk and process termination during blob publication.
+- Actual Fire TV, Apple TV and Plex Web playback; Hisense when available.
+
+Run `go vet ./...`, `go test ./...`, existing race checks, migrations, relevant frontend checks and Docker builds. Run the generated-spec consistency check. Record skipped live tests explicitly; passing mocks does not establish client compatibility.
+
+Gate: isolation and storage invariants pass under failure, and performance results include dataset, response sizes, concurrency and machine details.
+
+### Phase 8 — staged deployment and tuning
+
+Dependencies: qualification and at least the Phase 1 minimum real-client gate.
+
+Deploy with separate feature switches for the new artwork store, collection sync, user warming and production media delivery. Enable for the owner, then one shared user, then all three. Use a bounded initial preload: collection covers, initial collection posters, useful library posters, then opportunistic backgrounds.
+
+Observe at least one actual daily collection rebuild and representative playback sessions before expanding preload coverage. Adjust budgets based on measured hit rates and eviction churn rather than making the cache larger automatically.
+
+Rollback: pause jobs; disable new response/artwork behavior and return browsing to authorized PMS passthrough; retain the proven media path. Use additive schema migrations so disabling features does not require destructive rollback. Old cache data must not be treated as current merely because a feature is disabled. Document recovery from a failed upgrade and restore test results.
+
+Gate: no regression in playback or watch freshness, bounded disk/RAM, verified collection updates and a tested operational rollback.
+
+## 10. Performance and acceptance scorecard
+
+Proposed user-facing targets supplement rather than silently replace the existing internal processing targets in `acceptance_criteria.md`.
+
+| Measure | Proposed acceptance |
+| --- | --- |
+| Warm metadata response at Replx | p95 below 100 ms in a defined VPS benchmark, excluding client WAN latency; report body size |
+| Prepared browse sequence hit rate | Above 95% for explicitly prepared cacheable requests; live home/watch-state requests excluded and reported separately |
+| Continue Watching | No cached response after PMS reflects the update; measure PMS and client delays separately |
+| Collection propagation | Initial goal: publish within 5 minutes of confirmed rebuild completion for these 20 collections, subject to baseline evidence |
+| Disk | Artwork admission remains within configured reservations; free-space guard demonstrated under external disk growth |
+| Deduplication | Three authorized requests for identical bytes produce one retained blob |
+| Permissions | No cross-user restricted metadata, artwork or personalized-state disclosure |
+| Media | Zero bulk video bytes through Replx for validated direct-origin playback scenarios |
+| Failure | Cache failures fall through to PMS where possible; unknown permissions fail safely |
+
+Retain the existing p50/p95 internal overhead benchmarks and report them separately from end-to-end API response time. UI time-to-visible-posters is a separate device measurement. Targets are goals until measured, not promises that the VPS location alone can deliver.
+
+## 11. Risks and decisions to resolve
+
+| Risk or open decision | Response |
+| --- | --- |
+| Clients choose origin for browsing | Discovery/connection traces in Phase 1; do not assume Custom Server Access URL forces selection |
+| Unsupported cross-host media redirect | Per-client/per-protocol gate; revise delivery architecture before claiming support |
+| No host filesystem access | Use supported remote APIs; if required event access is unavailable, use bounded reconciliation |
+| Incomplete knowledge of permissions | Reauthorize through PMS; never infer a grant from owner visibility or account identity |
+| Collection automation has no completion hook | Stable-observation polling with documented limits and periodic reconciliation |
+| Episodes dominate artwork size | Keep most episode artwork on demand; hard budgets make unknown totals manageable |
+| Per-client transforms multiply storage | Measure variants; retain useful sizes and deduplicate identical payloads |
+| Growth or external files consume reserve | Stop speculative admission, evict reclaimable blobs and alert; never delete authoritative data |
+| User context expires between visits | Keep safe shared blobs; allow cold authorized response fetch; no owner-token substitution |
+| Live Continue Watching is slow at PMS | Measure separately; tune only with evidence, preserving the no-stale-cache requirement |
+
+Outstanding inputs: VPS RAM/CPU and usable disk; Plex API/version and measured endpoint access; season/episode inventory; actual client versions; Hisense OS/model; Aggregar schedule timezone and completion integration. None of the unknown counts prevents bounded storage implementation.
+
+## 12. First implementation milestone
+
+The first milestone is deliberately small: baseline tests, a read-only inventory/sample report, sanitized client browsing/playback traces, and the route-policy/watch-state corrections from Phase 2. Phase 1 live routing evidence is the deployment gate. Then implement shared artwork with hard admission limits before starting broad preload.
+
+Do not start by downloading the entire library. That would consume the storage budget before the project can deduplicate, prioritize or safely evict its contents.
+
+
+---
+
+## Source: `docs/agent_execution_plan.md`
+
+# Agent execution plan
+
+Status: the A–F foundation was implemented and locally qualified on 30 October 2026. Batch E remains incomplete against the original proactive library preload requirement. Live PMS and physical-client qualification remains pending. This is a reusable instruction document for Codex, not a standalone shell scheduler.
+
+Required sequence: **small discovery check → implement proactive preloading → controlled end-to-end and performance testing**. A–F completed the foundation; they did not complete the original preload requirement. The next incomplete work is Batch E's proactive preload extension below. Existing qualification results cover the foundation; extend and repeat qualification after preloading is implemented.
+
+## Run instruction
+
+Ask Codex: "Execute the next incomplete batch in docs/agent_execution_plan.md using its assigned models. Inspect the working tree, preserve existing changes, run relevant tests, integrate the results and update the execution record. Continue independent offline work while recording live validation as pending."
+
+Detailed requirements: [bounded cache implementation plan](bounded_cache_implementation_plan.md).
+
+## Model assignments
+
+| Work | Model | Effort | Dependency |
+| --- | --- | --- | --- |
+| Coordination and integration | Current main-chat model | Current setting | All batches |
+| Inventory command and fixture tests | GPT-6 Luna | High | None |
+| Cache keys, user isolation and watch state | GPT-6.1 Sol | High | Existing source and fixtures |
+| Shared artwork authorization/storage | GPT-6.1 Sol | High | Cache review; explicit authorization contract |
+| Collection snapshot synchronization | GPT-6.1 Sol | High | Durable invalidation interface |
+| Priority warming | GPT-6.1 Sol | Medium | Artwork and collection interfaces |
+| Preload discovery and client request analysis | GPT-6.1 Sol | High | Operator/client access; sanitized request evidence |
+| Preload authorization and interface design | GPT-6.1 Sol | High | Discovery evidence and existing authorization contract |
+| Resumable enumeration and proactive asset preload implementation | GPT-6.1 Sol | Medium | Approved interfaces, actual transforms and storage admission |
+| Preload controls, progress reporting and documentation | GPT-6 Luna | Medium | Stable preload interfaces |
+| Preload integration review and end-to-end/performance qualification | GPT-6.1 Sol | High | Implemented preload; operator/device access for live checks |
+| Admin controls, documentation and fixtures | GPT-6 Luna | Medium | Stable implementation interfaces |
+| Independent integration review | GPT-6.1 Sol | High | Each implementation batch |
+| Live routing/device checks | GPT-6.1 Sol with operator/device access | High | Secure PMS configuration and available clients |
+
+Model settings are passed when spawning each agent. The coordinator cannot change its own current model through these tools. Keep a maximum of three child agents active. Do not spawn further agents without an explicit assigned need. Prefer one focused implementation agent over multiple agents editing the same subsystem.
+
+For the remaining Batch E work, explicitly spawn `gpt-6.1-sol` with `high` effort for discovery, authorization/interface design and final qualification; use `gpt-6.1-sol` with `medium` effort for implementation after interfaces are fixed; use `gpt-6-luna` with `medium` effort for admin controls, coverage reports and documentation. This retains the cost-conscious split between focused implementation and deeper review. Pass model overrides with a fresh agent context and a self-contained assignment. Record the actual agent, model, effort, changed files, checks and outstanding requirements in the execution record. If an assigned model is unavailable, report that before substituting another model.
+
+## Execution rules
+
+- Inspect AGENTS.md and working-tree changes before assignments. Existing documentation changes belong to this conversation and must be preserved.
+- Assign exclusive files/packages to each writer. Read-only reviewers may inspect all files.
+- Keep dependent changes sequential. Freeze interfaces before allowing downstream implementation.
+- Require every agent to report changed files, checks performed, failures and incomplete requirements.
+- Use focused tests during implementation, then the existing Go suite and appropriate integration checks during reconciliation. Missing services are recorded as unavailable, never as passes.
+- Do not commit, publish or deploy as part of this run unless separately instructed.
+- Never put Plex credentials in task prompts, logs or documents. Offline fixtures precede live requests.
+- Do not claim client compatibility from unit tests. The live deployment gate remains in force.
+- If a model makes no progress after two bounded repair attempts, escalate that task to Sol High with the failure evidence rather than repeat indefinitely.
+
+## Batches
+
+### A: foundation — locally complete
+
+1. Luna High: create a separate read-only inventory command and package, bounded PMS calls and fixture tests.
+2. Sol High: implement initial cache/watch-state corrections within cache/proxy packages; retain unresolved Phase 2 requirements explicitly.
+3. Luna Medium: read-only artwork/collection interface assessment.
+4. Coordinator: integrate, inspect diffs, run checks and record remaining work.
+
+### B: cache authorization and durable invalidation — locally complete
+
+1. Sol High: add `cache_generations` migration and Postgres/memory generation stores. Store only a digest of scopes; keep independent server, scope and class counters. Seed the default global counter and advance cache key schema to v4.
+2. Sol High: wire production proxy and warmer keys to Postgres generation reads; bypass on generation read failure. A failed durable bump disables cache serving until an operator/global successful recovery bump.
+3. Sol High: add exact-response authorization leases in memory, keyed by caller fingerprint plus exact request cache key. Grant only after a complete successful caller-token PMS response; a lease lasts 30 seconds, does not slide and is revoked on known invalid credentials. Expired or absent proof bypasses local response/artwork reuse.
+4. Sol review: verify exact-request scope, restart behavior, SQL atomicity, key privacy, and fail-closed paths.
+
+Gate completed locally: SQL integration tests exercised migrations and a new generation-store instance after restart; current counters remain effective and a later scope bump retires all earlier classes. Real Plex permission revocation and client behavior remain unverified. The 30-second lease is a bounded authorization staleness window, not a library ACL. Unknown/managed-content semantics still need live testing. Race tests remain unavailable without CGO tooling.
+
+### C: shared artwork — locally complete
+
+Sol High implemented shared content-addressed blobs, PostgreSQL transform references, atomic publication, per-caller authorization gates, write reservations, crash recovery, priority eviction and a minimum-free-space guard. Admin storage reporting exposes bounded capacity figures. Gate evidence: proxy and SQL tests verify three callers must each authorize through PMS, their scoped references deduplicate identical bytes to one blob, and anonymous reuse is denied; replacement preserves other references; expired reservations/orphans recover; low-priority data evicts before posters; forced low disk rejects admission while reads remain available; concurrent reservations stay inside budget. Real Plex permission behavior and deployment disk pressure remain pending.
+
+### D: collections — complete locally
+
+Sol High implements explicit snapshots and ordered membership, then targeted invalidation and optional completion-trigger handling. Coordinator integrates admin wiring and documentation. Gate: incomplete scans cannot delete valid memberships, and daily rebuilds publish complete generations.
+
+Collection synchronization stages the complete catalog and ordered PMS child results for one library before a single transaction publishes its metadata, snapshot pointers and deletions. Ordinary and smart collections use PMS-evaluated children. Failed pages, changing totals, duplicate keys and ambiguous empty responses preserve the published generation; an explicit complete empty result can remove all collections or members. Unchanged content retains its published generation. Collection metadata, artwork references, ordering, membership additions/deletions and Plex delete/recreate identifiers participate in the change comparison. A committed change records a durable pending cache invalidation; the callback runs after commit and failures are retried. New catalog placeholders and staged snapshots are internal data and must never be treated as caller authorization or served as published data without a published-generation join.
+
+### E: proactive preloading, warming and operations — partially complete
+
+Sol Medium implements priority jobs and bounded ephemeral user contexts. Luna Medium implements stable admin controls and coverage reporting. Gate: warming respects capacity, permissions, origin request budgets and browsing priority.
+
+The scheduler only warms observed browse representations; it does not enumerate every library item, prefetch all artwork, or guess device-specific transforms. Jobs are deduplicated, limited to 512 entries, dispatched serially with request/byte/per-scope budgets, and prioritized across scopes. Foreground traffic cancels active background work. User credentials are held in at most 32 in-memory contexts for a fixed two minutes after successful foreground authorization; jobs contain no credentials, and publication rechecks the job/context before storage. Invalid credentials remove that scope's context and queued entries. Collection browse paths are protected in the queue, library section responses high priority, metadata normal, with low-priority shared artwork eligible for safe eviction only when no higher-priority reference shares its blob.
+
+Authenticated admin operations expose process-local pause/enable and bounded budgets, honest observed-entry coverage, one-collection rebuild, and low-priority artwork eviction. Settings revert to deployment defaults on restart. These delivered foundations do not satisfy proactive preloading. Full asset enumeration/prefetch and likely-next-page planning are required outstanding Batch E implementation work.
+
+Complete Batch E in this order, retaining the existing model assignments:
+
+1. **Small discovery check — Sol High with operator/client access:** capture sanitized requests from Plex Web, Fire TV and Apple TV; add Hisense once its platform is known. Establish actual browse endpoints, image sizes/transforms, resource versioning and permission behavior. Use this limited check to inform implementation; broad performance and playback qualification follows implementation. Never put credentials in traces, fixtures, job payloads or documents.
+2. **Proactive preloading — Sol Medium, with Sol High for authorization/interface design and review:** add resumable, bounded enumeration and preload jobs that operate before a user browses each title. Prepare collection covers and collection-member posters first, then useful library posters, logos and optional backgrounds. Use observed client transformations, shared content-addressed storage, capacity/free-space admission, request/byte/concurrency budgets, foreground priority and low-tier eviction. Refresh changed resources incrementally and replace obsolete jobs after collection publication/Aggregar updates. Keep Continue Watching and watch-state feeds live.
+3. **Permission-aware delivery — Sol High:** establish how prepared assets benefit the three ordinary users while preserving Plex visibility and revocation. Owner inventory and preloaded blobs must not authorize user access. Prove which first-access requests can benefit and which must contact PMS. Respect the existing ephemeral user-token policy; any different credential lifecycle requires an explicit design decision before implementation.
+4. **Operations and coverage — Luna Medium after stable interfaces:** expose resumable progress, discovered/queued/completed/failed asset counts, bytes and priority tiers, stale versions and per-user page coverage. Add bounded preload controls and distinguish proactive preparation from observed-response refresh. Describe restart behavior and cold authorization accurately.
+5. **Controlled end-to-end and performance testing — Sol High with operator/device access:** qualify the completed preload on Plex Web, Fire TV, Apple TV and the identified Hisense platform. Compare cold/warm library and collection browsing, verify daily collection updates and watch-state freshness, exercise capacity pressure/restart recovery, and confirm playback/seek delivery from PMS.
+
+Completion gate: a fresh deployment can enumerate and prepare the configured priority assets without requiring prior browsing of every title; the three users receive useful authorized reuse; updates replace affected data; capacity pressure preserves the configured priorities; progress and failures are measurable. Record live evidence before claiming client compatibility or performance. Durable warming controls and whole-library coverage beyond the configured storage budget remain separate scope decisions.
+
+### F: foundation qualification — complete locally; preload and live qualification pending
+
+Sol High independently reviews integrated changes and runs failure/race tests with required services. The review must include credential revocation, response generations, bounded warming and collection publication. Real Plex discovery, redirects and physical-client playback remain a separate live gate. Record client/version/protocol evidence for Fire TV, Apple TV, Plex Web and, once identified, Hisense.
+
+## Execution record
+
+- Initial working tree contains the approved planning documents; no runtime edits were present at dispatch.
+- Batch A agents dispatched: `inventory`, `cache_correctness`, `collection_assessment`.
+- Live access, VPS sizing and client evidence remain unavailable in this chat.
+- Batch A completed: bounded inventory command, live home/watch feeds, request-header variation keys, successful watch-write invalidation and foreground/background generation guards.
+- Inventory received a separate read-only review; findings were corrected before integration.
+- `go test ./...` and `go vet ./...` pass after integration. SQL-backed tests skip without their database configuration; Docker's daemon is unavailable. Race testing requires CGO in this Windows environment and did not run. Real PMS and client checks did not run.
+- Header-dependent responses remain cacheable on demand but are not background-warmed because the current warmer cannot reproduce their headers.
+- Batch B complete: durable Postgres generations, v4 cache namespace, exact caller/resource leases and proxy integration are in place. `go test ./... -count=1` passed with `REPLX_EDGE_TEST_POSTGRES_URL` pointing to the temporary local PostgreSQL test instance; `go vet ./...`, generated-spec check and `git diff --check` passed.
+- Batch C complete: shared content-addressed artwork, durable transform references and reservations, crash recovery, priority eviction, free-space admission guard and admin storage stats are implemented. SQL-backed shared-store tests and proxy/admin tests pass. Production config defaults to a 100 GiB artwork budget and preserves a 30 GiB free-space floor.
+- Batch D collection implementation ran in a GPT-6.1 Sol High agent. The PostgreSQL-backed sync tests cover ordered/smart/empty collection publication, unchanged generation reuse, late-page failures preserving the whole library, incomplete catalogs, changing totals, explicit empty deletion, delete/recreate and pending invalidation retry. Coordinator integration adds authenticated completion triggering and a server-wide `collections` generation that preserves unrelated cache classes. `go test ./... -count=1` passes with the temporary PostgreSQL URL configured; `go vet ./...` and `git diff --check` pass. Actual daily Aggregar execution, PMS behavior and client/device behavior remain live validation requirements.
+- Batch E implementation used GPT-6.1 Sol Medium for bounded priority warming and GPT-6 Luna Medium for admin operations/documentation. Integration adds foreground cancellation, memory-only expiring user contexts, authorization-aware publication, fair bounded scheduling, request/body budgets, backoff, coverage reporting, targeted collection rebuild, and safe low-priority artwork eviction. `go test ./... -count=1` passed with the temporary PostgreSQL URL configured; `go vet ./...`, generated complete-spec check and `git diff --check` pass. Only observed browse representations are warmed; full library asset prefetch/transform planning is pending. Live PMS, Aggregar and physical-client behavior remain unverified.
+- Batch F used GPT-6.1 Sol High for an independent review. The review reproduced that a PMS 401/403 could leave old cache grants and warmer credentials usable; proxy and artwork paths now revoke grants and forget that user's warm scope, with regression tests preserving the origin response and ensuring other callers remain isolated. It also found that `/library/sections/{id}/collections` was classified as `sections`, while collection sync bumps the `collections` class; both collection listing and child paths now use the same invalidation generation. The full PostgreSQL-backed `go test ./... -count=1`, `go vet ./...`, generated-spec check and `git diff --check` pass. The Windows host could not build `-race` because no gcc compiler is installed, but the current commit's Linux CI race suite passed. Docker is unavailable locally; the current commit's Docker CI check passed. No Plex credentials or live requests were used. Fire TV, Apple TV, Plex Web and Hisense (model unknown) remain unqualified; real PMS discovery, redirects, revocation semantics and playback are pending operator/device access.
+- Batch D completes the bounded first execution batch, not all Phase 0/2 requirements or the overall implementation roadmap. No deployment has been performed.
+
+## Initial assessment findings
+
+The collection/artwork assessment is complete. Existing artwork routing is injected through `proxy.Options.Artwork`; the shared store must keep caller authorization separate from blob lookup. The current store uses flat files and an 8 MiB image ceiling. A new sharded store should use additive schema migrations and treat the old cache as disposable rather than importing its authorization assumptions.
+
+Collection synchronization can reuse the worker's injected HTTP client, pagination and PostgreSQL test harness. New ordered membership snapshots must stage then publish atomically; deletion is inferred only from a completed enumeration. Owner collection snapshots remain internal data. Invalidation should be emitted after the database commit, not during a partial sweep.
+
+The assessment confirms that fixtures and local integration work can proceed without server shell access. It does not establish support for actual client transformations, Plex event behavior or Aggregar completion callbacks.
+
+## Inventory command
+
+The first batch adds `go run ./cmd/replx-inventory`. Configure `REPLX_EDGE_PMS_URL`
+and `REPLX_EDGE_PMS_TOKEN` securely in the process environment before running it.
+The token is never a command-line argument. HTTPS is required except for loopback
+fixtures; redirects are not followed. JSON is written to standard output; exit 1
+means incomplete counts, and exit 2 means configuration/output failure.
+
+Optional bounds are `REPLX_EDGE_INVENTORY_PAGE_SIZE` (default 200),
+`REPLX_EDGE_INVENTORY_WORKERS` (default 4), and
+`REPLX_EDGE_INVENTORY_REQUEST_TIMEOUT_SECONDS` (default 15). The command has a
+30-minute overall deadline. It prefers PMS total counts and falls back to bounded
+page counting. Movie/show/season/episode and collection counts are covered;
+representative asset downloads, byte sampling and resumable inventory are still
+pending. Do not interpret this command as completion of all Phase 0 deliverables.
 
 
 ---
@@ -3435,7 +4024,8 @@ services:
       REPLX_EDGE_IN_DOCKER: "true"
       REPLX_EDGE_LOG_LEVEL: ${REPLX_EDGE_LOG_LEVEL:-info}
       REPLX_EDGE_CACHE_MAX_GB: ${REPLX_EDGE_CACHE_MAX_GB:-20}
-      REPLX_EDGE_ARTWORK_MAX_GB: ${REPLX_EDGE_ARTWORK_MAX_GB:-50}
+      REPLX_EDGE_ARTWORK_MAX_GB: ${REPLX_EDGE_ARTWORK_MAX_GB:-100}
+      REPLX_EDGE_SHARED_ARTWORK_ENABLED: ${REPLX_EDGE_SHARED_ARTWORK_ENABLED:-true}
       REPLX_EDGE_DIAGNOSTICS_MAX_GB: ${REPLX_EDGE_DIAGNOSTICS_MAX_GB:-10}
       REPLX_EDGE_TRACE_RETENTION_DAYS: ${REPLX_EDGE_TRACE_RETENTION_DAYS:-7}
       REPLX_EDGE_PLAYBACK_RETENTION_DAYS: ${REPLX_EDGE_PLAYBACK_RETENTION_DAYS:-30}

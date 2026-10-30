@@ -214,7 +214,7 @@ PMS event consumer
 incremental sync
 reconciliation
 cache janitor
-artwork janitor
+shared artwork recovery and priority-eviction janitor
 diagnostics janitor
 playback retention janitor
 session reconciliation

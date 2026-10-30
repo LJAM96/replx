@@ -116,6 +116,8 @@ func runServe() error {
 		return err
 	}
 	defer db.Close()
+	generationStore := cache.NewPostgresGenerations(db.Raw(), "default")
+	var generationsLoaded atomic.Bool
 	migrate := func() {
 		mctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		defer cancel()
@@ -126,10 +128,16 @@ func runServe() error {
 		}
 		logger.Log(logging.Entry{Level: "info", Component: "database",
 			Fields: map[string]any{"event": "migrate_complete"}})
+		if err := generationStore.Load(mctx); err != nil {
+			logger.Log(logging.Entry{Level: "error", Component: "cache",
+				Fields: map[string]any{"event": "generation_store_load_failed", "error": err.Error()}})
+			return
+		}
+		generationsLoaded.Store(true)
 	}
 	go func() {
 		migrate()
-		if db.MigrationsComplete() {
+		if db.MigrationsComplete() && generationsLoaded.Load() {
 			return
 		}
 		ticker := time.NewTicker(30 * time.Second)
@@ -141,7 +149,7 @@ func runServe() error {
 			case <-ticker.C:
 			}
 			migrate()
-			if db.MigrationsComplete() {
+			if db.MigrationsComplete() && generationsLoaded.Load() {
 				return
 			}
 		}
@@ -193,6 +201,8 @@ func runServe() error {
 			Fields: map[string]any{"event": "cache_degraded", "reason": "valkey unreachable; browse falls through to origin"}})
 	}
 	cacheStore := cache.NewValkeyStore(cacheClient)
+	// Durable generations ensure watch-write invalidations remain retired
+	// across restarts while Valkey response entries persist.
 	// Identity pipeline: fingerprint to Plex account resolution with
 	// account-scoped cache sharing across a user's devices. plex.tv is
 	// consulted on cold fingerprints only; user tokens are never stored.
@@ -233,23 +243,30 @@ func runServe() error {
 	warm := warmer.New(cacheStore, cfg.OriginInternalURL, cfg.SecretKey, ownerPMSToken, logger, registry)
 	warm.OwnerAccount = ownerAccount
 	go warm.Run(ctx, 15*time.Second)
-	// Eta artwork: shared filesystem transcode cache with oldest-first
-	// janitor. Directory failure degrades to uncached artwork, never to
-	// failed startup.
+	// Eta artwork: shared content-addressed blobs with durable admission
+	// reservations. Directory or migration failure degrades to uncached
+	// artwork, never to failed startup.
 	var artworkStore *artwork.Store
-	if art, err := artwork.New(cfg.ArtworkDir, cfg.ArtworkMaxGB); err != nil {
-		logger.Log(logging.Entry{Level: "warn", Component: "cache",
-			Fields: map[string]any{"event": "artwork_degraded", "error": err.Error()}})
+	if cfg.SharedArtworkEnabled {
+		artworkBudget := int64(cfg.ArtworkMaxGB) << 30
+		if art, err := artwork.NewShared(db.Raw(), cfg.ArtworkDir, artwork.SharedOptions{
+			Namespace: "default", MaxBytes: artworkBudget, MinFreeBytes: 30 << 30,
+			LowWatermarkBytes: artworkBudget * 9 / 10, ProtectedBytes: artworkBudget / 20,
+		}); err != nil {
+			logger.Log(logging.Entry{Level: "warn", Component: "cache",
+				Fields: map[string]any{"event": "artwork_degraded", "error": err.Error()}})
+		} else {
+			artworkStore = art
+			go art.Run(ctx, 30*time.Minute)
+		}
 	} else {
-		artworkStore = art
-		go art.Run(ctx, 30*time.Minute)
+		logger.Log(logging.Entry{Level: "info", Component: "cache",
+			Fields: map[string]any{"event": "shared_artwork_disabled"}})
 	}
 	// Gamma index: owner library sync plus the PMS event consumer. Both
 	// run behind the single-replica worker loops; absence of credentials
 	// (pre-onboarding) idles them without failing startup.
 	syncWorker := syncpkg.New(db.Raw(), cfg.OriginInternalURL, ownerPMSToken, logger, registry)
-	go syncWorker.Run(ctx)
-	go syncWorker.Subscribe(ctx)
 	// Epsilon enforcement: negotiation interception plus the raw-part
 	// boundary behind the spike redirector. Sessions persist in Postgres;
 	// absent sessions preserve Alpha allow-through exactly.
@@ -269,6 +286,7 @@ func runServe() error {
 		Metrics:     registry,
 		Capture:     captureStore,
 		Cache:       cacheStore,
+		Generations: generationStore,
 		Warmer:      warm,
 		Playback:    playbackEngine,
 		Artwork:     artworkStore,
@@ -288,6 +306,13 @@ func runServe() error {
 	if err != nil {
 		return err
 	}
+	syncWorker.InvalidateCollections = func(ctx context.Context) error {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return proxyHandler.InvalidateCacheContext(cctx, "all", "collections")
+	}
+	go syncWorker.Run(ctx)
+	go syncWorker.Subscribe(ctx)
 	// Warmer uses the canonical owner scope (identity UUID) and
 	// generation-aware keys so refreshes land in the live namespace.
 	warm.DB = db.Raw()
@@ -297,7 +322,12 @@ func runServe() error {
 		if class == "" {
 			class = cache.ClassOf(s.Path)
 		}
-		sg, gg := proxyHandler.Generations().Get(s.Scope, class)
+		gctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		sg, gg, err := generationStore.Get(gctx, s.Scope, class)
+		if err != nil {
+			return ""
+		}
 		return cache.ResponseKeyGen(s.Scope, class, s.Method, s.Path, q, s.Accept, sg, gg)
 	}
 
@@ -346,8 +376,17 @@ func runServe() error {
 	adminMux.SetMetrics(registry)
 	adminMux.SetCapture(captureStore)
 	adminMux.SetWarmer(warm.Stats)
+	adminMux.SetWarmingControl(warm)
 	adminMux.SetSync(syncWorker)
+	adminMux.SetCollectionRebuilder(syncWorker.SyncCollectionOnce)
 	adminMux.SetCacheInvalidator(proxyHandler.InvalidateCache)
+	if artworkStore != nil {
+		adminMux.SetArtworkStats(artworkStore.Stats)
+		adminMux.SetLowPriorityEvictor(func(ctx context.Context) (int, int64, error) {
+			result, err := artworkStore.EvictLowPriority(ctx)
+			return result.Removed, result.FreedBytes, err
+		})
+	}
 	// Diagnostics gauge: active targeted captures.
 	go func() {
 		ticker := time.NewTicker(time.Minute)

@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/health"
 	"github.com/LJAM96/replx/internal/metrics"
@@ -53,19 +54,23 @@ type Mux struct {
 	// setupConsumed permanently disables bootstrap authentication once
 	// the administrator account is created. The setup capability is
 	// single use: creation consumes it in the same process lifetime.
-	setupConsumed bool
-	requireAuth   bool
-	sessions      *sessionStore
-	registry      *metrics.Registry
-	cap           *capture.Store
-	warmerStats   func() warmer.Stats
-	syncWorker    syncpkgWorker
-	syncMu        sync.Mutex
-	lastSyncFull  time.Time
-	lastSyncJob   string
-	checks        health.Checks
-	rateMu        sync.Mutex
-	rate          map[string][]time.Time
+	setupConsumed       bool
+	requireAuth         bool
+	sessions            *sessionStore
+	registry            *metrics.Registry
+	cap                 *capture.Store
+	warmerStats         func() warmer.Stats
+	warmingControl      WarmingControl
+	collectionRebuilder func(context.Context, string) error
+	lowPriorityEvictor  func(context.Context) (int, int64, error)
+	artworkStats        func(context.Context) (artwork.Stats, error)
+	syncWorker          syncpkgWorker
+	syncMu              sync.Mutex
+	lastSyncFull        time.Time
+	lastSyncJob         string
+	checks              health.Checks
+	rateMu              sync.Mutex
+	rate                map[string][]time.Time
 	// invalidator retires cache namespaces (wired to the proxy
 	// generations in production). Nil keeps audit-only behaviour.
 	invalidator func(scope, class string)
@@ -77,11 +82,17 @@ func (m *Mux) SetCacheInvalidator(fn func(scope, class string)) {
 	m.invalidator = fn
 }
 
+// SetArtworkStats wires bounded storage reporting into the admin storage API.
+func (m *Mux) SetArtworkStats(fn func(context.Context) (artwork.Stats, error)) {
+	m.artworkStats = fn
+}
+
 // syncpkgWorker is the sync surface admin needs (narrower than *sync.Worker
 // for tests).
 type syncpkgWorker interface {
 	Status(ctx context.Context) ([]syncpkg.CursorStatus, error)
 	SyncOnce(ctx context.Context, full bool) error
+	SyncCollectionsOnce(ctx context.Context) error
 }
 
 type ctxKey struct{}
@@ -146,6 +157,28 @@ func (m *Mux) SetCapture(store *capture.Store) {
 // stats omit the warmer block until wired.
 func (m *Mux) SetWarmer(stats func() warmer.Stats) {
 	m.warmerStats = stats
+}
+
+// WarmingControl is the stable admin surface for bounded in-memory warming.
+type WarmingControl interface {
+	Stats() warmer.Stats
+	Config() warmer.Config
+	Configure(warmer.Config) error
+	SetPaused(bool)
+}
+
+// SetWarmingControl wires live pause/budget settings and coverage reports.
+func (m *Mux) SetWarmingControl(control WarmingControl) { m.warmingControl = control }
+
+// SetCollectionRebuilder wires targeted collection refresh without coupling
+// the admin API to the synchronization implementation.
+func (m *Mux) SetCollectionRebuilder(fn func(context.Context, string) error) {
+	m.collectionRebuilder = fn
+}
+
+// SetLowPriorityEvictor wires a bounded shared-artwork eviction operation.
+func (m *Mux) SetLowPriorityEvictor(fn func(context.Context) (int, int64, error)) {
+	m.lowPriorityEvictor = fn
 }
 
 func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) { m.mux.ServeHTTP(w, r) }

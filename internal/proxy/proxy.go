@@ -10,6 +10,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +21,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/LJAM96/replx/internal/artwork"
@@ -131,7 +134,9 @@ type Options struct {
 	MediaFallbackURL string
 	// SearchDB enables local title search (/hubs/search) with PMS fallback.
 	// Nil disables local search: requests fall through to origin.
-	SearchDB database.DBTX
+	SearchDB    database.DBTX
+	Generations cache.GenerationStore
+	Grants      *identity.ResourceGrants
 }
 
 // Handler proxies Plex requests to the origin PMS.
@@ -154,7 +159,9 @@ type Handler struct {
 	// partPolicy is the playback boundary hook; see Options.PartPolicy.
 	partPolicy func(r *http.Request, partID, sessionID string) (string, bool, string)
 	// gens implements namespace cache invalidation; see cache.Generations.
-	gens *cache.Generations
+	gens        cache.GenerationStore
+	grants      *identity.ResourceGrants
+	cacheBroken atomic.Bool
 	// flightMu guards in-flight cacheable origin fetches for stampede
 	// control: one request refreshes an expired object while concurrent
 	// requests for the same key wait bounded for the cache to populate.
@@ -195,11 +202,19 @@ func New(opts Options) (*Handler, error) {
 		}
 		fallback = fb
 	}
+	gens := opts.Generations
+	if gens == nil {
+		gens = cache.NewMemoryGenerationStore()
+	}
+	grants := opts.Grants
+	if grants == nil {
+		grants = identity.NewResourceGrants()
+	}
 	return &Handler{origin: base, mode: opts.IngressMode, log: opts.Logger, secret: opts.Secret,
 		metrics: opts.Metrics, capture: opts.Capture, cache: opts.Cache, warmer: opts.Warmer,
 		playback: opts.Playback, artwork: opts.Artwork, identity: opts.Identity,
 		client: client, spike: opts.Spike, mediaFallback: fallback, searchDB: opts.SearchDB,
-		partPolicy: opts.PartPolicy, gens: cache.NewGenerations()}, nil
+		partPolicy: opts.PartPolicy, gens: gens, grants: grants}, nil
 }
 
 // obs is the per-request Beta observability identity: fingerprinted user,
@@ -227,6 +242,8 @@ type obs struct {
 	cacheTTL   time.Duration
 	cacheable  bool
 	cacheState string
+	scopeGen   uint64
+	globalGen  uint64
 }
 
 func (h *Handler) observe(r *http.Request) obs {
@@ -249,6 +266,12 @@ func (h *Handler) observe(r *http.Request) obs {
 			}
 			o.identityID, o.clientUUID = res.IdentityID, res.ClientID
 			o.fresh, o.invalid = res.Fresh, res.Invalid
+			if res.Invalid {
+				h.grants.Revoke(o.fingerprint)
+				if h.warmer != nil {
+					h.warmer.ForgetScope(o.scope)
+				}
+			}
 		}
 	}
 	if trace.IsPlaybackRoute(r.URL.Path) {
@@ -262,16 +285,44 @@ func (h *Handler) observe(r *http.Request) obs {
 	// Resolved accounts share one scope across all their devices. The
 	// fingerprint gate (secret+token required) keeps a missing secret
 	// from collapsing everyone into one bucket.
-	if h.cache != nil && o.fingerprint != "" && o.scope != "" {
-		if ttl, ok := cache.Cacheable(r.Method, r.URL.Path); ok {
+	if h.cache != nil && o.fingerprint != "" && o.scope != "" && !o.invalid {
+		if ttl, ok := cache.RequestCacheable(r); ok {
 			o.cacheable = true
 			o.cacheTTL = ttl
-			class := cache.ClassOf(r.URL.Path)
-			sg, gg := h.gens.Get(o.scope, class)
-			o.cacheKey = cache.ResponseKeyGen(o.scope, class, r.Method, r.URL.Path, r.URL.Query(), r.Header.Get("Accept"), sg, gg)
+			if !h.refreshCacheGeneration(r, &o) || h.cacheBroken.Load() {
+				o.cacheable = false
+			}
 		}
 	}
 	return o
+}
+
+func (h *Handler) refreshCacheGeneration(r *http.Request, o *obs) bool {
+	class := cache.ClassOf(r.URL.Path)
+	var err error
+	o.scopeGen, o.globalGen, err = h.gens.Get(r.Context(), o.scope, class)
+	if err != nil {
+		return false
+	}
+	o.cacheKey = cache.RequestKeyGen(o.scope, class, r, o.scopeGen, o.globalGen)
+	return true
+}
+
+func (h *Handler) currentCacheGeneration(r *http.Request, o obs) bool {
+	sg, gg, err := h.gens.Get(r.Context(), o.scope, cache.ClassOf(r.URL.Path))
+	return err == nil && sg == o.scopeGen && gg == o.globalGen
+}
+
+// A PMS rejection supersedes earlier successful resource proofs, even while
+// the identity resolver still considers this credential fresh.
+func (h *Handler) revokeRejectedAuthorization(o obs, status int) {
+	if status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return
+	}
+	h.grants.Revoke(o.fingerprint)
+	if h.warmer != nil {
+		h.warmer.ForgetScope(o.scope)
+	}
 }
 
 // serveCache attempts a cached control response. It reports whether it
@@ -283,8 +334,17 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 		// PMS answers live (usually 401) instead.
 		return false
 	}
+	// A request may have waited for another fill while a watch write was
+	// acknowledged. Recompute before lookup and reject a retired read.
+	if h.cacheBroken.Load() || !h.grants.Authorized(o.fingerprint, o.cacheKey) {
+		o.cacheState = "miss"
+		if h.metrics != nil {
+			h.metrics.IncCacheMiss()
+		}
+		return false
+	}
 	entry, ok, err := h.cache.Get(r.Context(), o.cacheKey)
-	if err != nil || !ok {
+	if err != nil || !ok || h.cacheBroken.Load() || !h.currentCacheGeneration(r, *o) {
 		o.cacheState = "miss"
 		if h.metrics != nil {
 			h.metrics.IncCacheMiss()
@@ -315,6 +375,12 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, id string, 
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.warmer != nil {
+		releaseForeground := h.warmer.Foreground()
+		if releaseForeground != nil {
+			defer releaseForeground()
+		}
+	}
 	start := time.Now()
 	id := requestid.New()
 	w.Header().Set(RequestIDHeader, id)
@@ -419,12 +485,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if routeClass == "control" && h.serveCache(w, r, id, &o, start) {
 		return
 	}
-	// Watch-state invalidation runs for every state mutation, whether or
-	// not the route itself is cacheable: timeline/scrobble POSTs retire
-	// the writer's Continue Watching namespace via generations.
-	if isStateWrite(r.URL.Path) {
-		h.bumpStateGeneration(o.scope)
-	}
 	// Stampede control: one request refreshes an expired object while
 	// concurrent requests for the same key wait bounded for the cache to
 	// populate, then serve the fresh entry instead of churning origin.
@@ -449,47 +509,76 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.proxy(w, r, id, o, routeClass, start)
 }
 
-// isStateWrite reports watch-state mutations that retire Continue
-// Watching: timeline progress plus scrobble transitions.
+// isStateWrite recognizes Plex watch mutations, which may use GET verbs.
 func isStateWrite(path string) bool {
 	p := strings.ToLower(path)
-	return strings.Contains(p, "/:/timeline") ||
-		strings.Contains(p, "/:/scrobble") ||
-		strings.Contains(p, "/:/unscrobble")
+	for _, suffix := range []string{"/:/timeline", "/:/progress", "/:/scrobble", "/:/unscrobble"} {
+		if strings.HasSuffix(strings.TrimSuffix(p, "/"), suffix) {
+			return true
+		}
+	}
+	return gateway.IsSessionStop(p)
 }
 
-// bumpStateGeneration retires the writer's Continue Watching namespace in
-// constant time. TTLs remain the correctness backstop.
-func (h *Handler) bumpStateGeneration(scope string) {
+// bumpStateGeneration retires all writer responses: details, collections,
+// section badges and show/season counts can all carry watch state.
+func (h *Handler) bumpStateGeneration(ctx context.Context, scope string) {
 	if h.gens == nil || scope == "" {
 		return
 	}
-	h.gens.Bump(scope, "cw")
+	if err := h.gens.BumpScope(ctx, scope); err != nil {
+		h.cacheBroken.Store(true)
+	}
 }
 
 // Generations exposes the cache invalidation registry for admin wiring.
-func (h *Handler) Generations() *cache.Generations {
+func (h *Handler) Generations() cache.GenerationStore {
 	if h == nil {
 		return nil
 	}
 	return h.gens
 }
 
-// InvalidateCache retires cache namespaces for the admin invalidation API:
-// scope "all" retires everything, empty class retires the whole scope,
-// otherwise one (scope, class) namespace.
+// InvalidateCache retires namespaces for the admin invalidation API. Scope
+// "all" with a class targets that class server-wide; with no class it retires
+// everything. Empty class on a user scope retires that user's whole namespace.
 func (h *Handler) InvalidateCache(scope, class string) {
+	_ = h.InvalidateCacheContext(context.Background(), scope, class)
+}
+
+// InvalidateCacheContext lets sync jobs observe durable invalidation failures
+// and keeps cache serving fail-closed until a successful recovery bump.
+func (h *Handler) InvalidateCacheContext(ctx context.Context, scope, class string) error {
 	if h.gens == nil {
-		return
+		return nil
 	}
 	switch {
+	case (scope == "all" || scope == "") && class != "":
+		if err := h.gens.BumpServerClass(ctx, class); err != nil {
+			h.cacheBroken.Store(true)
+			return err
+		}
+		return nil
 	case scope == "" || scope == "all":
-		h.gens.BumpAll()
+		if err := h.gens.BumpAll(ctx); err == nil {
+			h.cacheBroken.Store(false)
+			return nil
+		} else {
+			h.cacheBroken.Store(true)
+			return err
+		}
 	case class == "":
-		h.gens.BumpScope(scope)
+		if err := h.gens.BumpScope(ctx, scope); err != nil {
+			h.cacheBroken.Store(true)
+			return err
+		}
 	default:
-		h.gens.Bump(scope, class)
+		if err := h.gens.Bump(ctx, scope, class); err != nil {
+			h.cacheBroken.Store(true)
+			return err
+		}
 	}
+	return nil
 }
 
 // waitForFlight reports whether another request is already refreshing key.
@@ -557,25 +646,42 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 	if h.artwork == nil || o.fingerprint == "" || o.scope == "" || !artwork.Match(r.URL.Path) {
 		return false
 	}
+	// Transcodes are only reusable for complete, unconditional GET requests.
+	// HEAD, ranges, validators and request cache directives have different
+	// semantics and must reach PMS without reading or filling the local cache.
+	if r.Method != http.MethodGet || r.Header.Get("Range") != "" || r.Header.Get("Cookie") != "" ||
+		r.Header.Get("Authorization") != "" || requestHasCondition(r) ||
+		strings.Contains(strings.ToLower(r.Header.Get("Cache-Control")), "no-store") ||
+		strings.Contains(strings.ToLower(r.Header.Get("Cache-Control")), "no-cache") ||
+		strings.Contains(strings.ToLower(r.Header.Get("Pragma")), "no-cache") {
+		return false
+	}
 	if o.invalid || (h.identity != nil && !o.fresh) {
 		return false
 	}
-	key := artwork.Key(o.scope, r.URL.Path, r.URL.Query())
-	if ct, body, ok := h.artwork.Get(key); ok {
-		o.cacheState = "hit"
-		if h.metrics != nil {
-			h.metrics.IncCacheHit()
-			h.metrics.ObserveHTTP("control", http.StatusOK, time.Since(start))
+	// Startup recovery can walk the old cache tree; client requests bypass
+	// local artwork until that bounded admission scan has completed.
+	if !h.artwork.Ready() {
+		return false
+	}
+	key := artworkCacheKey(o.scope, r)
+	if h.grants.Authorized(o.fingerprint, key) {
+		if ct, body, ok := h.artwork.GetContext(r.Context(), key); ok {
+			o.cacheState = "hit"
+			if h.metrics != nil {
+				h.metrics.IncCacheHit()
+				h.metrics.ObserveHTTP("control", http.StatusOK, time.Since(start))
+			}
+			w.Header().Set(RequestIDHeader, id)
+			w.Header().Set(CacheHeader, "hit")
+			if ct != "" {
+				w.Header().Set("Content-Type", ct)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			h.emit(r, id, o, "control", http.StatusOK, start, map[string]any{"bodyBytes": len(body), "artwork": true})
+			return true
 		}
-		w.Header().Set(RequestIDHeader, id)
-		w.Header().Set(CacheHeader, "hit")
-		if ct != "" {
-			w.Header().Set("Content-Type", ct)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
-		h.emit(r, id, o, "control", http.StatusOK, start, map[string]any{"bodyBytes": len(body), "artwork": true})
-		return true
 	}
 	target := *h.origin
 	target.Path = singleJoin(h.origin.Path, r.URL.Path)
@@ -591,6 +697,15 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 		out.Header.Set("X-Forwarded-For", fwd)
 	}
 	out.Host = h.origin.Host
+	reservation, reserveErr := h.artwork.Reserve(r.Context(), key, artworkPriority(r))
+	if reserveErr != nil || reservation == nil {
+		return false
+	}
+	defer func() {
+		cancelCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		reservation.Cancel(cancelCtx)
+	}()
 	originStart := time.Now()
 	resp, err := h.client.Do(out) //nolint:gosec // target is admin-configured origin only
 	if h.metrics != nil {
@@ -600,14 +715,18 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 		return false
 	}
 	defer resp.Body.Close()
+	h.revokeRejectedAuthorization(o, resp.StatusCode)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, artwork.MaxBodyBytes+1))
 	if err != nil || int64(len(body)) > artwork.MaxBodyBytes {
 		// Oversize or unreadable: decline the artwork fast path so the
 		// normal proxy streams it uncached. Nothing written yet.
 		return false
 	}
-	if resp.StatusCode == http.StatusOK {
-		_ = h.artwork.Set(key, resp.Header.Get("Content-Type"), body)
+	if resp.StatusCode == http.StatusOK && cache.StorableResponse(resp.Header) &&
+		strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "image/") {
+		if reservation.Commit(r.Context(), resp.Header.Get("Content-Type"), body) == nil {
+			h.grants.Grant(o.fingerprint, key)
+		}
 	}
 	o.cacheState = "miss"
 	if h.metrics != nil {
@@ -621,6 +740,35 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 	_, _ = w.Write(body)
 	h.emit(r, id, o, "control", resp.StatusCode, start, map[string]any{"bodyBytes": len(body), "artwork": true})
 	return true
+}
+
+func artworkCacheKey(scope string, r *http.Request) string {
+	// Keep transform references isolated by the current Plex scope because
+	// the same URL can produce permission-dependent bytes. The payload store
+	// deduplicates across scopes by content digest.
+	variationKey := cache.RequestKeyGen(scope, "artwork", r, 0, 0)
+	sum := sha256.Sum256([]byte(variationKey))
+	return hex.EncodeToString(sum[:])
+}
+
+func artworkPriority(r *http.Request) artwork.Priority {
+	resource := strings.ToLower(r.URL.Query().Get("url"))
+	if strings.Contains(resource, "background") || strings.HasSuffix(resource, "/art") {
+		return artwork.Low
+	}
+	if strings.HasSuffix(resource, "/thumb") || strings.HasSuffix(resource, "/poster") || strings.HasSuffix(resource, "/cover") {
+		return artwork.High
+	}
+	return artwork.Normal
+}
+
+func requestHasCondition(r *http.Request) bool {
+	for name := range r.Header {
+		if strings.HasPrefix(strings.ToLower(name), "if-") {
+			return true
+		}
+	}
+	return false
 }
 
 // serveSearch is intentionally a PMS passthrough in Production 1.0: the
@@ -850,6 +998,13 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 		return
 	}
 	defer resp.Body.Close()
+	h.revokeRejectedAuthorization(o, resp.StatusCode)
+
+	// Retire reads fetched before successful origin acknowledgement. A
+	// failed write never invents a local watch-state transition.
+	if r.Method != http.MethodHead && r.Method != http.MethodOptions && resp.StatusCode >= 200 && resp.StatusCode < 300 && isStateWrite(r.URL.Path) {
+		h.bumpStateGeneration(r.Context(), o.scope)
+	}
 
 	// Response-side media guard: in tunnel mode a control-classified route
 	// that returns bulk media bytes must fail closed BEFORE streaming.
@@ -883,7 +1038,7 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 // response for replay, and oversize bodies stream through uncached. The
 // client always receives whatever the origin produced either way.
 func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *http.Response) int64 {
-	if !o.cacheable || resp.StatusCode != http.StatusOK || !storableResponse(resp.Header) {
+	if !o.cacheable || resp.StatusCode != http.StatusOK || !cache.StorableResponse(resp.Header) {
 		n, _ := io.Copy(w, resp.Body)
 		return n
 	}
@@ -900,14 +1055,23 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 		return n + rest
 	}
 	body := buf.Bytes()
-	_ = h.cache.Set(r.Context(), o.cacheKey, cache.Entry{
+	if h.cacheBroken.Load() || !h.currentCacheGeneration(r, o) {
+		return n
+	}
+	stored := false
+	if err := h.cache.Set(r.Context(), o.cacheKey, cache.Entry{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
 		Headers:     cache.SafeHeaders(resp.Header),
 		Body:        body,
-	}, o.cacheTTL)
-	if h.warmer != nil {
-		h.warmer.Track(o.cacheKey, warmer.Snapshot{
+	}, o.cacheTTL); err == nil {
+		h.grants.Grant(o.fingerprint, o.cacheKey)
+		stored = true
+	}
+	// Snapshots currently reproduce only query and Accept. Header variants
+	// remain cacheable on demand, but must not be refreshed without them.
+	if stored && h.warmer != nil && cache.HeaderVariation(r.Header) == "" {
+		h.warmer.TrackAuthorized(o.cacheKey, warmer.Snapshot{
 			Method:   r.Method,
 			Path:     r.URL.Path,
 			RawQuery: r.URL.RawQuery,
@@ -915,25 +1079,9 @@ func (h *Handler) copyBody(w http.ResponseWriter, r *http.Request, o obs, resp *
 			Scope:    o.scope,
 			Class:    cache.ClassOf(r.URL.Path),
 			TTL:      o.cacheTTL,
-		})
+		}, trace.ExtractToken(r))
 	}
 	return n
-}
-
-// storableResponse reports whether an origin response is safe to persist:
-// identity encoding only (stored bytes must be servable regardless of the
-// requester's Accept-Encoding) and no wildcard Vary (the key does not
-// model arbitrary request variation).
-func storableResponse(hdr http.Header) bool {
-	if ce := strings.TrimSpace(strings.ToLower(hdr.Get("Content-Encoding"))); ce != "" && ce != "identity" {
-		return false
-	}
-	for _, v := range strings.Split(hdr.Get("Vary"), ",") {
-		if strings.TrimSpace(strings.ToLower(v)) == "*" {
-			return false
-		}
-	}
-	return true
 }
 
 func (h *Handler) writeBadGateway(w http.ResponseWriter, r *http.Request, id string, o obs, routeClass string, start time.Time) {

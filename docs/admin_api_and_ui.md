@@ -49,6 +49,7 @@ Responses include:
 | GET | `/api/v1/server` | PMS and discovery status |
 | POST | `/api/v1/server/test` | Test origin and identity |
 | POST | `/api/v1/server/sync` | Queue reconciliation |
+| POST | `/api/v1/server/collections/refresh` | Reconcile collection catalog and ordered membership after an external collection builder completes |
 | GET | `/api/v1/users` | User list |
 | GET | `/api/v1/users/{id}` | User detail |
 | GET | `/api/v1/users/{id}/policy` | User policy |
@@ -63,6 +64,11 @@ Responses include:
 | GET | `/api/v1/cache` | Cache statistics |
 | POST | `/api/v1/cache/invalidate` | Retire cache namespaces by scope/class via generations (audited) |
 | GET | `/api/v1/storage` | Storage use |
+| POST | `/api/v1/storage/evict-low-priority` | Evict low-priority shared artwork under storage pressure (audited, rate limited) |
+| GET | `/api/v1/warming` | Live warming configuration and queue status |
+| PATCH | `/api/v1/warming` | Pause/enable warming and tune bounded request/byte budgets |
+| GET | `/api/v1/warming/coverage` | Observed-entry warming coverage and artwork admission state |
+| POST | `/api/v1/warming/collections/{ratingKey}/rebuild` | Rebuild one collection's internal snapshot |
 | GET | `/api/v1/sessions` | Active and recent playback |
 | GET | `/api/v1/playback/{id}` | Decision explanation |
 | POST | `/api/v1/diagnostics/traces` | Arm targeted trace |
@@ -93,6 +99,14 @@ Browser panels authenticate with the session cookie plus per-session CSRF token;
 `POST /server/test` defaults to 5 requests per minute per admin session.
 
 `POST /server/sync` is idempotent while a sync is already queued or running. Only one full reconciliation may run at once. A repeated call returns the current job ID instead of starting a second scan.
+
+`POST /api/v1/server/collections/refresh` is an optional authenticated completion hook for a collection builder such as Aggregar. Call it after the builder has finished changing collections. The request runs a bounded owner-token reconciliation of all library collection catalogs and child pages; it does not accept or return a Plex token. A complete collection snapshot publishes its ordered membership in one transaction. Failed/incomplete scans preserve the last published membership and return an error. A successful publication advances the server-wide `collections` response generation so all users refresh collection pages without evicting unrelated cache classes. The periodic full sync remains the fallback if the hook is not configured.
+
+`GET /api/v1/warming` reports the in-memory job scheduler configuration and queue counters. `PATCH` accepts any subset of `{ "enabled": true, "paused": false, "maxTracked": 512, "requestsPerPass": 16, "maxPerScopePerPass": 4, "bytesPerPass": 67108864 }`. Bounds are 1–512 tracked entries, 1–64 requests per pass, 1–requests-per-pass per scope, and 8–256 MiB per pass; defaults are 512, 16, 4 and 64 MiB. Enable and pause are separate: disabling turns off background jobs; pause suspends dispatch while retaining eligible queued work. Invalid limits return 400. Configuration is live for the current process and returns to deployment defaults after restart.
+
+Warm jobs are bounded, priority scheduled, deduplicated, fairly dispatched across scopes, and subject to capacity and backoff. Caller credentials used for warm refreshes come only from successful authenticated foreground requests and live in bounded short-lived memory; they are not written to the database or job payloads. Expired or revoked contexts are discarded. A warm response is still subject to the normal caller authorization lease when served.
+
+`GET /api/v1/warming/coverage` reports known observed entries, pending/due work, recent outcomes, priority distribution, active ephemeral authorization contexts, and artwork admission state. It deliberately does not report a percentage of the complete Plex library: uncached sorts, filters, headers and content are not enumerable from observed traffic. `POST /api/v1/warming/collections/{ratingKey}/rebuild` refreshes one numeric Plex collection key and its snapshot. `POST /api/v1/storage/evict-low-priority` runs one bounded eviction pass and reports removed entries and bytes; it never removes protected artwork. These manual operations are audited and rate limited.
 
 Expensive cache invalidation operations require explicit scope and are rate limited. Invalidation retires generations (per scope/class, or global), never reconstructed keys.
 

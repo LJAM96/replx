@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/LJAM96/replx/internal/artwork"
 	"github.com/LJAM96/replx/internal/capture"
 	"github.com/LJAM96/replx/internal/health"
 	"github.com/LJAM96/replx/internal/metrics"
@@ -29,6 +30,27 @@ func TestSetupGate(t *testing.T) {
 	m.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("spike events must also gate, got %d", rec.Code)
+	}
+}
+
+func TestStorageReportsArtworkCapacity(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", false, nil, &spike.Observations{})
+	m.SetArtworkStats(func(context.Context) (artwork.Stats, error) {
+		return artwork.Stats{Shared: true, PayloadBytes: 123, ReservedBytes: 8, MaxBytes: 1000}, nil
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/storage", nil)
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"payloadBytes":123`) || !strings.Contains(rec.Body.String(), `"maxBytes":1000`) {
+		t.Fatalf("storage response missing artwork capacity: %d %s", rec.Code, rec.Body.String())
+	}
+	m.SetArtworkStats(func(context.Context) (artwork.Stats, error) {
+		return artwork.Stats{}, artwork.ErrInitializing
+	})
+	rec = httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), `"state":"initializing"`) {
+		t.Fatalf("initializing storage status missing: %s", rec.Body.String())
 	}
 }
 
@@ -175,6 +197,75 @@ func TestCacheStatsWarmerBlock(t *testing.T) {
 	}
 }
 
+type testWarmingControl struct {
+	cfg    warmer.Config
+	paused bool
+}
+
+func (w *testWarmingControl) Stats() warmer.Stats               { return warmer.Stats{} }
+func (w *testWarmingControl) Config() warmer.Config             { return w.cfg }
+func (w *testWarmingControl) Configure(cfg warmer.Config) error { w.cfg = cfg; return nil }
+func (w *testWarmingControl) SetPaused(v bool)                  { w.paused = v }
+
+func TestWarmingControlsAndCoverage(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	unauth := httptest.NewRecorder()
+	m.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/api/v1/warming", nil))
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("warming must require auth, got %d", unauth.Code)
+	}
+	control := &testWarmingControl{cfg: warmer.Config{Enabled: true, MaxTracked: 512, RequestsPerPass: 16, MaxPerScopePerPass: 4, BytesPerPass: 64 << 20}}
+	m.SetWarmingControl(control)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/warming", strings.NewReader(`{"paused":true,"requestsPerPass":8,"maxPerScopePerPass":3,"bytesPerPass":33554432}`))
+	req.Header.Set("Authorization", "Bearer tok123")
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !control.paused || control.cfg.RequestsPerPass != 8 || control.cfg.MaxPerScopePerPass != 3 || control.cfg.BytesPerPass != 32<<20 {
+		t.Fatalf("warming patch: %d paused=%v cfg=%+v %s", rec.Code, control.paused, control.cfg, rec.Body.String())
+	}
+	bad := httptest.NewRequest(http.MethodPatch, "/api/v1/warming", strings.NewReader(`{"requestsPerPass":65}`))
+	bad.Header.Set("Authorization", "Bearer tok123")
+	badRec := httptest.NewRecorder()
+	m.ServeHTTP(badRec, bad)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid warm budget: %d %s", badRec.Code, badRec.Body.String())
+	}
+	coverage := httptest.NewRequest(http.MethodGet, "/api/v1/warming/coverage", nil)
+	coverage.Header.Set("Authorization", "Bearer tok123")
+	coverageRec := httptest.NewRecorder()
+	m.ServeHTTP(coverageRec, coverage)
+	if coverageRec.Code != http.StatusOK || !strings.Contains(coverageRec.Body.String(), "observed cache entries only") || strings.Contains(coverageRec.Body.String(), "coveragePercent") {
+		t.Fatalf("coverage must state its limited basis: %d %s", coverageRec.Code, coverageRec.Body.String())
+	}
+}
+
+func TestWarmingManualOperations(t *testing.T) {
+	m := NewMux(health.Checks{}, nil, "tok123", true, nil, &spike.Observations{})
+	key := ""
+	m.SetCollectionRebuilder(func(_ context.Context, ratingKey string) error { key = ratingKey; return nil })
+	removed := 0
+	m.SetLowPriorityEvictor(func(context.Context) (int, int64, error) { removed++; return 2, 4096, nil })
+	call := func(method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		req.Header.Set("Authorization", "Bearer tok123")
+		rec := httptest.NewRecorder()
+		m.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := call(http.MethodPost, "/api/v1/warming/collections/12345/rebuild"); rec.Code != http.StatusOK || key != "12345" {
+		t.Fatalf("collection rebuild: %d key=%s %s", rec.Code, key, rec.Body.String())
+	}
+	if rec := call(http.MethodPost, "/api/v1/warming/collections/%2Fadmin/rebuild"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("unsafe collection key: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := call(http.MethodPost, "/api/v1/storage/evict-low-priority"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"freedBytes":4096`) {
+		t.Fatalf("evict: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := call(http.MethodPost, "/api/v1/storage/evict-low-priority"); rec.Code != http.StatusTooManyRequests || removed != 1 {
+		t.Fatalf("evict rate limit: %d removed=%d %s", rec.Code, removed, rec.Body.String())
+	}
+}
+
 func TestValidatePolicy(t *testing.T) {
 	if _, err := validatePolicy("global", "", "g", json.RawMessage(`{"allowTranscode":"deny"}`)); err != nil {
 		t.Fatalf("valid global: %v", err)
@@ -214,6 +305,11 @@ func (s *stubSync) SyncOnce(ctx context.Context, full bool) error {
 	return s.err
 }
 
+func (s *stubSync) SyncCollectionsOnce(ctx context.Context) error {
+	s.calls++
+	return s.err
+}
+
 func TestSyncEndpoints(t *testing.T) {
 	ctx := context.Background()
 	_ = ctx
@@ -236,6 +332,13 @@ func TestSyncEndpoints(t *testing.T) {
 	m2.ServeHTTP(postRec, post)
 	if postRec.Code != http.StatusOK || stub.calls != 1 {
 		t.Fatalf("sync full: %d calls=%d %s", postRec.Code, stub.calls, postRec.Body.String())
+	}
+	collections := httptest.NewRequest(http.MethodPost, "/api/v1/server/collections/refresh", nil)
+	collections.Header.Set("Authorization", "Bearer tok123")
+	collectionsRec := httptest.NewRecorder()
+	m2.ServeHTTP(collectionsRec, collections)
+	if collectionsRec.Code != http.StatusOK || stub.calls != 2 {
+		t.Fatalf("collections refresh: %d calls=%d %s", collectionsRec.Code, stub.calls, collectionsRec.Body.String())
 	}
 	// Immediate repeat trips the 5-minute rate limit.
 	post2 := httptest.NewRequest(http.MethodPost, "/api/v1/sync/full", nil)

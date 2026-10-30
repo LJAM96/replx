@@ -53,7 +53,10 @@ func (w *Worker) handleEventData(payload string) {
 		return
 	}
 	a := nc.Activity
-	if !strings.Contains(strings.ToLower(a.Subtype), "library.refresh.items") {
+	subtype := strings.ToLower(a.Subtype)
+	itemRefresh := strings.Contains(subtype, "library.refresh.items")
+	collectionRefresh := strings.Contains(subtype, "library.refresh.collections")
+	if !itemRefresh && !collectionRefresh {
 		return
 	}
 	done := false
@@ -68,7 +71,12 @@ func (w *Worker) handleEventData(payload string) {
 		key = a.Context.Key
 	}
 	if m := sectionKey.FindStringSubmatch(key); m != nil {
-		w.MarkDirty(m[1])
+		if itemRefresh {
+			w.MarkDirty(m[1])
+		}
+		if collectionRefresh {
+			w.MarkCollectionsDirty(m[1])
+		}
 	}
 }
 

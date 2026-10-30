@@ -37,12 +37,12 @@ import (
 // revalidateAfter bounds plex.tv traffic for definitively bad tokens.
 const revalidateAfter = time.Hour
 
-// credentialValidityPeriod bounds how long a linked credential authorizes
-// locally served responses without fresh proof. Identity association (who
+// credentialValidityPeriod bounds how long a linked credential's account
+// identity may be considered fresh. Identity association (who
 // this fingerprint belonged to) is kept indefinitely for scoping and
-// policy, but local serving (long lived artwork) requires validity proven
-// within this window. plex.tv is consulted at most once per memTTL per
-// fingerprint, never on the steady-state hot path.
+// policy. This window does not prove PMS resource visibility; local reuse
+// requires separate caller-authorized resource proof. plex.tv is consulted
+// at most once per memTTL per fingerprint, never on the steady-state hot path.
 const credentialValidityPeriod = 24 * time.Hour
 
 // memTTL bounds the process-local resolution caches.
@@ -75,7 +75,7 @@ func FromTrace(c trace.Client) Client {
 // credential validity and library authorization are separate concepts:
 //   - Known means the fingerprint links to a Plex account (scoping, policy).
 //   - Fresh means the credential was proven valid within
-//     credentialValidityPeriod (authorizes locally served responses).
+//     credentialValidityPeriod (identity proof, not resource permission).
 //   - Invalid means plex.tv definitively rejected the credential recently:
 //     callers must bypass local serving and let PMS answer (usually 401).
 type Resolved struct {

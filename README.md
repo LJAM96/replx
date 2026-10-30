@@ -144,6 +144,8 @@ The files under `docs/` and `deploy/` are canonical source documents.
 | `docs/operations_runbook.md` | Production operations |
 | `docs/ci_release_backup_upgrade.md` | CI, releases, backup and upgrade |
 | `docs/implementation_roadmap.md` | Ordered build phases |
+| `docs/bounded_cache_implementation_plan.md` | Detailed 200 GB deployment plan, shared artwork and phased library acceleration |
+| `docs/agent_execution_plan.md` | Model assignments, execution batches and implementation status |
 | `docs/acceptance_criteria.md` | Definition of done |
 | `deploy/media_fallback_design.md` | Optional non Cloudflare media gateway |
 

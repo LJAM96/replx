@@ -76,6 +76,8 @@ type Config struct {
 	// the janitor deletes oldest files first.
 	ArtworkDir   string
 	ArtworkMaxGB int
+	// SharedArtworkEnabled allows rollback to authorized PMS passthrough.
+	SharedArtworkEnabled bool
 	// CacheMaxGB and DiagnosticsMaxGB bound filesystem/valkey budgets.
 	// Enforced by janitors; zero disables enforcement for that class.
 	CacheMaxGB       int
@@ -113,30 +115,31 @@ func intEnv(key string, def int) int {
 // supplied directly or via TUNNEL_TOKEN_FILE (Docker secret compatible).
 func Load() (Config, error) {
 	cfg := Config{
-		ImageOwner:        getenv("REPLX_EDGE_IMAGE_OWNER", ""),
-		Version:           getenv("REPLX_EDGE_VERSION", "dev"),
-		PublicURL:         getenv("REPLX_EDGE_PUBLIC_URL", ""),
-		OriginInternalURL: getenv("REPLX_EDGE_ORIGIN_INTERNAL_URL", ""),
-		IngressMode:       getenv("REPLX_EDGE_INGRESS_MODE", "cloudflare_tunnel"),
-		AdminBind:         getenv("REPLX_EDGE_ADMIN_BIND", "127.0.0.1"),
-		AdminListen:       getenv("REPLX_EDGE_ADMIN_LISTEN", ""),
-		AdminPublishBind:  getenv("REPLX_EDGE_ADMIN_PUBLISH_BIND", "127.0.0.1"),
-		InDocker:          strings.EqualFold(getenv("REPLX_EDGE_IN_DOCKER", "false"), "true"),
-		LogLevel:          getenv("REPLX_EDGE_LOG_LEVEL", "info"),
-		SecretKey:         getenv("REPLX_EDGE_SECRET_KEY", ""),
-		MediaPublicURL:    getenv("REPLX_EDGE_MEDIA_PUBLIC_URL", ""),
-		PostgresHost:      getenv("POSTGRES_HOST", "postgres"),
-		PostgresDB:        getenv("POSTGRES_DB", "replx_edge"),
-		PostgresUser:      getenv("POSTGRES_USER", "replx_edge"),
-		PostgresPass:      getenv("POSTGRES_PASSWORD", ""),
-		PostgresURL:       getenv("REPLX_EDGE_POSTGRES_URL", ""),
-		PostgresSSLMode:   strings.ToLower(strings.TrimSpace(getenv("POSTGRES_SSLMODE", ""))),
-		ValkeyAddr:        getenv("REPLX_EDGE_VALKEY_ADDR", getenv("VALKEY_ADDR", "valkey:6379")),
-		PlexTVBase:        getenv("REPLX_EDGE_PLEXTV_URL", "https://plex.tv"),
-		SpikeRouting:      strings.EqualFold(getenv("REPLX_EDGE_SPIKE_ROUTING", "false"), "true"),
-		ArtworkDir:        getenv("REPLX_EDGE_ARTWORK_DIR", "/data/artwork"),
+		ImageOwner:           getenv("REPLX_EDGE_IMAGE_OWNER", ""),
+		Version:              getenv("REPLX_EDGE_VERSION", "dev"),
+		PublicURL:            getenv("REPLX_EDGE_PUBLIC_URL", ""),
+		OriginInternalURL:    getenv("REPLX_EDGE_ORIGIN_INTERNAL_URL", ""),
+		IngressMode:          getenv("REPLX_EDGE_INGRESS_MODE", "cloudflare_tunnel"),
+		AdminBind:            getenv("REPLX_EDGE_ADMIN_BIND", "127.0.0.1"),
+		AdminListen:          getenv("REPLX_EDGE_ADMIN_LISTEN", ""),
+		AdminPublishBind:     getenv("REPLX_EDGE_ADMIN_PUBLISH_BIND", "127.0.0.1"),
+		InDocker:             strings.EqualFold(getenv("REPLX_EDGE_IN_DOCKER", "false"), "true"),
+		LogLevel:             getenv("REPLX_EDGE_LOG_LEVEL", "info"),
+		SecretKey:            getenv("REPLX_EDGE_SECRET_KEY", ""),
+		MediaPublicURL:       getenv("REPLX_EDGE_MEDIA_PUBLIC_URL", ""),
+		PostgresHost:         getenv("POSTGRES_HOST", "postgres"),
+		PostgresDB:           getenv("POSTGRES_DB", "replx_edge"),
+		PostgresUser:         getenv("POSTGRES_USER", "replx_edge"),
+		PostgresPass:         getenv("POSTGRES_PASSWORD", ""),
+		PostgresURL:          getenv("REPLX_EDGE_POSTGRES_URL", ""),
+		PostgresSSLMode:      strings.ToLower(strings.TrimSpace(getenv("POSTGRES_SSLMODE", ""))),
+		ValkeyAddr:           getenv("REPLX_EDGE_VALKEY_ADDR", getenv("VALKEY_ADDR", "valkey:6379")),
+		PlexTVBase:           getenv("REPLX_EDGE_PLEXTV_URL", "https://plex.tv"),
+		SpikeRouting:         strings.EqualFold(getenv("REPLX_EDGE_SPIKE_ROUTING", "false"), "true"),
+		ArtworkDir:           getenv("REPLX_EDGE_ARTWORK_DIR", "/data/artwork"),
+		SharedArtworkEnabled: strings.EqualFold(getenv("REPLX_EDGE_SHARED_ARTWORK_ENABLED", "true"), "true"),
 	}
-	artGB, err := strconv.Atoi(getenv("REPLX_EDGE_ARTWORK_MAX_GB", "50"))
+	artGB, err := strconv.Atoi(getenv("REPLX_EDGE_ARTWORK_MAX_GB", "100"))
 	if err != nil || artGB <= 0 || artGB > 10000 {
 		return Config{}, fmt.Errorf("invalid REPLX_EDGE_ARTWORK_MAX_GB")
 	}

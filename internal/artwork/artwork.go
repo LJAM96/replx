@@ -1,10 +1,8 @@
-// Package artwork caches Plex artwork transcodes on the filesystem.
-//
-// Entries are account scoped: identical transforms for different accounts
-// store separately, because an authenticated token alone never proves
-// authorization for a restricted item's artwork. Anonymous requests
-// bypass. TTL is 7 days; the janitor bounds disk usage oldest-first under
-// the configured budget.
+// Package artwork stores shared content-addressed Plex artwork while leaving
+// caller authorization to the proxy's exact-resource lease. The production
+// store uses PostgreSQL variant references, filesystem blobs, reservations,
+// and a hard byte budget. The legacy New constructor remains for migration
+// compatibility and isolated tests.
 package artwork
 
 import (
@@ -34,12 +32,11 @@ func Match(path string) bool {
 	return strings.HasPrefix(strings.ToLower(path), "/photo/:/transcode")
 }
 
-// Key hashes scope plus path plus sorted non-secret params. Entries are
-// account scoped (acct:<id>) like metadata: an authenticated token alone
-// never proves authorization for a restricted item's artwork. The
-// two-layer optimization (per-user authorization key over a shared
-// content-addressed blob) is future work; disk deduplication yields to
-// correctness for Production 1.0.
+// Key returns the legacy account-scoped file key. Production uses a hashed
+// scope-bound transform reference and gates every read through ResourceGrants;
+// the referenced content-addressed blob is shared by digest.
+//
+// Deprecated: use the shared transform key in the proxy with NewShared.
 func Key(scope, path string, query url.Values) string {
 	var b strings.Builder
 	b.WriteString(scope)
@@ -80,10 +77,10 @@ func isSecret(k string) bool {
 type Store struct {
 	dir      string
 	maxBytes int64
+	shared   *sharedStore
 }
 
-// New creates the cache directory. maxGB<=0 disables the budget check
-// frequency, not the budget itself: pass a positive budget in production.
+// New creates the legacy cache directory. Production uses NewShared.
 // The directory is owner-only: cached artwork is user-accessible media,
 // not world-readable state.
 func New(dir string, maxGB int) (*Store, error) {
@@ -108,6 +105,9 @@ func (s *Store) paths(key string) (string, string) {
 // Get returns a fresh entry. Expired or corrupt entries read as misses
 // and are removed lazily.
 func (s *Store) Get(key string) (string, []byte, bool) {
+	if s != nil && s.shared != nil {
+		return s.GetContext(context.Background(), key)
+	}
 	if s == nil || key == "" {
 		return "", nil, false
 	}
@@ -143,6 +143,14 @@ func (s *Store) Get(key string) (string, []byte, bool) {
 // body, which reads as a miss and is reclaimed by the sweeper — never a
 // metadata record pointing at a torn body. Files are owner-only.
 func (s *Store) Set(key, contentType string, body []byte) error {
+	if s != nil && s.shared != nil {
+		r, err := s.Reserve(context.Background(), key, Normal)
+		if err != nil {
+			return err
+		}
+		defer r.Cancel(context.Background())
+		return r.Commit(context.Background(), contentType, body)
+	}
 	if s == nil || key == "" {
 		return fmt.Errorf("artwork: empty key")
 	}
@@ -213,6 +221,11 @@ func writeTemp(dir string, b []byte) (string, error) {
 
 // Sweep deletes oldest bodies until the budget holds. Returns removals.
 func (s *Store) Sweep() (removed int, freed int64) {
+	if s != nil && s.shared != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return s.shared.sweep(ctx)
+	}
 	if s == nil {
 		return 0, 0
 	}
@@ -269,6 +282,47 @@ func (s *Store) Run(ctx context.Context, interval time.Duration) {
 	}
 	if interval <= 0 {
 		interval = 30 * time.Minute
+	}
+	if s.shared != nil {
+		// Migrations run asynchronously. Recover immediately, then retry briefly
+		// while unavailable so the first client request never performs the scan.
+		retry := time.NewTimer(0)
+		defer retry.Stop()
+		maintenance := time.NewTicker(interval)
+		defer maintenance.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-retry.C:
+				if !s.Ready() {
+					if err := s.Recover(ctx); err != nil {
+						retry.Reset(5 * time.Second)
+						continue
+					}
+				}
+				s.Sweep()
+				if s.shared.expiredPending.Load() {
+					retry.Reset(time.Second)
+				}
+			case <-s.shared.maintenanceWake:
+				s.Sweep()
+				if s.shared.expiredPending.Load() {
+					retry.Reset(time.Second)
+				}
+			case <-maintenance.C:
+				if !s.Ready() {
+					if err := s.Recover(ctx); err != nil {
+						retry.Reset(5 * time.Second)
+						continue
+					}
+				}
+				s.Sweep()
+				if s.shared.expiredPending.Load() {
+					retry.Reset(time.Second)
+				}
+			}
+		}
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

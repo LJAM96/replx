@@ -70,18 +70,13 @@ func TestKeyStripsSecretsAndSorts(t *testing.T) {
 	if a == json {
 		t.Fatal("representations must never share keys")
 	}
-	if !strings.HasPrefix(a, "replx_edge:v2:default:hubs:fp-user-1:xml:0:0:") {
+	if !strings.HasPrefix(a, "replx_edge:v4:default:hubs:fp-user-1:xml:0:0:") {
 		t.Fatalf("key shape: %s", a)
 	}
 }
 
 func TestPolicy(t *testing.T) {
 	allow := map[string]time.Duration{
-		"/hubs/home/recentlyAdded":              15 * time.Second,
-		"/hubs/home/continueWatching":           5 * time.Second,
-		"/hubs/promoted":                        10 * time.Second,
-		"/hubs/continueWatching/items":          5 * time.Second,
-		"/hubs/search":                          30 * time.Second,
 		"/library/collections/4317478/children": 2 * time.Minute,
 		"/library/metadata/4573984":             5 * time.Minute,
 		"/library/sections":                     5 * time.Minute,
@@ -101,9 +96,12 @@ func TestPolicy(t *testing.T) {
 		"/library/parts/11/file.mkv",
 		"/photo/:/transcode",
 		"/:/eventsource/notifications",
-		"/library/sections", // method gate below, path itself is fine
+		"/hubs", "/hubs/home", "/hubs/promoted", "/hubs/search",
+		"/hubs/home/recentlyAdded", "/hubs/home/continueWatching",
+		"/library/sections/1/onDeck", "/library/sections/1/continueWatching",
+		"/library/sectionsExtra", "/identityExtra", "/library/metadata/1/:/scrobble",
 	}
-	for _, p := range deny[:6] {
+	for _, p := range deny {
 		if _, ok := Cacheable("GET", p); ok {
 			t.Errorf("%s must never cache", p)
 		}
@@ -131,21 +129,44 @@ func TestMemoryExpiry(t *testing.T) {
 
 func TestClassOf(t *testing.T) {
 	cases := map[string]string{
-		"/hubs/home/continueWatching":  "cw",
-		"/hubs/continueWatching/items": "cw",
-		"/hubs/search?query=x":         "search",
-		"/hubs/home":                   "hubs",
-		"/library/sections":            "sections",
-		"/library/sections/22/all":     "sections",
-		"/library/metadata/1":          "metadata",
-		"/library/collections/x":       "collections",
-		"/identity":                    "identity",
-		"/photo/:/transcode":           "browse",
+		"/hubs/home/continueWatching":        "cw",
+		"/hubs/continueWatching/items":       "cw",
+		"/hubs/search?query=x":               "search",
+		"/hubs/home":                         "hubs",
+		"/library/sections":                  "sections",
+		"/library/sections/22/all":           "sections",
+		"/library/sections/22/collections":   "collections",
+		"/library/sections/22/collections/1": "collections",
+		"/library/metadata/1":                "metadata",
+		"/library/collections/x":             "collections",
+		"/identity":                          "identity",
+		"/photo/:/transcode":                 "browse",
 	}
 	for p, want := range cases {
 		if got := ClassOf(p); got != want {
 			t.Errorf("%s: want %s, got %s", p, want, got)
 		}
+	}
+}
+
+func TestCollectionListingUsesCollectionInvalidationGeneration(t *testing.T) {
+	ctx := context.Background()
+	g := NewMemoryGenerationStore()
+	path := "/library/sections/22/collections"
+	class := ClassOf(path)
+	before, _, err := g.Get(ctx, "user:one", class)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.BumpServerClass(ctx, "collections"); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := g.Get(ctx, "user:one", class)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatalf("collection publication must retire listing generation: class=%q generation=%d", class, after)
 	}
 }
 
