@@ -1,6 +1,6 @@
 # Agent execution plan
 
-Status: batches A–E implemented and locally checked on 29 October 2026. Live PMS and physical-client qualification remains pending. This is a reusable instruction document for Codex, not a standalone shell scheduler.
+Status: batches A–F implemented and locally qualified on 30 October 2026. Live PMS and physical-client qualification remains pending. This is a reusable instruction document for Codex, not a standalone shell scheduler.
 
 ## Run instruction
 
@@ -72,9 +72,9 @@ The scheduler only warms observed browse representations; it does not enumerate 
 
 Authenticated admin operations expose process-local pause/enable and bounded budgets, honest observed-entry coverage, one-collection rebuild, and low-priority artwork eviction. Settings revert to deployment defaults on restart. Full asset enumeration/prefetch, likely-next-page planning, durable warming controls and live PMS/device behavior remain pending qualification or later phases.
 
-### F: qualification — pending
+### F: qualification — complete locally; live gate pending
 
-Sol High reviews integrated changes and runs failure/race tests with required services. Real Plex discovery, redirects and physical-client playback remain a separate live gate. Record client/version/protocol evidence for Fire TV, Apple TV, Plex Web and, once identified, Hisense.
+Sol High independently reviews integrated changes and runs failure/race tests with required services. The review must include credential revocation, response generations, bounded warming and collection publication. Real Plex discovery, redirects and physical-client playback remain a separate live gate. Record client/version/protocol evidence for Fire TV, Apple TV, Plex Web and, once identified, Hisense.
 
 ## Execution record
 
@@ -89,6 +89,7 @@ Sol High reviews integrated changes and runs failure/race tests with required se
 - Batch C complete: shared content-addressed artwork, durable transform references and reservations, crash recovery, priority eviction, free-space admission guard and admin storage stats are implemented. SQL-backed shared-store tests and proxy/admin tests pass. Production config defaults to a 100 GiB artwork budget and preserves a 30 GiB free-space floor.
 - Batch D collection implementation ran in a GPT-6.1 Sol High agent. The PostgreSQL-backed sync tests cover ordered/smart/empty collection publication, unchanged generation reuse, late-page failures preserving the whole library, incomplete catalogs, changing totals, explicit empty deletion, delete/recreate and pending invalidation retry. Coordinator integration adds authenticated completion triggering and a server-wide `collections` generation that preserves unrelated cache classes. `go test ./... -count=1` passes with the temporary PostgreSQL URL configured; `go vet ./...` and `git diff --check` pass. Actual daily Aggregar execution, PMS behavior and client/device behavior remain live validation requirements.
 - Batch E implementation used GPT-6.1 Sol Medium for bounded priority warming and GPT-6 Luna Medium for admin operations/documentation. Integration adds foreground cancellation, memory-only expiring user contexts, authorization-aware publication, fair bounded scheduling, request/body budgets, backoff, coverage reporting, targeted collection rebuild, and safe low-priority artwork eviction. `go test ./... -count=1` passed with the temporary PostgreSQL URL configured; `go vet ./...`, generated complete-spec check and `git diff --check` pass. Only observed browse representations are warmed; full library asset prefetch/transform planning is pending. Live PMS, Aggregar and physical-client behavior remain unverified.
+- Batch F used GPT-6.1 Sol High for an independent review. The review reproduced that a PMS 401/403 could leave old cache grants and warmer credentials usable; proxy and artwork paths now revoke grants and forget that user's warm scope, with regression tests preserving the origin response and ensuring other callers remain isolated. It also found that `/library/sections/{id}/collections` was classified as `sections`, while collection sync bumps the `collections` class; both collection listing and child paths now use the same invalidation generation. The full PostgreSQL-backed `go test ./... -count=1`, `go vet ./...`, generated-spec check and `git diff --check` pass. `go test -race ./...` was attempted but cannot build here because CGO is disabled and no gcc compiler is installed; race testing remains unverified. Docker is unavailable locally, though the PR's Docker check passed. No Plex credentials or live requests were used. Fire TV, Apple TV, Plex Web and Hisense (model unknown) remain unqualified; real PMS discovery, redirects, revocation semantics and playback are pending operator/device access.
 - Batch D completes the bounded first execution batch, not all Phase 0/2 requirements or the overall implementation roadmap. No deployment has been performed.
 
 ## Initial assessment findings

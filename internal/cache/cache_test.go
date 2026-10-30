@@ -129,21 +129,44 @@ func TestMemoryExpiry(t *testing.T) {
 
 func TestClassOf(t *testing.T) {
 	cases := map[string]string{
-		"/hubs/home/continueWatching":  "cw",
-		"/hubs/continueWatching/items": "cw",
-		"/hubs/search?query=x":         "search",
-		"/hubs/home":                   "hubs",
-		"/library/sections":            "sections",
-		"/library/sections/22/all":     "sections",
-		"/library/metadata/1":          "metadata",
-		"/library/collections/x":       "collections",
-		"/identity":                    "identity",
-		"/photo/:/transcode":           "browse",
+		"/hubs/home/continueWatching":        "cw",
+		"/hubs/continueWatching/items":       "cw",
+		"/hubs/search?query=x":               "search",
+		"/hubs/home":                         "hubs",
+		"/library/sections":                  "sections",
+		"/library/sections/22/all":           "sections",
+		"/library/sections/22/collections":   "collections",
+		"/library/sections/22/collections/1": "collections",
+		"/library/metadata/1":                "metadata",
+		"/library/collections/x":             "collections",
+		"/identity":                          "identity",
+		"/photo/:/transcode":                 "browse",
 	}
 	for p, want := range cases {
 		if got := ClassOf(p); got != want {
 			t.Errorf("%s: want %s, got %s", p, want, got)
 		}
+	}
+}
+
+func TestCollectionListingUsesCollectionInvalidationGeneration(t *testing.T) {
+	ctx := context.Background()
+	g := NewMemoryGenerationStore()
+	path := "/library/sections/22/collections"
+	class := ClassOf(path)
+	before, _, err := g.Get(ctx, "user:one", class)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.BumpServerClass(ctx, "collections"); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := g.Get(ctx, "user:one", class)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatalf("collection publication must retire listing generation: class=%q generation=%d", class, after)
 	}
 }
 

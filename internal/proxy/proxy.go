@@ -313,6 +313,18 @@ func (h *Handler) currentCacheGeneration(r *http.Request, o obs) bool {
 	return err == nil && sg == o.scopeGen && gg == o.globalGen
 }
 
+// A PMS rejection supersedes earlier successful resource proofs, even while
+// the identity resolver still considers this credential fresh.
+func (h *Handler) revokeRejectedAuthorization(o obs, status int) {
+	if status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return
+	}
+	h.grants.Revoke(o.fingerprint)
+	if h.warmer != nil {
+		h.warmer.ForgetScope(o.scope)
+	}
+}
+
 // serveCache attempts a cached control response. It reports whether it
 // wrote the response. Misses flip the obs state to miss for logging,
 // headers and metrics; store errors read as misses (best-effort cache).
@@ -703,6 +715,7 @@ func (h *Handler) serveArtwork(w http.ResponseWriter, r *http.Request, id string
 		return false
 	}
 	defer resp.Body.Close()
+	h.revokeRejectedAuthorization(o, resp.StatusCode)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, artwork.MaxBodyBytes+1))
 	if err != nil || int64(len(body)) > artwork.MaxBodyBytes {
 		// Oversize or unreadable: decline the artwork fast path so the
@@ -985,6 +998,7 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, id string, o obs
 		return
 	}
 	defer resp.Body.Close()
+	h.revokeRejectedAuthorization(o, resp.StatusCode)
 
 	// Retire reads fetched before successful origin acknowledgement. A
 	// failed write never invents a local watch-state transition.

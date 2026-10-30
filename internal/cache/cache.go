@@ -138,6 +138,8 @@ func ClassOf(path string) string {
 		return "search"
 	case strings.HasPrefix(p, "/hubs/"):
 		return "hubs"
+	case strings.HasPrefix(p, "/library/sections") && strings.Contains(p, "/collections"):
+		return "collections"
 	case strings.HasPrefix(p, "/library/sections"):
 		return "sections"
 	case strings.HasPrefix(p, "/library/metadata"):
