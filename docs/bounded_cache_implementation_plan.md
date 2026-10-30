@@ -251,6 +251,10 @@ Gate: all 20 collections reconcile; failed scans do not erase membership; daily 
 
 Dependencies: Phases 2–4.
 
+Implementation status: the A–F execution batches delivered the cache, collection and observed-response warming foundation. Proactive library preloading remains an outstanding core requirement in Batch E. Follow **small discovery check → implement proactive preloading → controlled end-to-end and performance testing**. A–F completed the foundation; they did not complete the original preload requirement. See [Batch E in the agent execution plan](agent_execution_plan.md) for the assigned work and completion gate.
+
+Assigned models: GPT-6.1 Sol High for discovery, authorization/interface design and final qualification; GPT-6.1 Sol Medium for resumable enumeration and proactive preload implementation; GPT-6 Luna Medium for admin controls, coverage reporting and documentation after interfaces are stable. Exact model IDs and dispatch requirements are recorded in the agent execution plan.
+
 Tasks:
 
 1. Replace the owner-only observed-entry list with bounded priority jobs.
@@ -258,6 +262,7 @@ Tasks:
 3. Warm first visible pages and likely next pages for recently active user/client contexts.
 4. Add per-user fairness, byte/request/concurrency budgets, deduplication and backoff.
 5. Cancel obsolete jobs on collection generations, permission changes and storage pressure.
+6. Add resumable, bounded asset enumeration so the configured priority library assets can be prepared before users browse each title. Refresh changed assets incrementally after catalog and collection updates; report proactive coverage separately from observed-request refresh.
 
 User-token policy: use a short-lived, bounded in-memory context from actual authorized user requests; clear it on expiry/revocation. Persistent jobs contain no raw credential. After restart, user warming waits for a fresh context. Owner credentials prepare owner data and shared internal inventory, not another user's personalized pages. Warming while users are absent across restarts requires a separate approved credential-lifecycle design.
 

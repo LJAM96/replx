@@ -1,6 +1,8 @@
 # Agent execution plan
 
-Status: batches A–F implemented and locally qualified on 30 October 2026. Live PMS and physical-client qualification remains pending. This is a reusable instruction document for Codex, not a standalone shell scheduler.
+Status: the A–F foundation was implemented and locally qualified on 30 October 2026. Batch E remains incomplete against the original proactive library preload requirement. Live PMS and physical-client qualification remains pending. This is a reusable instruction document for Codex, not a standalone shell scheduler.
+
+Required sequence: **small discovery check → implement proactive preloading → controlled end-to-end and performance testing**. A–F completed the foundation; they did not complete the original preload requirement. The next incomplete work is Batch E's proactive preload extension below. Existing qualification results cover the foundation; extend and repeat qualification after preloading is implemented.
 
 ## Run instruction
 
@@ -18,11 +20,18 @@ Detailed requirements: [bounded cache implementation plan](bounded_cache_impleme
 | Shared artwork authorization/storage | GPT-6.1 Sol | High | Cache review; explicit authorization contract |
 | Collection snapshot synchronization | GPT-6.1 Sol | High | Durable invalidation interface |
 | Priority warming | GPT-6.1 Sol | Medium | Artwork and collection interfaces |
+| Preload discovery and client request analysis | GPT-6.1 Sol | High | Operator/client access; sanitized request evidence |
+| Preload authorization and interface design | GPT-6.1 Sol | High | Discovery evidence and existing authorization contract |
+| Resumable enumeration and proactive asset preload implementation | GPT-6.1 Sol | Medium | Approved interfaces, actual transforms and storage admission |
+| Preload controls, progress reporting and documentation | GPT-6 Luna | Medium | Stable preload interfaces |
+| Preload integration review and end-to-end/performance qualification | GPT-6.1 Sol | High | Implemented preload; operator/device access for live checks |
 | Admin controls, documentation and fixtures | GPT-6 Luna | Medium | Stable implementation interfaces |
 | Independent integration review | GPT-6.1 Sol | High | Each implementation batch |
 | Live routing/device checks | GPT-6.1 Sol with operator/device access | High | Secure PMS configuration and available clients |
 
 Model settings are passed when spawning each agent. The coordinator cannot change its own current model through these tools. Keep a maximum of three child agents active. Do not spawn further agents without an explicit assigned need. Prefer one focused implementation agent over multiple agents editing the same subsystem.
+
+For the remaining Batch E work, explicitly spawn `gpt-6.1-sol` with `high` effort for discovery, authorization/interface design and final qualification; use `gpt-6.1-sol` with `medium` effort for implementation after interfaces are fixed; use `gpt-6-luna` with `medium` effort for admin controls, coverage reports and documentation. This retains the cost-conscious split between focused implementation and deeper review. Pass model overrides with a fresh agent context and a self-contained assignment. Record the actual agent, model, effort, changed files, checks and outstanding requirements in the execution record. If an assigned model is unavailable, report that before substituting another model.
 
 ## Execution rules
 
@@ -64,15 +73,25 @@ Sol High implements explicit snapshots and ordered membership, then targeted inv
 
 Collection synchronization stages the complete catalog and ordered PMS child results for one library before a single transaction publishes its metadata, snapshot pointers and deletions. Ordinary and smart collections use PMS-evaluated children. Failed pages, changing totals, duplicate keys and ambiguous empty responses preserve the published generation; an explicit complete empty result can remove all collections or members. Unchanged content retains its published generation. Collection metadata, artwork references, ordering, membership additions/deletions and Plex delete/recreate identifiers participate in the change comparison. A committed change records a durable pending cache invalidation; the callback runs after commit and failures are retried. New catalog placeholders and staged snapshots are internal data and must never be treated as caller authorization or served as published data without a published-generation join.
 
-### E: warming and operations — complete locally
+### E: proactive preloading, warming and operations — partially complete
 
 Sol Medium implements priority jobs and bounded ephemeral user contexts. Luna Medium implements stable admin controls and coverage reporting. Gate: warming respects capacity, permissions, origin request budgets and browsing priority.
 
 The scheduler only warms observed browse representations; it does not enumerate every library item, prefetch all artwork, or guess device-specific transforms. Jobs are deduplicated, limited to 512 entries, dispatched serially with request/byte/per-scope budgets, and prioritized across scopes. Foreground traffic cancels active background work. User credentials are held in at most 32 in-memory contexts for a fixed two minutes after successful foreground authorization; jobs contain no credentials, and publication rechecks the job/context before storage. Invalid credentials remove that scope's context and queued entries. Collection browse paths are protected in the queue, library section responses high priority, metadata normal, with low-priority shared artwork eligible for safe eviction only when no higher-priority reference shares its blob.
 
-Authenticated admin operations expose process-local pause/enable and bounded budgets, honest observed-entry coverage, one-collection rebuild, and low-priority artwork eviction. Settings revert to deployment defaults on restart. Full asset enumeration/prefetch, likely-next-page planning, durable warming controls and live PMS/device behavior remain pending qualification or later phases.
+Authenticated admin operations expose process-local pause/enable and bounded budgets, honest observed-entry coverage, one-collection rebuild, and low-priority artwork eviction. Settings revert to deployment defaults on restart. These delivered foundations do not satisfy proactive preloading. Full asset enumeration/prefetch and likely-next-page planning are required outstanding Batch E implementation work.
 
-### F: qualification — complete locally; live gate pending
+Complete Batch E in this order, retaining the existing model assignments:
+
+1. **Small discovery check — Sol High with operator/client access:** capture sanitized requests from Plex Web, Fire TV and Apple TV; add Hisense once its platform is known. Establish actual browse endpoints, image sizes/transforms, resource versioning and permission behavior. Use this limited check to inform implementation; broad performance and playback qualification follows implementation. Never put credentials in traces, fixtures, job payloads or documents.
+2. **Proactive preloading — Sol Medium, with Sol High for authorization/interface design and review:** add resumable, bounded enumeration and preload jobs that operate before a user browses each title. Prepare collection covers and collection-member posters first, then useful library posters, logos and optional backgrounds. Use observed client transformations, shared content-addressed storage, capacity/free-space admission, request/byte/concurrency budgets, foreground priority and low-tier eviction. Refresh changed resources incrementally and replace obsolete jobs after collection publication/Aggregar updates. Keep Continue Watching and watch-state feeds live.
+3. **Permission-aware delivery — Sol High:** establish how prepared assets benefit the three ordinary users while preserving Plex visibility and revocation. Owner inventory and preloaded blobs must not authorize user access. Prove which first-access requests can benefit and which must contact PMS. Respect the existing ephemeral user-token policy; any different credential lifecycle requires an explicit design decision before implementation.
+4. **Operations and coverage — Luna Medium after stable interfaces:** expose resumable progress, discovered/queued/completed/failed asset counts, bytes and priority tiers, stale versions and per-user page coverage. Add bounded preload controls and distinguish proactive preparation from observed-response refresh. Describe restart behavior and cold authorization accurately.
+5. **Controlled end-to-end and performance testing — Sol High with operator/device access:** qualify the completed preload on Plex Web, Fire TV, Apple TV and the identified Hisense platform. Compare cold/warm library and collection browsing, verify daily collection updates and watch-state freshness, exercise capacity pressure/restart recovery, and confirm playback/seek delivery from PMS.
+
+Completion gate: a fresh deployment can enumerate and prepare the configured priority assets without requiring prior browsing of every title; the three users receive useful authorized reuse; updates replace affected data; capacity pressure preserves the configured priorities; progress and failures are measurable. Record live evidence before claiming client compatibility or performance. Durable warming controls and whole-library coverage beyond the configured storage budget remain separate scope decisions.
+
+### F: foundation qualification — complete locally; preload and live qualification pending
 
 Sol High independently reviews integrated changes and runs failure/race tests with required services. The review must include credential revocation, response generations, bounded warming and collection publication. Real Plex discovery, redirects and physical-client playback remain a separate live gate. Record client/version/protocol evidence for Fire TV, Apple TV, Plex Web and, once identified, Hisense.
 
